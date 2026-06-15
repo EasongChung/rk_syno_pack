@@ -1,0 +1,20 @@
+--- linuxrc.syno.impl	2025-07-29 10:57:15.000000000 +0800
++++ linuxrc.syno.impl	2026-06-09 00:00:00.000000000 +0800
+@@ -292,7 +292,7 @@
+ 	insmod /lib/modules/of_i2c.ko
+ 	insmod /lib/modules/i2c-mpc.ko
+ fi
+-
++sleep 5
+ if [ -x /usr/syno/bin/synocfgen ]; then
+         insmod /lib/modules/synobios.*
+         /bin/mknod /dev/synobios c 201 0
+@@ -301,7 +301,7 @@
+         RetCfg=$?
+         echo "/usr/syno/bin/synocfgen returns $RetCfg"
+         # shellcheck disable=SC2046 # Because delimiter of rmmod arguments is spaces
+-        rmmod `/sbin/lsmod | /usr/bin/cut -f 1 -d ' ' | /bin/grep synobios`
++        # rmmod `/sbin/lsmod | /usr/bin/cut -f 1 -d ' ' | /bin/grep synobios`
+ 		if [ "ppc853x" = "$UniqueRD" ]; then
+ 			rmmod i2c_mpc
+ 			rmmod of_i2c
