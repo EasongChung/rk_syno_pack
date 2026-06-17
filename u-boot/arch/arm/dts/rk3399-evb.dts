@@ -384,21 +384,20 @@
 	enable-gpios = <&gpio4 29 GPIO_ACTIVE_HIGH>;
 };
 
-&route_edp {
+&route_hdmi {
 	status = "okay";
+	logo,uboot = "logo.bmp";
+	logo,kernel = "logo.bmp";
+	logo,mode = "center";
+	charge_logo,mode = "center";
 };
 
-&edp_in_vopl {
+&route_edp {
 	status = "disabled";
 };
 
-&edp_in_vopb {
-	status = "okay";
-};
-
 &edp {
-	status = "okay";
-	force-hpd;
+	status = "disabled";
 
 	ports {
 		port@1 {
@@ -409,6 +408,18 @@
 			};
 		};
 	};
+};
+
+&hdmi_in_vopb {
+	status = "okay";
+};
+
+&hdmi_in_vopl {
+	status = "disabled";
+};
+
+&hdmi {
+	status = "okay";
 };
 
 &vopb {

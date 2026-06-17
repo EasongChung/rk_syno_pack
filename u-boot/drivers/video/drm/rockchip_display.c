@@ -9,6 +9,7 @@
 #include <config.h>
 #include <common.h>
 #include <errno.h>
+#include <fs.h>
 #include <linux/libfdt.h>
 #include <fdtdec.h>
 #include <fdt_support.h>
@@ -53,6 +54,7 @@
 #define BMP_PROCESSED_FLAG 8399
 #define BYTES_PER_PIXEL sizeof(uint32_t)
 #define MAX_IMAGE_BYTES (8 * 1024 * 1024)
+#define ROCKCHIP_BOOT_LOGO_FILE "logo.bmp"
 
 DECLARE_GLOBAL_DATA_PTR;
 static LIST_HEAD(rockchip_display_list);
@@ -63,6 +65,13 @@ static unsigned long cubic_lut_memory_start;
 static unsigned long memory_end;
 static struct base2_info base_parameter;
 static u32 align_size = PAGE_SIZE;
+
+static const char * const boot_logo_devparts[] = {
+	"0:3",
+	"0:4",
+	"1:3",
+	"1:4",
+};
 
 /*
  * the phy types are used by different connectors in public.
@@ -1161,10 +1170,60 @@ struct rockchip_logo_cache *find_or_alloc_logo_cache(const char *bmp, int rotate
 	return logo_cache;
 }
 
+static int load_boot_logo_file(void *buf, const char *bmp_name, int max_size)
+{
+	const char *splash_file = env_get("rk_logo_file");
+	const char *devpart = env_get("rk_logo_devpart");
+	const char *name;
+	loff_t actread;
+	int ret;
+	int i;
+
+	name = splash_file ? splash_file : bmp_name;
+	if (!strcmp(name, ROCKCHIP_BOOT_LOGO_FILE))
+		name = "/" ROCKCHIP_BOOT_LOGO_FILE;
+
+	if (devpart) {
+		ret = fs_set_blk_dev("mmc", devpart, FS_TYPE_ANY);
+		if (!ret) {
+			ret = fs_read(name, (ulong)buf, 0, max_size, &actread);
+			if (!ret)
+				return actread;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(boot_logo_devparts); i++) {
+		ret = fs_set_blk_dev("mmc", boot_logo_devparts[i], FS_TYPE_ANY);
+		if (ret)
+			continue;
+
+		ret = fs_read(name, (ulong)buf, 0, max_size, &actread);
+		if (!ret) {
+			printf("LOGO: %s from mmc %s\n", name,
+			       boot_logo_devparts[i]);
+			return actread;
+		}
+	}
+
+	return -ENOENT;
+}
+
+static int load_logo_file(void *buf, const char *bmp_name, int max_size)
+{
+	int len;
+
+#ifdef CONFIG_ROCKCHIP_RESOURCE_IMAGE
+	len = rockchip_read_resource_file(buf, bmp_name, 0, max_size);
+	if (len >= 0)
+		return len;
+#endif
+
+	return load_boot_logo_file(buf, bmp_name, max_size);
+}
+
 /* Note: used only for rkfb kernel driver */
 static int load_kernel_bmp_logo(struct logo_info *logo, const char *bmp_name)
 {
-#ifdef CONFIG_ROCKCHIP_RESOURCE_IMAGE
 	void *dst = NULL;
 	int len, size;
 	struct bmp_header *header;
@@ -1176,14 +1235,14 @@ static int load_kernel_bmp_logo(struct logo_info *logo, const char *bmp_name)
 	if (!header)
 		return -ENOMEM;
 
-	len = rockchip_read_resource_file(header, bmp_name, 0, RK_BLK_SIZE);
+	len = load_logo_file(header, bmp_name, RK_BLK_SIZE);
 	if (len != RK_BLK_SIZE) {
 		free(header);
 		return -EINVAL;
 	}
 	size = get_unaligned_le32(&header->file_size);
 	dst = (void *)(memory_start + MEMORY_POOL_SIZE / 2);
-	len = rockchip_read_resource_file(dst, bmp_name, 0, size);
+	len = load_logo_file(dst, bmp_name, size);
 	if (len != size) {
 		printf("failed to load bmp %s\n", bmp_name);
 		free(header);
@@ -1191,7 +1250,6 @@ static int load_kernel_bmp_logo(struct logo_info *logo, const char *bmp_name)
 	}
 
 	logo->mem = dst;
-#endif
 
 	return 0;
 }
@@ -1223,7 +1281,7 @@ static int load_bmp_logo_legacy(struct logo_info *logo, const char *bmp_name)
 	if (!header)
 		return -ENOMEM;
 
-	len = rockchip_read_resource_file(header, bmp_name, 0, RK_BLK_SIZE);
+	len = load_logo_file(header, bmp_name, RK_BLK_SIZE);
 	if (len != RK_BLK_SIZE) {
 		ret = -EINVAL;
 		goto free_header;
@@ -1250,7 +1308,7 @@ static int load_bmp_logo_legacy(struct logo_info *logo, const char *bmp_name)
 		dst = pdst;
 	}
 
-	len = rockchip_read_resource_file(pdst, bmp_name, 0, size);
+	len = load_logo_file(pdst, bmp_name, size);
 	if (len != size) {
 		printf("failed to load bmp %s\n", bmp_name);
 		ret = -ENOENT;
@@ -1450,7 +1508,7 @@ static int load_bmp_logo(struct logo_info *logo, const char *bmp_name)
 
 	bmp_create(&bmp, &bitmap_callbacks);
 
-	len = rockchip_read_resource_file(bmp_data, bmp_name, 0, MAX_IMAGE_BYTES);
+	len = load_logo_file(bmp_data, bmp_name, MAX_IMAGE_BYTES);
 	if (len < 0) {
 		ret = -EINVAL;
 		goto free_bmp_data;

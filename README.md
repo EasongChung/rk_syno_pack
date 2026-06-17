@@ -20,7 +20,7 @@ sudo apt-get update
 sudo apt-get install -y \
   build-essential bc bison flex libssl-dev libelf-dev dwarves \
   cpio xz-utils patch curl e2fsprogs device-tree-compiler vim-common \
-  libsodium-dev libmsgpack-dev
+  dosfstools mtools libsodium-dev libmsgpack-dev
 ```
 
 ## 当前目录
@@ -206,12 +206,11 @@ DSM_PATCH_VERSION=7.3 ./build.sh pat
 - `output/firmware/update.img`
 - `output/dsm/rk3399-dsm-update.img`
 
-默认会在 kernel command line 固定 DSM 看到的 MAC 和序列号：
+默认不会在 `extlinux.conf` 固定 MAC 和序列号。如果没有手动传
+`mac1=`/`sn=`/`custom_sn=`，U-Boot 会从 RK vendor storage 读取
+LAN MAC 和 SN，并在启动内核前补成 DSM 需要的参数：
 
 - `root=/dev/md0`
-- `SYNO_MAC1=021132423001`
-- `SYNO_SN=RKG3399DS42301`
-- `SYNO_CUSTOM_SN=$SYNO_SN`
 - `SYNO_FW_VERSION=M.115`
 
 `SYNO_FW_VERSION` 要和当前 DS423 `PAT` 内的 `uboot_DS423.bin` 版本一致。
@@ -219,7 +218,9 @@ DS423 7.3.2-86009 里是 `M.115`。如果这里低于 `PAT` 内的版本，
 官方 `updater` 会尝试更新 `/dev/mtd7`，在 RK3399 启动环境里会因为没有
 Synology 原生 MTD flash 而安装失败。
 
-如需覆盖，构建时传环境变量即可。`SYNO_MAC1` 使用 12 位十六进制，不带冒号：
+如需强制从 `extlinux.conf` 传 MAC 或序列号，构建时传环境变量即可。
+`SYNO_MAC1` 使用 12 位十六进制，不带冒号；`SYNO_CUSTOM_SN` 不设置时
+默认跟随 `SYNO_SN`：
 
 ```bash
 SYNO_MAC1=021132423001 SYNO_SN=RKG3399DS42301 SYNO_FW_VERSION=M.115 ./build.sh updateimg

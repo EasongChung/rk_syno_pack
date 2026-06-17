@@ -1303,6 +1303,83 @@ static void bootargs_add_android(bool verbose)
 #endif
 }
 
+static void bootargs_add_syno_mac(bool verbose)
+{
+	const char *ethaddr = env_get("ethaddr");
+	const int prefix_len = strlen("mac1=");
+	char mac1[sizeof("mac1=001122334455")];
+	int i, j;
+
+	if (!ethaddr || env_exist("bootargs", "mac1="))
+		return;
+
+	for (i = 0, j = prefix_len;
+	     ethaddr[i] && j < sizeof(mac1) - 1;
+	     i++) {
+		if (ethaddr[i] == ':')
+			continue;
+		mac1[j++] = ethaddr[i];
+	}
+	mac1[j] = '\0';
+
+	if (j != sizeof(mac1) - 1)
+		return;
+
+	memcpy(mac1, "mac1=", prefix_len);
+	env_update("bootargs", mac1);
+	if (verbose)
+		printf("## syno mac: %s\n\n", mac1);
+}
+
+static bool syno_sn_is_letter(char c)
+{
+	return c >= 'A' && c <= 'Z' && c != 'I' && c != 'O';
+}
+
+static bool syno_sn_is_value(char c)
+{
+	return (c >= '0' && c <= '9') || syno_sn_is_letter(c);
+}
+
+static bool syno_sn_is_valid_ds423(const char *serial)
+{
+	if (!serial || strlen(serial) != strlen("22A0VKRA1234B"))
+		return false;
+
+	if (strncmp(serial, "22A0VKR", strlen("22A0VKR")))
+		return false;
+
+	return syno_sn_is_letter(serial[7]) &&
+	       syno_sn_is_value(serial[8]) &&
+	       syno_sn_is_value(serial[9]) &&
+	       syno_sn_is_value(serial[10]) &&
+	       syno_sn_is_value(serial[11]) &&
+	       syno_sn_is_letter(serial[12]);
+}
+
+static void bootargs_add_syno_sn(bool verbose)
+{
+	const char *serial = env_get("serial#");
+	char sn[VENDOR_SN_MAX + sizeof("custom_sn=")];
+
+	if (!syno_sn_is_valid_ds423(serial))
+		return;
+
+	if (!env_exist("bootargs", "sn=")) {
+		snprintf(sn, sizeof(sn), "sn=%s", serial);
+		env_update("bootargs", sn);
+		if (verbose)
+			printf("## syno sn: %s\n\n", sn);
+	}
+
+	if (!env_exist("bootargs", "custom_sn=")) {
+		snprintf(sn, sizeof(sn), "custom_sn=%s", serial);
+		env_update("bootargs", sn);
+		if (verbose)
+			printf("## syno custom_sn: %s\n\n", sn);
+	}
+}
+
 static void bootargs_add_partition(bool verbose)
 {
 #if defined(CONFIG_ENVF) || defined(CONFIG_ENV_PARTITION)
@@ -1399,6 +1476,8 @@ char *board_fdt_chosen_bootargs(void *fdt)
 	bootargs_add_partition(verbose);
 	bootargs_add_fwver(verbose);
 	bootargs_add_android(verbose);
+	bootargs_add_syno_mac(verbose);
+	bootargs_add_syno_sn(verbose);
 
 	/*
 	 * Initrd fixup: remove unused "initrd=0x...,0x...",
@@ -1506,4 +1585,3 @@ int ft_verify_fdt(void *fdt)
 #endif
 	return 1;
 }
-

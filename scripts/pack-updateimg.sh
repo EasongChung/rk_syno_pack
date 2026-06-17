@@ -34,10 +34,11 @@ Environment:
   INITRD_ROOT     unpacked initrd root, defaults to ../build/pat-rd-patched
   PATCHED_UINITRD patched uInitrd path, defaults to ../build/boot-patched/uInitrd
   ROOT_MODULE_SRC initrd root module source dir, defaults to INITRD_ROOT/usr/lib/modules
-  SYNO_MAC1       fixed DSM LAN1 MAC, 12 hex chars without ':'
-  SYNO_SN         fixed DSM serial number, max 31 chars, no whitespace
-  SYNO_CUSTOM_SN  fixed DSM custom serial, defaults to SYNO_SN
+  SYNO_MAC1       optional fixed DSM LAN1 MAC, 12 hex chars without ':'
+  SYNO_SN         optional fixed DSM serial number, max 31 chars, no whitespace
+  SYNO_CUSTOM_SN  optional fixed DSM custom serial, defaults to SYNO_SN when set
   SYNO_FW_VERSION fixed DSM uboot version marker, defaults to M.115 for DS423 86009
+  SYNO_BOOT_LOGO  optional BMP copied to /logo.bmp in the FAT32 boot image
   CROSS_COMPILE   toolchain prefix, auto-detected when unset
   JOBS            parallel make jobs, defaults to nproc
 EOF
@@ -56,21 +57,23 @@ log()
 
 validate_syno_identity()
 {
-	case "$SYNO_MAC1" in
-		*[!0-9a-fA-F]*|"")
-			die "SYNO_MAC1 must be 12 hex chars without ':'"
-			;;
-	esac
+	if [ -n "$SYNO_MAC1" ]; then
+		case "$SYNO_MAC1" in
+			*[!0-9a-fA-F]*)
+				die "SYNO_MAC1 must be 12 hex chars without ':'"
+				;;
+		esac
 
-	if [ "${#SYNO_MAC1}" -ne 12 ]; then
-		die "SYNO_MAC1 must be 12 hex chars without ':'"
+		if [ "${#SYNO_MAC1}" -ne 12 ]; then
+			die "SYNO_MAC1 must be 12 hex chars without ':'"
+		fi
 	fi
 
-	if [ -z "$SYNO_SN" ] || [ "${#SYNO_SN}" -gt 31 ] || [[ "$SYNO_SN" =~ [[:space:]] ]]; then
+	if [ -n "$SYNO_SN" ] && { [ "${#SYNO_SN}" -gt 31 ] || [[ "$SYNO_SN" =~ [[:space:]] ]]; }; then
 		die "SYNO_SN must be 1-31 chars without whitespace"
 	fi
 
-	if [ -z "$SYNO_CUSTOM_SN" ] || [ "${#SYNO_CUSTOM_SN}" -gt 31 ] || [[ "$SYNO_CUSTOM_SN" =~ [[:space:]] ]]; then
+	if [ -n "$SYNO_CUSTOM_SN" ] && { [ "${#SYNO_CUSTOM_SN}" -gt 31 ] || [[ "$SYNO_CUSTOM_SN" =~ [[:space:]] ]]; }; then
 		die "SYNO_CUSTOM_SN must be 1-31 chars without whitespace"
 	fi
 
@@ -256,17 +259,19 @@ KERNEL_DEFCONFIG="${KERNEL_DEFCONFIG:-rk3399_dsm_defconfig}"
 INITRD_ROOT="${INITRD_ROOT:-$PROJECT_DIR/build/pat-rd-patched}"
 PATCHED_UINITRD="${PATCHED_UINITRD:-$PROJECT_DIR/build/boot-patched/uInitrd}"
 ROOT_MODULE_SRC="${ROOT_MODULE_SRC:-$INITRD_ROOT/usr/lib/modules}"
-SYNO_MAC1="${SYNO_MAC1:-021132423001}"
-SYNO_SN="${SYNO_SN:-2350W7R123456}"
+SYNO_MAC1="${SYNO_MAC1:-}"
+SYNO_SN="${SYNO_SN:-}"
 SYNO_CUSTOM_SN="${SYNO_CUSTOM_SN:-$SYNO_SN}"
 SYNO_FW_VERSION="${SYNO_FW_VERSION:-M.115}"
+SYNO_BOOT_LOGO="${SYNO_BOOT_LOGO:-$PROJECT_DIR/assets/boot-logo/logo.bmp}"
 RAW_INITRD="$OUT_DIR/uInitrd.raw"
 LZMA_INITRD="$OUT_DIR/uInitrd.lzma"
 KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image"
 KERNEL_DTB="$KERNEL_BUILD/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb"
 JOBS="${JOBS:-$(nproc)}"
 
-command -v mkfs.ext4 >/dev/null || die "mkfs.ext4 is missing"
+command -v mkfs.vfat >/dev/null || die "mkfs.vfat is missing"
+command -v mcopy >/dev/null || die "mcopy is missing"
 command -v cpio >/dev/null || die "cpio is missing"
 command -v lzma >/dev/null || die "lzma is missing"
 command -v dd >/dev/null || die "dd is missing"
@@ -322,6 +327,9 @@ fi
 need_file "$KERNEL_IMAGE" "build the DSM RK3399 kernel first"
 need_file "$KERNEL_DTB" "build the DSM RK3399 dtb first"
 need_file "$PATCHED_UINITRD" "build or restore DSM uInitrd first"
+if [ -n "${SYNO_BOOT_LOGO:-}" ]; then
+	need_file "$SYNO_BOOT_LOGO" "SYNO_BOOT_LOGO file not found"
+fi
 
 log "preparing DSM boot tree"
 rm -rf "$BOOT_ROOT"
@@ -330,6 +338,9 @@ install -D -m 0644 "$PATCHED_UINITRD" "$BOOT_ROOT/boot/uInitrd"
 
 install -D -m 0755 "$KERNEL_IMAGE" "$BOOT_ROOT/boot/Image"
 install -D -m 0644 "$KERNEL_DTB" "$BOOT_ROOT/boot/rk3399-nanopc-t4-dsm.dtb"
+if [ -n "${SYNO_BOOT_LOGO:-}" ]; then
+	install -D -m 0644 "$SYNO_BOOT_LOGO" "$BOOT_ROOT/logo.bmp"
+fi
 install_root_modules
 
 BOOTARGS=(
@@ -340,15 +351,24 @@ BOOTARGS=(
 	uio_pdrv_genirq.of_id=generic-uio
 	vender_format_version=2
 	vendor_format_version=2
-	mac1="$SYNO_MAC1"
-	sn="$SYNO_SN"
-	custom_sn="$SYNO_CUSTOM_SN"
 	console=ttyS2,1500000
 	earlycon=uart8250,mmio32,0xff1a0000
 	fw_devlink=permissive
 	swiotlb=1
 	coherent_pool=1m
+	vt.global_cursor_default=0
+	fbcon=map:1
 )
+
+if [ -n "$SYNO_MAC1" ]; then
+	BOOTARGS+=(mac1="$SYNO_MAC1")
+fi
+if [ -n "$SYNO_SN" ]; then
+	BOOTARGS+=(sn="$SYNO_SN")
+fi
+if [ -n "$SYNO_CUSTOM_SN" ]; then
+	BOOTARGS+=(custom_sn="$SYNO_CUSTOM_SN")
+fi
 
 {
 	cat <<'EOF'
@@ -362,9 +382,11 @@ EOF
 	printf '\n'
 } > "$BOOT_ROOT/boot/extlinux/extlinux.conf"
 
-log "building 64 MiB ext4 boot image"
+log "building 128 MiB FAT32 boot image"
 rm -f "$BOOT_IMG"
-mkfs.ext4 -q -F -m 0 -L DSMBOOT -O ^metadata_csum,^64bit -d "$BOOT_ROOT" "$BOOT_IMG" 64M
+truncate -s 128M "$BOOT_IMG"
+mkfs.vfat -F 32 -n DSMBOOT "$BOOT_IMG" >/dev/null
+MTOOLS_SKIP_CHECK=1 mcopy -i "$BOOT_IMG" -s "$BOOT_ROOT"/* ::/
 
 log "preparing firmware links"
 mkdir -p "$FIRMWARE_DIR"
