@@ -791,6 +791,32 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 
 	kernel_addr = genimg_get_kernel_addr(bootm_argv[1]);
 	buf = map_sysmem(kernel_addr, 0);
+
+	unsigned char *cbuf = (unsigned char *)buf;
+	if (cbuf[0] == 0x1f && cbuf[1] == 0x8b) {
+		unsigned long decomp_addr = kernel_addr + 0x02000000;
+		unsigned long decomp_len = ~0UL;
+		unsigned long src_len = ~0UL;
+		int err;
+
+		puts("Detected Gzip compressed kernel Image.gz, decompressing...\n");
+		err = gunzip((void *)decomp_addr, decomp_len, cbuf, &src_len);
+		if (err) {
+			printf("Gzip decompression failed, error: %d\n", err);
+			unmap_sysmem(buf);
+			return 1;
+		}
+		printf("Decompressed %ld bytes to 0x%lx\n", src_len, decomp_addr);
+
+		static char decomp_addr_str[32];
+		sprintf(decomp_addr_str, "0x%lx", decomp_addr);
+		bootm_argv[1] = decomp_addr_str;
+
+		unmap_sysmem(buf);
+		kernel_addr = decomp_addr;
+		buf = map_sysmem(kernel_addr, 0);
+	}
+
 	/* Try bootm for legacy and FIT format image */
 	if (genimg_get_format(buf) != IMAGE_FORMAT_INVALID)
 		do_bootm(cmdtp, 0, bootm_argc, bootm_argv);

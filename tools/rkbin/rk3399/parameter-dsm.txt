@@ -9,4 +9,4 @@ CHECK_MASK: 0x80
 PWR_HLD: 0,0,A,0,1
 TYPE: GPT
 GROW_ALIGN: 0
-CMDLINE: mtdparts=:0x00002000@0x00004000(uboot),0x00002000@0x00006000(trust),0x00040000@0x0000a000(boot:bootable),-@0x0004a000(userdata:grow)
+CMDLINE: mtdparts=:0x00002000@0x00004000(uboot),0x00002000@0x00006000(trust),0x00010000@0x0000a000(boot:bootable),-@0x0001a000(userdata:grow)

@@ -16,7 +16,7 @@ Inputs:
   ../build/boot-patched/uInitrd                    (patched uInitrd from PAT)
 
 Outputs:
-  ../build/out/kernel-7.3/arch/arm64/boot/Image
+  ../build/out/kernel-7.3/arch/arm64/boot/Image.gz
   ../build/out/kernel-7.3/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb
   ../build/boot-patched/uInitrd
   output/dsm/boot.img
@@ -266,7 +266,7 @@ SYNO_FW_VERSION="${SYNO_FW_VERSION:-M.115}"
 SYNO_BOOT_LOGO="${SYNO_BOOT_LOGO:-$PROJECT_DIR/assets/boot-logo/logo.bmp}"
 RAW_INITRD="$OUT_DIR/uInitrd.raw"
 LZMA_INITRD="$OUT_DIR/uInitrd.lzma"
-KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image"
+KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image.gz"
 KERNEL_DTB="$KERNEL_BUILD/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -297,11 +297,7 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 
 	configure_kernel_if_needed
 	log "building kernel Image and dtb"
-	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image dtbs
-	log "preparing module build"
-	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" modules_prepare
-	log "building syno_hddmon.ko"
-	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" M=drivers/hwmon modules
+	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image.gz dtbs
 	log "building all kernel modules"
 	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" modules
 	prune_stale_kernel_modules
@@ -336,7 +332,7 @@ rm -rf "$BOOT_ROOT"
 mkdir -p "$BOOT_ROOT/boot/extlinux"
 install -D -m 0644 "$PATCHED_UINITRD" "$BOOT_ROOT/boot/uInitrd"
 
-install -D -m 0755 "$KERNEL_IMAGE" "$BOOT_ROOT/boot/Image"
+install -D -m 0755 "$KERNEL_IMAGE" "$BOOT_ROOT/boot/Image.gz"
 install -D -m 0644 "$KERNEL_DTB" "$BOOT_ROOT/boot/rk3399-nanopc-t4-dsm.dtb"
 if [ -n "${SYNO_BOOT_LOGO:-}" ]; then
 	install -D -m 0644 "$SYNO_BOOT_LOGO" "$BOOT_ROOT/logo.bmp"
@@ -373,7 +369,7 @@ fi
 {
 	cat <<'EOF'
 label DSM-rk3399
-  kernel /boot/Image
+  kernel /boot/Image.gz
   initrd /boot/uInitrd
   fdt /boot/rk3399-nanopc-t4-dsm.dtb
 EOF
@@ -382,9 +378,9 @@ EOF
 	printf '\n'
 } > "$BOOT_ROOT/boot/extlinux/extlinux.conf"
 
-log "building 128 MiB FAT32 boot image"
+log "building FAT32 boot image"
 rm -f "$BOOT_IMG"
-truncate -s 128M "$BOOT_IMG"
+truncate -s 32M "$BOOT_IMG"
 mkfs.vfat -F 32 -n DSMBOOT "$BOOT_IMG" >/dev/null
 MTOOLS_SKIP_CHECK=1 mcopy -i "$BOOT_IMG" -s "$BOOT_ROOT"/* ::/
 
