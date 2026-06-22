@@ -13,8 +13,8 @@ need_cmd fdtget
 
 prepare_dirs
 
-PAT_URL="${1:-${PAT_URL_DEFAULT}}"
-PAT_FILE="${2:-${PAT_FILE_DEFAULT}}"
+PAT_URL="${PAT_URL:-$(pat_url_for "${1:-${DSM_PAT_VERSION_DEFAULT}}")}"
+PAT_FILE="${2:-${PAT_FILE:-${WORK_DIR}/$(basename "${PAT_URL}")}}"
 FALLBACK_PAT_DIR="${3:-${FALLBACK_PAT_DIR_DEFAULT}}"
 FALLBACK_RD_DIR="${4:-${FALLBACK_RD_DIR_DEFAULT}}"
 

@@ -5,7 +5,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KERNEL_SRC_DEFAULT="$ROOT_DIR/linux-5.10.x"
 KERNEL_BUILD_DEFAULT="$ROOT_DIR/build/out/kernel-7.3"
-PAT_URL_DEFAULT="https://global.synologydownload.com/download/DSM/release/7.3.2/86009/DSM_DS423_86009.pat"
 
 usage() {
   cat <<'EOF'
@@ -13,7 +12,7 @@ Usage:
   ./build.sh [all|pat|uboot|kernel|updateimg]
 
 Targets:
-  pat        download/extract/patch official DSM pat and generate patched rd.bin/uInitrd
+  pat        download/extract/patch DSM 7.4-90075 pat and generate patched rd.bin/uInitrd
   uboot      build u-boot/trust/loader artifacts locally
   kernel     build DSM kernel Image/dtb
   updateimg  generate Rockchip update.img using this project only
@@ -22,6 +21,7 @@ Targets:
 Environment:
   PAT_URL         official PAT URL
   PAT_FILE        local PAT file path
+  DSM_PAT_VERSION pat selector: 7.4 default, set 7.3 to use DSM 7.3.2-86009
   KERNEL_SRC      kernel source tree
   KERNEL_BUILD    kernel build output dir
   CROSS_COMPILE   aarch64 compiler prefix
@@ -30,7 +30,6 @@ Environment:
                        defaults to 0000:00:00.0,00.0
   SYNO_MAX_DISKS       DSM internal slot count written into initrd model.dtb
                        and synoinfo.conf, defaults to 6
-  DSM_PATCH_VERSION    patch directory under patches/, defaults to PAT major.minor
 EOF
 }
 
@@ -41,8 +40,8 @@ msg() {
 target_pat() {
   msg "patching official pat"
   "$ROOT_DIR/scripts/download_and_patch_pat.sh" \
-    "${PAT_URL:-$PAT_URL_DEFAULT}" \
-    "${PAT_FILE:-$ROOT_DIR/build/DSM_DS423_86009.pat}" \
+    "${PAT_URL:-${DSM_PAT_VERSION:-7.4}}" \
+    "${PAT_FILE:-}" \
     "${FALLBACK_PAT_DIR:-}" \
     "${FALLBACK_RD_DIR:-}"
 }

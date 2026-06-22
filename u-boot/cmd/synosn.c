@@ -8,7 +8,8 @@
 #include <command.h>
 #include <asm/arch/vendor.h>
 
-#define SYNO_DS423_SN_PREFIX	"22A0VKR"
+#define SYNO_DS423_SN_PREFIX	"2310VKR"
+
 
 static char syno_random_letter(void)
 {

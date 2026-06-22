@@ -6,14 +6,32 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORK_DIR="${PROJECT_DIR}/build"
 BIN_DIR="${PROJECT_DIR}/tools"
 PATCH_ROOT_DIR="${PROJECT_DIR}/patches"
-PATCH_DIR=""
 SYNOXTRACT_BIN="${PROJECT_DIR}/tools/SynoXtract/synoxtract"
 KERNEL_BUILD_DIR="${KERNEL_BUILD:-${PROJECT_DIR}/build/out/kernel-7.3}"
 SYNO_HDDMON_KO="${SYNO_HDDMON_KO:-${KERNEL_BUILD_DIR}/drivers/hwmon/syno_hddmon.ko}"
 ROOT_MODULE_DEP_LINES=()
 
-PAT_URL_DEFAULT="https://global.synologydownload.com/download/DSM/release/7.3.2/86009/DSM_DS423_86009.pat"
-PAT_FILE_DEFAULT="${WORK_DIR}/DSM_DS423_86009.pat"
+pat_url_for() {
+  case "${1:-7.4}" in
+    7.3|7.3.2|86009)
+      printf '%s\n' 'https://global.synologydownload.com/download/DSM/release/7.3.2/86009/DSM_DS423_86009.pat'
+      ;;
+    7.4|90075)
+      printf '%s\n' 'https://global.synologydownload.com/download/DSM/release/7.4/90075/DSM_DS423_90075.pat'
+      ;;
+    http://*|https://*)
+      printf '%s\n' "$1"
+      ;;
+    *)
+      printf '[syno-rk3399-patchkit] error: unknown DSM PAT version: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+DSM_PAT_VERSION_DEFAULT="${DSM_PAT_VERSION:-7.4}"
+PAT_URL_DEFAULT="$(pat_url_for "${DSM_PAT_VERSION_DEFAULT}")"
+PAT_FILE_DEFAULT="${WORK_DIR}/$(basename "${PAT_URL_DEFAULT}")"
 PAT_EXTRACT_DIR="${WORK_DIR}/pat-extract"
 PAT_RD_DIR="${WORK_DIR}/pat-rd"
 PATCHED_RD_DIR="${WORK_DIR}/pat-rd-patched"
@@ -38,6 +56,20 @@ need_cmd() {
 
 need_file() {
   [ -r "$1" ] || die "missing file: $1"
+}
+
+abs_path() {
+  local path="$1"
+  local dir base
+
+  case "${path}" in
+    /*) printf '%s\n' "${path}" ;;
+    *)
+      dir="$(dirname "${path}")"
+      base="$(basename "${path}")"
+      printf '%s/%s\n' "$(cd "${dir}" && pwd)" "${base}"
+      ;;
+  esac
 }
 
 install_module_file() {
@@ -72,6 +104,67 @@ sync_root_modules_to_initrd() {
   write_root_module_manifest
 }
 
+copy_initrd_root() {
+  local src_dir="$1"
+  local dst_dir="$2"
+
+  [ -d "${src_dir}" ] || die "initrd source dir not found: ${src_dir}"
+
+  if [ "$(cd "${src_dir}" && pwd)" = "$(mkdir -p "${dst_dir}" && cd "${dst_dir}" && pwd)" ]; then
+    return 0
+  fi
+
+  rm -rf "${dst_dir}"
+  mkdir -p "${dst_dir}"
+  (
+    cd "${src_dir}"
+    tar -cf - .
+  ) | (
+    cd "${dst_dir}"
+    tar -xf -
+  )
+}
+
+unpack_initrd_file() {
+  local initrd_file
+  local dst_dir="$2"
+
+  initrd_file="$(abs_path "$1")"
+
+  need_file "${initrd_file}"
+  rm -rf "${dst_dir}"
+  mkdir -p "${dst_dir}"
+
+  msg "unpacking initrd file: ${initrd_file}"
+  (
+    cd "${dst_dir}"
+    if command -v lzma >/dev/null 2>&1; then
+      lzma -dc <"${initrd_file}" | cpio -idm --quiet
+    else
+      xz --format=lzma -dc <"${initrd_file}" | cpio -idm --quiet
+    fi
+  )
+  [ -f "${dst_dir}/linuxrc.syno.impl" ] || die "failed to unpack initrd file: ${initrd_file}"
+  chmod u+r "${dst_dir}/etc/shadow" "${dst_dir}/etc.defaults/shadow" 2>/dev/null || true
+}
+
+repack_initrd_file() {
+  local src_dir="$1"
+  local initrd_file
+
+  initrd_file="$(abs_path "$2")"
+
+  [ -d "${src_dir}" ] || die "initrd root dir not found: ${src_dir}"
+  mkdir -p "$(dirname "${initrd_file}")"
+
+  msg "repacking initrd file: ${initrd_file}"
+  rm -f "${initrd_file}"
+  (
+    cd "${src_dir}"
+    find . -print | cpio -o -H newc -R root:root --quiet | xz --format=lzma -9 >"${initrd_file}"
+  )
+}
+
 prepare_dirs() {
   mkdir -p "${WORK_DIR}" "${PAT_EXTRACT_DIR}" "${PAT_RD_DIR}" \
     "${PATCHED_RD_DIR}" "${PATCHED_BOOT_DIR}"
@@ -80,17 +173,17 @@ prepare_dirs() {
 apply_patch_series() {
   local patch_file found=0
 
-  [ -n "${PATCH_DIR}" ] || die "PATCH_DIR is not selected"
-
   shopt -s nullglob
-  for patch_file in "${PATCH_DIR}"/[0-9][0-9][0-9][0-9]-*.patch; do
+  for patch_file in "${PATCH_ROOT_DIR}"/[0-9][0-9][0-9][0-9]-*.patch; do
     found=1
     msg "applying patch $(basename "${patch_file}")"
     patch -p0 <"${patch_file}"
   done
   shopt -u nullglob
 
-  [ "${found}" -eq 1 ] || die "no patch files found in ${PATCH_DIR}"
+  if [ "${found}" -eq 0 ]; then
+    msg "no patch files found in ${PATCH_ROOT_DIR}, skipping patch series"
+  fi
 }
 
 read_version_key() {
@@ -98,27 +191,6 @@ read_version_key() {
   local file="$2"
 
   sed -n "s/^${key}=\"\\([^\"]*\\)\".*/\\1/p" "${file}"
-}
-
-select_patch_dir() {
-  local patch_version="${DSM_PATCH_VERSION:-}"
-  local version_file="${PAT_EXTRACT_DIR}/VERSION"
-  local major minor
-
-  if [ -z "${patch_version}" ]; then
-    need_file "${version_file}"
-    major="$(read_version_key majorversion "${version_file}")"
-    [ -n "${major}" ] || major="$(read_version_key major "${version_file}")"
-    minor="$(read_version_key minorversion "${version_file}")"
-    [ -n "${minor}" ] || minor="$(read_version_key minor "${version_file}")"
-    [ -n "${major}" ] || die "failed to detect DSM major version from ${version_file}"
-    [ -n "${minor}" ] || die "failed to detect DSM minor version from ${version_file}"
-    patch_version="${major}.${minor}"
-  fi
-
-  PATCH_DIR="${PATCH_ROOT_DIR}/${patch_version}"
-  [ -d "${PATCH_DIR}" ] || die "patch directory not found for DSM ${patch_version}: ${PATCH_DIR}"
-  msg "using DSM ${patch_version} patches: ${PATCH_DIR}"
 }
 
 patch_model_dtb_sata_pcie_root() {
@@ -232,18 +304,15 @@ extract_pat() {
   chmod u+r "${PAT_RD_DIR}/etc/shadow" "${PAT_RD_DIR}/etc.defaults/shadow" 2>/dev/null || true
 }
 
-apply_patches() {
-  rm -rf "${PATCHED_RD_DIR}"
-  mkdir -p "${PATCHED_RD_DIR}"
-  (
-    cd "${PAT_RD_DIR}"
-    tar -cf - .
-  ) | (
-    cd "${PATCHED_RD_DIR}"
-    tar -xf -
-  )
+patch_initrd_root() {
+  local src_dir="${1:-${PAT_RD_DIR}}"
+  local dst_dir="${2:-${PATCHED_RD_DIR}}"
+  local install_syno_hddmon="${INSTALL_SYNO_HDDMON:-1}"
 
-  select_patch_dir
+  copy_initrd_root "${src_dir}" "${dst_dir}"
+  PATCHED_RD_DIR="${dst_dir}"
+  chmod u+r "${PATCHED_RD_DIR}/etc/shadow" "${PATCHED_RD_DIR}/etc.defaults/shadow" 2>/dev/null || true
+
   (
     cd "${PATCHED_RD_DIR}"
     apply_patch_series
@@ -251,21 +320,25 @@ apply_patches() {
 
   patch_model_dtb_sata_pcie_root
   patch_synoinfo_disk_count
+  "${PATCH_ROOT_DIR}/0000-rk-initrd-fixes.sh" "${PATCHED_RD_DIR}"
 
-  need_file "${SYNO_HDDMON_KO}"
-  msg "replacing syno_hddmon.ko from kernel build"
-  install -m 0644 "${SYNO_HDDMON_KO}" \
-    "${PATCHED_RD_DIR}/usr/lib/modules/syno_hddmon.ko"
+  if [ "${install_syno_hddmon}" = 1 ]; then
+    need_file "${SYNO_HDDMON_KO}"
+    msg "replacing syno_hddmon.ko from kernel build"
+    install -m 0644 "${SYNO_HDDMON_KO}" \
+      "${PATCHED_RD_DIR}/usr/lib/modules/syno_hddmon.ko"
+  else
+    msg "skipping syno_hddmon.ko replacement"
+  fi
   msg "keeping factory synobios.ko"
 
   sync_root_modules_to_initrd
 }
 
+apply_patches() {
+  patch_initrd_root "${PAT_RD_DIR}" "${PATCHED_RD_DIR}"
+}
+
 repack_rd() {
-  msg "repacking rd.bin"
-  rm -f "${PATCHED_RD_BIN}"
-  (
-    cd "${PATCHED_RD_DIR}"
-    find . -print | cpio -o -H newc -R root:root --quiet | xz --format=lzma -9 >"${PATCHED_RD_BIN}"
-  )
+  repack_initrd_file "${PATCHED_RD_DIR}" "${PATCHED_RD_BIN}"
 }

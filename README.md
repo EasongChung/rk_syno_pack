@@ -165,11 +165,13 @@ cd /home/yxl/my_proj/syno
 1. 使用 `tools/SynoXtract/synoxtract` 解 `pat`
 2. 提取 `rd.bin`
 3. 解开 `rd.bin`
-4. 按 `patches/<DSM major.minor>/0001-*.patch` 顺序应用补丁
+4. 按 `patches/0001-*.patch` 顺序应用通用补丁（没有补丁时跳过）
 5. 修正 `initrd` 里的 `model.dtb` SATA 盘位 PCIe 路径
-6. 替换 `build/out/kernel-7.3/drivers/hwmon/syno_hddmon.ko`
-7. 重新打包 `rd.bin`
-8. 生成新的 `uInitrd`
+6. 修正 `initrd` 里的 `synoinfo.conf` 盘位数量
+7. 执行 `patches/0000-rk-initrd-fixes.sh` 注入 RK3399 运行时修补
+8. 替换 `build/out/kernel-7.3/drivers/hwmon/syno_hddmon.ko`
+9. 重新打包 `rd.bin`
+10. 生成新的 `uInitrd`
 
 默认会把 DS423 的 `/internal_slot@1..6/ahci/pcie_root` 改成当前
 RK3399 + PCIe 转 SATA HBA 的路径：
@@ -182,17 +184,25 @@ RK3399 + PCIe 转 SATA HBA 的路径：
 SYNO_SATA_PCIE_ROOT=0000:00:00.0,00.0 ./build.sh pat
 ```
 
-补丁目录默认会从 `PAT` 内的 `VERSION` 自动选择，例如 `7.3.2-86009`
-使用 `patches/7.3/`。如需手动指定：
-
-```bash
-DSM_PATCH_VERSION=7.3 ./build.sh pat
-```
+`patches/` 目录不再按 DSM 7.2/7.3 分版本。版本相关且容易冲突的
+`linuxrc` / `webman` 修改已改为脚本注入，集中在
+`patches/0000-rk-initrd-fixes.sh`。
 
 关键产物：
 
 - `build/rd.bin`
 - `build/boot-patched/uInitrd`
+
+### 3.1 只修补已有 initrd 文件
+
+如果已经在 buildroot 或其他流程里拿到了 `rd.bin` / `uInitrd`，不需要走
+`PAT` 下载和解包流程，可以直接修补源文件：
+
+```bash
+scripts/patch-initrd-file.sh /path/to/rd.bin /path/to/rd.bin.patched
+```
+
+这个入口会自己解开输入 initrd、执行同一套 RK3399 initrd 修补、再重新打包。
 
 ### 4. 生成 update.img
 

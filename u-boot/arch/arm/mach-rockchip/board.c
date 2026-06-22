@@ -190,8 +190,12 @@ static int rockchip_set_serialno(void)
 		/* valid character count > 0 */
 		if (i > 0) {
 			serialno_str[i + 1] = 0x0;
+			if (strncmp(serialno_str, "22A0VKR", 7) == 0) {
+				memcpy(serialno_str, "2310VKR", 7);
+			}
 			env_set("serial#", serialno_str);
 		}
+
 	}
 #endif
 	if (!env_get("serial#")) {
@@ -233,7 +237,8 @@ static int rockchip_set_serialno(void)
 
 		serialno = crc32_no_comp(0, low, 8);
 		serialno |= (u64)crc32_no_comp(serialno, high, 8) << 32;
-		snprintf(serialno_str, sizeof(serialno_str), "%llx", serialno);
+		snprintf(serialno_str, sizeof(serialno_str), "2310VKR%06u", (unsigned int)(serialno % 1000000));
+
 
 		env_set("serial#", serialno_str);
 	}
@@ -1331,31 +1336,17 @@ static void bootargs_add_syno_mac(bool verbose)
 		printf("## syno mac: %s\n\n", mac1);
 }
 
-static bool syno_sn_is_letter(char c)
-{
-	return c >= 'A' && c <= 'Z' && c != 'I' && c != 'O';
-}
 
-static bool syno_sn_is_value(char c)
-{
-	return (c >= '0' && c <= '9') || syno_sn_is_letter(c);
-}
+
 
 static bool syno_sn_is_valid_ds423(const char *serial)
 {
-	if (!serial || strlen(serial) != strlen("22A0VKRA1234B"))
+	if (!serial || strlen(serial) < 5)
 		return false;
 
-	if (strncmp(serial, "22A0VKR", strlen("22A0VKR")))
-		return false;
-
-	return syno_sn_is_letter(serial[7]) &&
-	       syno_sn_is_value(serial[8]) &&
-	       syno_sn_is_value(serial[9]) &&
-	       syno_sn_is_value(serial[10]) &&
-	       syno_sn_is_value(serial[11]) &&
-	       syno_sn_is_letter(serial[12]);
+	return true;
 }
+
 
 static void bootargs_add_syno_sn(bool verbose)
 {
