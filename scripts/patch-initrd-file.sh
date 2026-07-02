@@ -13,6 +13,7 @@ Patch a DSM initrd file directly. This does not download or extract a PAT file.
 
 Environment:
   INITRD_WORK_DIR      temp work dir, defaults to build/initrd-file-patch
+  SOC                  Rockchip SoC selector, defaults to rk3399
   INSTALL_SYNO_HDDMON  replace syno_hddmon.ko, defaults to 1
   SYNO_HDDMON_KO       replacement syno_hddmon.ko path
   SYNO_SATA_PCIE_ROOT  SATA pcie_root written into model.dtb

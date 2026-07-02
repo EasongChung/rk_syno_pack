@@ -17,6 +17,61 @@ need_file()
 	[ -r "$1" ] || _exit "$1 is missing"
 }
 
+install_overlay()
+{
+	root="$1"
+	overlay="$(dirname "$0")/overlay"
+
+	if [ ! -d "$overlay" ]; then
+		log "overlay not found, skipping"
+		return 0
+	fi
+
+	log "installing overlay files"
+	cp -a "$overlay"/. "$root"/
+	chmod 0755 "$root/usr/syno/bin/rk_bootanim" 2>/dev/null || true
+	chmod 0755 "$root/usr/syno/sbin/rk3399_bootanim.sh" 2>/dev/null || true
+}
+
+install_bootanim_hook()
+{
+	root="$1"
+	linuxrc="$root/linuxrc.syno"
+	impl="$root/linuxrc.syno.impl"
+	hook='/bin/sh /usr/syno/sbin/rk3399_bootanim.sh'
+
+	need_file "$linuxrc"
+	[ -x "$root/usr/syno/sbin/rk3399_bootanim.sh" ] || return 0
+
+	if [ -f "$impl" ] && grep -Fq "$hook" "$impl"; then
+		grep -Fvx "$hook" "$impl" >"$impl.rk3399" || true
+		mv -f "$impl.rk3399" "$impl"
+		chmod 0755 "$impl"
+	fi
+
+	if grep -Fq "$hook" "$linuxrc"; then
+		log "boot animation hook already installed"
+		return 0
+	fi
+
+	log "installing boot animation hook"
+	awk -v hook="$hook" '
+		!started && $0 == "\tif RunWithLog /var/log/linuxrc.syno.log /linuxrc.syno.impl; then" {
+			print "\t" hook
+			print
+			started = 1
+			next
+		}
+		{ print }
+		END {
+			if (!started)
+				exit 1
+		}
+	' "$linuxrc" >"$linuxrc.rk3399"
+	mv -f "$linuxrc.rk3399" "$linuxrc"
+	chmod 0755 "$linuxrc"
+}
+
 install_model_sync_hook()
 {
 	root="$1"
@@ -121,9 +176,19 @@ fix_webman_reboot()
 main()
 {
 	root="${1:-.}"
+	soc="${SOC:-rk3399}"
 
 	[ -d "$root" ] || _exit "$root is not a directory"
 
+	case "$soc" in
+		rk3399)
+			install_overlay "$root"
+			install_bootanim_hook "$root"
+			;;
+		*)
+			log "skipping overlay and boot animation for $soc"
+			;;
+	esac
 	install_model_sync_hook "$root"
 	fix_webman_reboot "$root"
 }

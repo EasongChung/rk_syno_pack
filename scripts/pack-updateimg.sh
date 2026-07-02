@@ -7,30 +7,36 @@ usage()
 Usage:
   ./scripts/pack-updateimg.sh [--kernel-only] [--pack-only]
 
-Build the DSM RK3399 kernel, repack uInitrd, then generate a Rockchip update.img.
+Build the DSM Rockchip kernel, repack uInitrd, then generate a Rockchip update.img.
 
 Inputs:
   ../linux-5.10.x                                  (default kernel source, overridable by KERNEL_SRC)
-  arch/arm64/configs/rk3399_dsm_defconfig          (default kernel config target)
+  arch/arm64/configs/<soc>_dsm_defconfig           (default kernel config target)
   ../build/pat-rd-patched                         (patched initrd rootfs)
   ../build/boot-patched/uInitrd                    (patched uInitrd from PAT)
 
 Outputs:
-  ../build/out/kernel-7.3/arch/arm64/boot/Image.gz
-  ../build/out/kernel-7.3/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb
+  ../build/out/kernel-7.3/arch/arm64/boot/Image
+  ../build/out/kernel-7.3/arch/arm64/boot/dts/rockchip/<dtb>
   ../build/boot-patched/uInitrd
   output/dsm/boot.img
   output/firmware/update.img
-  output/dsm/rk3399-dsm-update.img
+  output/dsm/<soc>-dsm-update.img
+  output/dsm/<soc>-dsm-raw.img                  (rkdeveloptool wl 0x0 image, when RAW_BOOTLOADER_BIN exists)
 
 Options:
   --kernel-only   stop after building kernel Image and dtb
   --pack-only     skip kernel/initrd rebuild, only package existing artifacts
 
 Environment:
+  SOC             Rockchip SoC selector: rk3399, rk3566, rk3568; defaults to rk3399
+  DTB_NAME        DTB file name under arch/arm64/boot/dts/rockchip
+  LOADER_BIN      MiniLoaderAll.bin source path; auto-detected from u-boot when unset
+  CONSOLE         kernel console bootarg, defaults from SOC
+  EARLYCON        kernel earlycon bootarg, defaults from SOC
   KERNEL_SRC      kernel source tree, defaults to ../linux-5.10.x
   KERNEL_BUILD    kernel out dir, defaults to ../build/out/kernel-7.3
-  KERNEL_DEFCONFIG kernel defconfig target, defaults to rk3399_dsm_defconfig
+  KERNEL_DEFCONFIG kernel defconfig target, defaults from SOC
   INITRD_ROOT     unpacked initrd root, defaults to ../build/pat-rd-patched
   PATCHED_UINITRD patched uInitrd path, defaults to ../build/boot-patched/uInitrd
   ROOT_MODULE_SRC initrd root module source dir, defaults to INITRD_ROOT/usr/lib/modules
@@ -39,6 +45,9 @@ Environment:
   SYNO_CUSTOM_SN  optional fixed DSM custom serial, defaults to SYNO_SN when set
   SYNO_FW_VERSION fixed DSM uboot version marker, defaults to M.115 for DS423 86009
   SYNO_BOOT_LOGO  optional BMP copied to /logo.bmp in the FAT32 boot image
+  SWIOTLB         kernel swiotlb slot count, defaults to 32768 (64 MiB)
+  COHERENT_POOL   kernel coherent_pool bootarg, defaults to 4M
+  RAW_BOOTLOADER_BIN optional raw bootloader block for rkdeveloptool wl 0x0 image
   CROSS_COMPILE   toolchain prefix, auto-detected when unset
   JOBS            parallel make jobs, defaults to nproc
 EOF
@@ -131,6 +140,19 @@ detect_cross_compile()
 	return 1
 }
 
+ensure_cross_compile()
+{
+	local gcc="${CROSS_COMPILE:-}gcc"
+
+	if [ -n "${CROSS_COMPILE:-}" ] && command -v "$gcc" >/dev/null 2>&1; then
+		return 0
+	fi
+
+	CROSS_COMPILE="$(detect_cross_compile)" || \
+		die "set CROSS_COMPILE to a working aarch64 toolchain prefix"
+	export CROSS_COMPILE
+}
+
 need_file()
 {
 	local file="$1"
@@ -145,6 +167,21 @@ need_file()
 	fi
 
 	die "$file is missing"
+}
+
+find_first_file()
+{
+	local pattern="$1"
+	local file
+
+	for file in $pattern; do
+		if [ -f "$file" ]; then
+			echo "$file"
+			return 0
+		fi
+	done
+
+	return 1
 }
 
 root_module_source()
@@ -246,16 +283,15 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SOC="${SOC:-rk3399}"
 OUT_DIR="$PROJECT_DIR/output/dsm"
 BOOT_ROOT="$OUT_DIR/boot-root"
 BOOT_IMG="$OUT_DIR/boot.img"
-UPDATE_OUT="$OUT_DIR/rk3399-dsm-update.img"
 FIRMWARE_DIR="$PROJECT_DIR/output/firmware"
-CHIP_DIR="$PROJECT_DIR/tools/rkbin/rk3399"
 PACK_TOOL_DIR="$PROJECT_DIR/tools/linux_pack"
+RAW_PACK_SCRIPT="$PROJECT_DIR/scripts/pack-raw-disk-img.sh"
 KERNEL_SRC="${KERNEL_SRC:-$PROJECT_DIR/linux-5.10.x}"
 KERNEL_BUILD="${KERNEL_BUILD:-$PROJECT_DIR/build/out/kernel-7.3}"
-KERNEL_DEFCONFIG="${KERNEL_DEFCONFIG:-rk3399_dsm_defconfig}"
 INITRD_ROOT="${INITRD_ROOT:-$PROJECT_DIR/build/pat-rd-patched}"
 PATCHED_UINITRD="${PATCHED_UINITRD:-$PROJECT_DIR/build/boot-patched/uInitrd}"
 ROOT_MODULE_SRC="${ROOT_MODULE_SRC:-$INITRD_ROOT/usr/lib/modules}"
@@ -264,40 +300,108 @@ SYNO_SN="${SYNO_SN:-}"
 SYNO_CUSTOM_SN="${SYNO_CUSTOM_SN:-$SYNO_SN}"
 SYNO_FW_VERSION="${SYNO_FW_VERSION:-M.115}"
 SYNO_BOOT_LOGO="${SYNO_BOOT_LOGO:-$PROJECT_DIR/assets/boot-logo/logo.bmp}"
+SWIOTLB="${SWIOTLB:-32768}"
+COHERENT_POOL="${COHERENT_POOL:-4M}"
 RAW_INITRD="$OUT_DIR/uInitrd.raw"
 LZMA_INITRD="$OUT_DIR/uInitrd.lzma"
-KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image.gz"
-KERNEL_DTB="$KERNEL_BUILD/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb"
+KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image"
 JOBS="${JOBS:-$(nproc)}"
 
-command -v mkfs.vfat >/dev/null || die "mkfs.vfat is missing"
-command -v mcopy >/dev/null || die "mcopy is missing"
-command -v cpio >/dev/null || die "cpio is missing"
-command -v lzma >/dev/null || die "lzma is missing"
-command -v dd >/dev/null || die "dd is missing"
-command -v xxd >/dev/null || die "xxd is missing"
+case "$SOC" in
+	rk3399)
+		DEFAULT_DTB_NAME="rk3399-nanopc-t4-dsm.dtb"
+		DEFAULT_KERNEL_DEFCONFIG="rk3399_dsm_defconfig"
+		DEFAULT_CONSOLE="ttyS2,1500000"
+		DEFAULT_EARLYCON="uart8250,mmio32,0xff1a0000"
+		LOADER_PATTERN="$PROJECT_DIR/u-boot/rk3399_loader*.bin"
+		EXTLINUX_LABEL="DSM-rk3399"
+		NEED_TRUST=1
+		;;
+	rk3566)
+		DEFAULT_DTB_NAME="rk3566-oec-box-wxy4-dsm.dtb"
+		DEFAULT_KERNEL_DEFCONFIG="rk3566_dsm_defconfig"
+		DEFAULT_CONSOLE="ttyS2,1500000"
+		DEFAULT_EARLYCON="uart8250,mmio32,0xfe660000"
+		LOADER_PATTERN="$PROJECT_DIR/tools/rkbin/rk3566/wxy-oect/MiniLoaderAll.bin $PROJECT_DIR/u-boot/rk356x_spl_loader*.bin"
+		EXTLINUX_LABEL="DSM-rk3566"
+		NEED_TRUST=0
+		NEED_UBOOT=0
+		NEED_PARAMETER=1
+		;;
+	rk3568)
+		DEFAULT_DTB_NAME="rk3568-evb1-ddr4-v10.dtb"
+		DEFAULT_KERNEL_DEFCONFIG="rk3568_dsm_defconfig"
+		DEFAULT_CONSOLE="ttyS2,1500000"
+		DEFAULT_EARLYCON="uart8250,mmio32,0xfe660000"
+		LOADER_PATTERN="$PROJECT_DIR/u-boot/rk356x_spl_loader*.bin"
+		EXTLINUX_LABEL="DSM-rk3568"
+		NEED_TRUST=0
+		NEED_UBOOT=1
+		NEED_PARAMETER=1
+		;;
+	*)
+		die "unsupported SOC: $SOC"
+		;;
+esac
+
+if [ "$SOC" = "rk3399" ]; then
+	NEED_UBOOT=1
+	NEED_PARAMETER=1
+fi
+
+DTB_NAME="${DTB_NAME:-$DEFAULT_DTB_NAME}"
+KERNEL_DEFCONFIG="${KERNEL_DEFCONFIG:-$DEFAULT_KERNEL_DEFCONFIG}"
+CONSOLE="${CONSOLE:-$DEFAULT_CONSOLE}"
+EARLYCON="${EARLYCON:-$DEFAULT_EARLYCON}"
+CHIP_DIR="${CHIP_DIR:-$PROJECT_DIR/tools/rkbin/$SOC}"
+UPDATE_OUT="$OUT_DIR/${UPDATE_BASENAME:-$SOC-dsm-update.img}"
+RAW_UPDATE_OUT="$OUT_DIR/${RAW_UPDATE_BASENAME:-$SOC-dsm-raw.img}"
+KERNEL_DTB="$KERNEL_BUILD/arch/arm64/boot/dts/rockchip/$DTB_NAME"
+RAW_BOOTLOADER_BIN="${RAW_BOOTLOADER_BIN:-}"
+if [ -z "$RAW_BOOTLOADER_BIN" ] && [ "$SOC" = "rk3566" ]; then
+	RAW_BOOTLOADER_BIN="$PROJECT_DIR/tools/rkbin/rk3566/wxy-oect/bootloader.bin"
+fi
+LOADER_BIN="${LOADER_BIN:-}"
+if [ -z "$LOADER_BIN" ]; then
+	LOADER_BIN="$(find_first_file "$LOADER_PATTERN" || true)"
+fi
+
+if [ "$KERNEL_ONLY" -eq 0 ]; then
+	command -v mkfs.vfat >/dev/null || die "mkfs.vfat is missing"
+	command -v mcopy >/dev/null || die "mcopy is missing"
+	command -v cpio >/dev/null || die "cpio is missing"
+	command -v lzma >/dev/null || die "lzma is missing"
+	command -v dd >/dev/null || die "dd is missing"
+	command -v xxd >/dev/null || die "xxd is missing"
+fi
 
 validate_syno_identity
 
-need_file "$CHIP_DIR/parameter-dsm.txt"
-need_file "$CHIP_DIR/package-file-dsm"
-need_file "$PROJECT_DIR/u-boot/rk3399_loader_v1.30.130.bin" "build u-boot first"
-need_file "$PROJECT_DIR/u-boot/uboot.img" "build u-boot first"
-need_file "$PROJECT_DIR/u-boot/trust.img" "build u-boot first"
-need_file "$PACK_TOOL_DIR/afptool" "missing local Rockchip pack tool"
-need_file "$PACK_TOOL_DIR/rkImageMaker" "missing local Rockchip pack tool"
+if [ "$KERNEL_ONLY" -eq 0 ]; then
+	need_file "$CHIP_DIR/package-file-dsm"
+	if [ "$NEED_PARAMETER" -eq 1 ]; then
+		need_file "$CHIP_DIR/parameter-dsm.txt"
+	fi
+	need_file "$LOADER_BIN" "build u-boot first or set LOADER_BIN"
+	if [ "$NEED_UBOOT" -eq 1 ]; then
+		need_file "$PROJECT_DIR/u-boot/uboot.img" "build u-boot first"
+	fi
+	if [ "$NEED_TRUST" -eq 1 ]; then
+		need_file "$PROJECT_DIR/u-boot/trust.img" "build u-boot first"
+	fi
+	need_file "$PACK_TOOL_DIR/afptool" "missing local Rockchip pack tool"
+	need_file "$PACK_TOOL_DIR/rkImageMaker" "missing local Rockchip pack tool"
+fi
 
 if [ "$PACK_ONLY" -eq 0 ]; then
 	need_file "$KERNEL_SRC/Makefile" "kernel source tree is missing"
 	need_file "$KERNEL_SRC/arch/arm64/configs/$KERNEL_DEFCONFIG" "kernel defconfig is missing"
 
-	if [ -z "${CROSS_COMPILE:-}" ]; then
-		CROSS_COMPILE="$(detect_cross_compile)" || die "set CROSS_COMPILE to an aarch64 toolchain prefix"
-	fi
+	ensure_cross_compile
 
 	configure_kernel_if_needed
 	log "building kernel Image and dtb"
-	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image.gz dtbs
+	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image Image.gz dtbs
 	log "building all kernel modules"
 	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" modules
 	prune_stale_kernel_modules
@@ -320,8 +424,8 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 	mv "$LZMA_INITRD" "$PATCHED_UINITRD"
 fi
 
-need_file "$KERNEL_IMAGE" "build the DSM RK3399 kernel first"
-need_file "$KERNEL_DTB" "build the DSM RK3399 dtb first"
+need_file "$KERNEL_IMAGE" "build the DSM $SOC kernel first"
+need_file "$KERNEL_DTB" "build the DSM $SOC dtb first"
 need_file "$PATCHED_UINITRD" "build or restore DSM uInitrd first"
 if [ -n "${SYNO_BOOT_LOGO:-}" ]; then
 	need_file "$SYNO_BOOT_LOGO" "SYNO_BOOT_LOGO file not found"
@@ -329,11 +433,11 @@ fi
 
 log "preparing DSM boot tree"
 rm -rf "$BOOT_ROOT"
-mkdir -p "$BOOT_ROOT/boot/extlinux"
+mkdir -p "$BOOT_ROOT/boot/extlinux" "$BOOT_ROOT/extlinux"
 install -D -m 0644 "$PATCHED_UINITRD" "$BOOT_ROOT/boot/uInitrd"
 
-install -D -m 0755 "$KERNEL_IMAGE" "$BOOT_ROOT/boot/Image.gz"
-install -D -m 0644 "$KERNEL_DTB" "$BOOT_ROOT/boot/rk3399-nanopc-t4-dsm.dtb"
+install -D -m 0755 "$KERNEL_IMAGE" "$BOOT_ROOT/boot/Image"
+install -D -m 0644 "$KERNEL_DTB" "$BOOT_ROOT/boot/$DTB_NAME"
 if [ -n "${SYNO_BOOT_LOGO:-}" ]; then
 	install -D -m 0644 "$SYNO_BOOT_LOGO" "$BOOT_ROOT/logo.bmp"
 fi
@@ -347,13 +451,16 @@ BOOTARGS=(
 	uio_pdrv_genirq.of_id=generic-uio
 	vender_format_version=2
 	vendor_format_version=2
-	console=ttyS2,1500000
-	earlycon=uart8250,mmio32,0xff1a0000
+	console="$CONSOLE"
+	earlycon="$EARLYCON"
 	fw_devlink=permissive
-	swiotlb=1
-	coherent_pool=1m
+	swiotlb="$SWIOTLB"
+	coherent_pool="$COHERENT_POOL"
 	vt.global_cursor_default=0
 	fbcon=map:1
+	deferred_probe_timeout=5
+	regulator_ignore_unused
+	clk_ignore_unused
 )
 
 if [ -n "$SYNO_MAC1" ]; then
@@ -365,18 +472,26 @@ fi
 if [ -n "$SYNO_CUSTOM_SN" ]; then
 	BOOTARGS+=(custom_sn="$SYNO_CUSTOM_SN")
 fi
+if [ -n "${DEBUG_BOOTARGS:-}" ]; then
+	# Space-separated extra kernel arguments for one-off boot diagnostics.
+	# Example: DEBUG_BOOTARGS="deferred_probe_timeout=5 initcall_debug ignore_loglevel loglevel=8"
+	# shellcheck disable=SC2206
+	DEBUG_BOOTARGS_ARRAY=($DEBUG_BOOTARGS)
+	BOOTARGS+=("${DEBUG_BOOTARGS_ARRAY[@]}")
+fi
 
 {
-	cat <<'EOF'
-label DSM-rk3399
-  kernel /boot/Image.gz
+	cat <<EOF
+label $EXTLINUX_LABEL
+  kernel /boot/Image
   initrd /boot/uInitrd
-  fdt /boot/rk3399-nanopc-t4-dsm.dtb
+  fdt /boot/$DTB_NAME
 EOF
 	printf '  append'
 	printf ' %s' "${BOOTARGS[@]}"
 	printf '\n'
 } > "$BOOT_ROOT/boot/extlinux/extlinux.conf"
+cp -f "$BOOT_ROOT/boot/extlinux/extlinux.conf" "$BOOT_ROOT/extlinux/extlinux.conf"
 
 log "building FAT32 boot image"
 rm -f "$BOOT_IMG"
@@ -386,11 +501,18 @@ MTOOLS_SKIP_CHECK=1 mcopy -i "$BOOT_IMG" -s "$BOOT_ROOT"/* ::/
 
 log "preparing firmware links"
 mkdir -p "$FIRMWARE_DIR"
-rm -f "$FIRMWARE_DIR/misc.img"
-ln -rsf "$PROJECT_DIR/u-boot/rk3399_loader_v1.30.130.bin" "$FIRMWARE_DIR/MiniLoaderAll.bin"
-ln -rsf "$PROJECT_DIR/u-boot/uboot.img" "$FIRMWARE_DIR/uboot.img"
-ln -rsf "$PROJECT_DIR/u-boot/trust.img" "$FIRMWARE_DIR/trust.img"
-ln -rsf "$CHIP_DIR/parameter-dsm.txt" "$FIRMWARE_DIR/parameter.txt"
+rm -f "$FIRMWARE_DIR/misc.img" "$FIRMWARE_DIR/parameter.txt" \
+	"$FIRMWARE_DIR/uboot.img" "$FIRMWARE_DIR/trust.img"
+ln -rsf "$LOADER_BIN" "$FIRMWARE_DIR/MiniLoaderAll.bin"
+if [ "$NEED_UBOOT" -eq 1 ]; then
+	ln -rsf "$PROJECT_DIR/u-boot/uboot.img" "$FIRMWARE_DIR/uboot.img"
+fi
+if [ "$NEED_TRUST" -eq 1 ]; then
+	ln -rsf "$PROJECT_DIR/u-boot/trust.img" "$FIRMWARE_DIR/trust.img"
+fi
+if [ "$NEED_PARAMETER" -eq 1 ]; then
+	ln -rsf "$CHIP_DIR/parameter-dsm.txt" "$FIRMWARE_DIR/parameter.txt"
+fi
 ln -rsf "$BOOT_IMG" "$FIRMWARE_DIR/boot.img"
 
 log "packing Rockchip update.img"
@@ -406,3 +528,11 @@ rm -rf "$FIRMWARE_DIR/update.raw.img" "$FIRMWARE_DIR/update.img"
 need_file "$FIRMWARE_DIR/update.img" "Rockchip update image pack failed"
 cp -f "$FIRMWARE_DIR/update.img" "$UPDATE_OUT"
 log "done: $UPDATE_OUT"
+
+if [ -n "$RAW_BOOTLOADER_BIN" ] && [ -r "$RAW_BOOTLOADER_BIN" ]; then
+	log "packing raw disk image"
+	"$RAW_PACK_SCRIPT" "$RAW_BOOTLOADER_BIN" "$BOOT_IMG" "$RAW_UPDATE_OUT" >/dev/null
+	log "done: $RAW_UPDATE_OUT"
+elif [ -n "$RAW_BOOTLOADER_BIN" ]; then
+	log "skip raw disk image: $RAW_BOOTLOADER_BIN is missing"
+fi

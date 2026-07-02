@@ -193,6 +193,43 @@ read_version_key() {
   sed -n "s/^${key}=\"\\([^\"]*\\)\".*/\\1/p" "${file}"
 }
 
+patch_model_dtb_rk3566_sata_slots() {
+  local max_disks="${SYNO_MAX_DISKS:-6}"
+  local model_dtb slot slot_node ahci_node rtk_ahci_node actual
+
+  case "${max_disks}" in
+    ''|*[!0-9]*) die "SYNO_MAX_DISKS must be a positive integer" ;;
+  esac
+  [ "${max_disks}" -gt 0 ] || die "SYNO_MAX_DISKS must be greater than zero"
+
+  msg "patching initrd model.dtb RK3566 SATA slots 1-${max_disks}"
+  for model_dtb in \
+    "${PATCHED_RD_DIR}/etc/model.dtb" \
+    "${PATCHED_RD_DIR}/etc.defaults/model.dtb"; do
+    need_file "${model_dtb}"
+
+    for ((slot = 1; slot <= max_disks; slot++)); do
+      slot_node="/internal_slot@${slot}"
+      ahci_node="${slot_node}/ahci"
+      rtk_ahci_node="${slot_node}/rtk_ahci"
+
+      fdtput -cp "${model_dtb}" "${ahci_node}"
+      fdtput -cp "${model_dtb}" "${rtk_ahci_node}"
+      fdtput -t s "${model_dtb}" "${slot_node}" protocol_type sata
+      fdtput -t x "${model_dtb}" "${ahci_node}" ata_port "$((slot - 1))"
+      fdtput -t x "${model_dtb}" "${rtk_ahci_node}" ata_port "$((slot - 1))"
+      fdtput -d "${model_dtb}" "${ahci_node}" pcie_root 2>/dev/null || true
+
+      actual="$(fdtget -t x "${model_dtb}" "${ahci_node}" ata_port)"
+      [ "${actual}" = "$((slot - 1))" ] || \
+        die "failed to patch ${ahci_node}/ata_port in ${model_dtb}: got ${actual}"
+      actual="$(fdtget -t x "${model_dtb}" "${rtk_ahci_node}" ata_port)"
+      [ "${actual}" = "$((slot - 1))" ] || \
+        die "failed to patch ${rtk_ahci_node}/ata_port in ${model_dtb}: got ${actual}"
+    done
+  done
+}
+
 patch_model_dtb_sata_pcie_root() {
   local pcie_root="${SYNO_SATA_PCIE_ROOT:-0000:00:00.0,00.0}"
   local max_disks="${SYNO_MAX_DISKS:-6}"
@@ -227,6 +264,17 @@ patch_model_dtb_sata_pcie_root() {
         die "failed to patch ${ahci_node}/pcie_root in ${model_dtb}: got ${actual}"
     done
   done
+}
+
+patch_model_dtb_sata_slots() {
+  case "${SOC:-rk3399}" in
+    rk3566)
+      patch_model_dtb_rk3566_sata_slots
+      ;;
+    *)
+      patch_model_dtb_sata_pcie_root
+      ;;
+  esac
 }
 
 set_synoinfo_kv() {
@@ -318,7 +366,7 @@ patch_initrd_root() {
     apply_patch_series
   )
 
-  patch_model_dtb_sata_pcie_root
+  patch_model_dtb_sata_slots
   patch_synoinfo_disk_count
   "${PATCH_ROOT_DIR}/0000-rk-initrd-fixes.sh" "${PATCHED_RD_DIR}"
 

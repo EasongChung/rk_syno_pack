@@ -13,9 +13,9 @@ Usage:
 
 Targets:
   pat        download/extract/patch DSM 7.4-90075 pat and generate patched rd.bin/uInitrd
-  uboot      build u-boot/trust/loader artifacts locally
+  uboot      build u-boot and loader artifacts locally
   kernel     build DSM kernel Image/dtb
-  updateimg  generate Rockchip update.img using this project only
+  updateimg  generate Rockchip update.img and raw disk image using this project only
   all        run uboot -> kernel -> pat -> updateimg
 
 Environment:
@@ -25,7 +25,11 @@ Environment:
   KERNEL_SRC      kernel source tree
   KERNEL_BUILD    kernel build output dir
   CROSS_COMPILE   aarch64 compiler prefix
-  UBOOT_DEFCONFIG u-boot defconfig, defaults to evb-rk3399
+  SOC             Rockchip SoC selector: rk3399, rk3566, rk3568; defaults to rk3399
+  UBOOT_DEFCONFIG u-boot defconfig, defaults from SOC
+  DTB_NAME        DTB file name under arch/arm64/boot/dts/rockchip
+  LOADER_BIN      MiniLoaderAll.bin source path, auto-detected from u-boot when unset
+  RAW_BOOTLOADER_BIN raw bootloader block for rkdeveloptool wl 0x0 image
   SYNO_SATA_PCIE_ROOT  SATA pcie_root written into initrd model.dtb
                        defaults to 0000:00:00.0,00.0
   SYNO_MAX_DISKS       DSM internal slot count written into initrd model.dtb
