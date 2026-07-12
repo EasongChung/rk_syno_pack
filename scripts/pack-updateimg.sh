@@ -354,8 +354,9 @@ KERNEL_DEFCONFIG="${KERNEL_DEFCONFIG:-$DEFAULT_KERNEL_DEFCONFIG}"
 CONSOLE="${CONSOLE:-$DEFAULT_CONSOLE}"
 EARLYCON="${EARLYCON:-$DEFAULT_EARLYCON}"
 CHIP_DIR="${CHIP_DIR:-$PROJECT_DIR/tools/rkbin/$SOC}"
-UPDATE_OUT="$OUT_DIR/${UPDATE_BASENAME:-$SOC-dsm-update.img}"
-RAW_UPDATE_OUT="$OUT_DIR/${RAW_UPDATE_BASENAME:-$SOC-dsm-raw.img}"
+OUTPUT_DATE="${OUTPUT_DATE:-$(date +%Y%m%d)}"
+UPDATE_OUT="$OUT_DIR/${UPDATE_BASENAME:-$SOC-dsm-update_$OUTPUT_DATE.img}"
+RAW_UPDATE_OUT="$OUT_DIR/${RAW_UPDATE_BASENAME:-$SOC-dsm-raw_$OUTPUT_DATE.img}"
 KERNEL_DTB="$KERNEL_BUILD/arch/arm64/boot/dts/rockchip/$DTB_NAME"
 RAW_BOOTLOADER_BIN="${RAW_BOOTLOADER_BIN:-}"
 if [ -z "$RAW_BOOTLOADER_BIN" ] && [ "$SOC" = "rk3566" ]; then
@@ -456,12 +457,18 @@ BOOTARGS=(
 	fw_devlink=permissive
 	swiotlb="$SWIOTLB"
 	coherent_pool="$COHERENT_POOL"
-	vt.global_cursor_default=0
-	fbcon=map:1
-	deferred_probe_timeout=5
-	regulator_ignore_unused
-	clk_ignore_unused
 )
+
+case "$SOC" in
+	rk3399)
+		BOOTARGS+=(
+			vt.global_cursor_default=0
+			fbcon=map:1
+		)
+		;;
+	*)
+		;;
+esac
 
 if [ -n "$SYNO_MAC1" ]; then
 	BOOTARGS+=(mac1="$SYNO_MAC1")
