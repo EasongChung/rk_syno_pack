@@ -1,0 +1,6 @@
+[submodule "tools/SynoXtract"]
+	path = tools/SynoXtract
+	url = https://github.com/prt1999/SynoXtract.git
+[submodule "linux-5.10.x"]
+	path = linux-5.10.x
+	url = https://github.com/931122/rk_syno_kernel.git
