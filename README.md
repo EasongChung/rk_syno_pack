@@ -1,301 +1,325 @@
-# syno rk3399 patchkit
+# Synology DSM Rockchip 构建工具
 
-这个目录是当前项目根目录，用来完成这条完整流程：
+本项目用于编译 Rockchip 平台的 DSM 内核、修补 DS423 PAT/initrd，并生成
+可启动的 `boot.img`、Rockchip `update.img` 和 raw eMMC 镜像。
 
-1. 编译 `u-boot`
-2. 编译 RK3399 DSM 内核
-3. 解包官方 `DSM_DS423_86009.pat`
-4. 给 `initrd` 打补丁并替换内核刚编出来的 `syno_hddmon.ko`
-5. 重新打包 `uInitrd`
-6. 生成 Rockchip `update.img`
+## 支持的平台
 
-当前已经切到直接使用 `SynoXtract` 解官方加密 `pat`。
+| `SOC` | 板卡 | 内核配置 | 默认 DTB |
+| --- | --- | --- | --- |
+| `rk3399` | FriendlyElec NanoPC-T4 | `rk3399_dsm_defconfig` | `rk3399-nanopc-t4-dsm.dtb` |
+| `rk3566` | WXY/OECT Box | `rk3566_dsm_defconfig` | `rk3566-oec-box-wxy4-dsm.dtb` |
+| `rk3568` | RK3568 EVB1 DDR4 V10 | `rk3568_dsm_defconfig` | `rk3568-evb1-ddr4-v10.dtb` |
+
+未指定 `SOC` 时默认编译 `rk3399`。建议每条构建命令都显式传入
+`SOC`，避免把不同平台的内核、DTB 和 initrd 混在一起。
 
 ## 系统依赖
 
-先安装宿主机依赖：
+在 Debian/Ubuntu 主机上安装：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
   build-essential bc bison flex libssl-dev libelf-dev dwarves \
-  cpio xz-utils patch curl e2fsprogs device-tree-compiler vim-common \
-  dosfstools mtools libsodium-dev libmsgpack-dev
+  cpio xz-utils patch curl e2fsprogs device-tree-compiler \
+  dosfstools mtools gdisk gzip vim-common \
+  libsodium-dev libmsgpack-dev
 ```
 
-## 当前目录
+项目已包含 AArch64 交叉工具链、`SynoXtract` 和 Rockchip 打包工具，
+通常不需要单独配置 `CROSS_COMPILE`。
 
-- `build.sh`
-  - 顶层入口
-- `build/`
-  - 构建输出和临时过程目录
-- `scripts/`
-  - 所有构建脚本
-- `patches/`
-  - `initrd` 补丁，按 `0001-*.patch` 顺序自动执行
-- `linux-5.10.x/`
-  - 内核源码
-- `u-boot/`
-  - U-Boot 源码
-- `tools/`
-  - `SynoXtract`
-  - `linux_pack`
-  - `prebuilts`
-  - `rkbin`
+## 快速开始
 
-## build 目录说明
-
-`build/` 只放中间产物和输出，不放脚本。
-
-当前会用到这些目录：
-
-- `build/out/kernel`
-  - 内核编译输出
-- `build/DSM_DS423_86009.pat`
-  - 本地官方 `pat`
-- `build/pat-extract`
-  - `pat` 解包结果
-- `build/pat-rd`
-  - 从 `rd.bin` 解出的原始 rootfs
-- `build/pat-rd-patched`
-  - 打完补丁后的 rootfs
-- `build/rd.bin`
-  - 重新打包后的 patched `rd.bin`
-- `build/boot-patched`
-  - 从官方 `pat` 重打出来的 `uInitrd`
-- `output/dsm/boot-root`
-  - 生成 `boot.img` 时临时组装的 boot 文件树
-
-## 当前补丁内容
-
-### linuxrc.syno.impl
-
-- `synocfgen` 前增加 `sleep 5`
-- 注释掉 `rmmod synobios`
-- 设置 `red-led` trigger 为 `disk-activity`
-
-### etc/rc
-
-- 在 `exit 0` 前增加 `/sbin/getty 1500000 console`
-
-补丁目录：
-
-- [patches](/home/yxl/my_proj/syno/patches:1)
-
-### root password
-
-- 通过 `0003-etc.shadow-root-password.patch` 同时修改 `etc/passwd` 和 `etc/shadow` 中的 `root` 条目
-- 通过 `0005-rk3399-load-extra-usb-modules.patch` 早期加载 RK3399 USB、DWC3 和 quota 模块
-- `./build.sh pat` 会把自编内核的 `quota_tree.ko`、`quota_v1.ko`、`quota_v2.ko` 放进 initrd，并在 `linuxrc.syno.impl` 早期加载，保证 DS423 安装阶段新建的 ext4 quota 根分区可以挂载
-- 内核内建 `mtdram`，启动时注册 8 个 RAM-backed
-  Synology/Realtek junior 风格 MTD 分区。DS423 的 junior `updater` 会读取
-  `/dev/mtd7` 的 FIS 信息，并按 `/dev/mtd0..7` 更新 `zImage/model.dtb/rd.bin`
-  等内容；RK3399 没有 Synology 原生 junior flash 布局，所以这里提供安装阶段
-  探测和写入使用的假 SPI NOR。该 RAM MTD 模拟为 16MiB、4KiB erase block，
-  分区布局来自 `uboot_DS423.bin` 的 `mtdparts=RtkSFC`：
-  `RedBoot/zImage/dtb/rd.gz/vendor/pstore/Misc Info/FIS directory`。
-
-### syno_hddmon.ko
-
-当前替换的是内核树里编出来、适配 `RK3399 + PCIe 转 SATA` 的版本：
-
-- 如果不存在 Synology 原生盘位 GPIO/SMBus 电源控制
-- 直接跳过 HDD monitor
-
-模块产物：
-
-- [build/out/kernel/drivers/hwmon/syno_hddmon.ko](/home/yxl/my_proj/syno/build/out/kernel/drivers/hwmon/syno_hddmon.ko:1)
-
-## 构建入口
-
-顶层只保留一个入口：
+所有命令都在项目根目录执行：
 
 ```bash
 cd /home/yxl/my_proj/syno
-./build.sh <target>
+./build.sh --help
 ```
 
-支持的 target：
+### RK3566 WXY/OECT
 
-- `uboot`
-- `kernel`
-- `pat`
-- `updateimg`
-- `all`
-
-## 推荐流程
-
-### 1. 编译 u-boot
+RK3566 使用 `tools/rkbin/rk3566/wxy-oect/` 中的板级 vendor
+bootloader，不需要编译或替换 U-Boot。推荐按下面的顺序执行：
 
 ```bash
-./build.sh uboot
+SOC=rk3566 JOBS="$(nproc)" ./build.sh kernel
+SOC=rk3566 DSM_PAT_VERSION=7.4.1 ./build.sh pat
+SOC=rk3566 ./build.sh updateimg
 ```
 
-产物：
-
-- `u-boot/rk3399_loader_v1.30.130.bin`
-- `u-boot/uboot.img`
-- `u-boot/trust.img`
-
-### 2. 编译内核
+### RK3399
 
 ```bash
+SOC=rk3399 JOBS="$(nproc)" ./build.sh all
+```
+
+也可以分步执行：
+
+```bash
+SOC=rk3399 ./build.sh uboot
+SOC=rk3399 JOBS="$(nproc)" ./build.sh kernel
+SOC=rk3399 DSM_PAT_VERSION=7.4.1 ./build.sh pat
+SOC=rk3399 ./build.sh updateimg
+```
+
+### RK3568
+
+```bash
+SOC=rk3568 JOBS="$(nproc)" ./build.sh all
+```
+
+调试时建议分步执行，修改内核后只需重新运行：
+
+```bash
+SOC=rk3568 JOBS="$(nproc)" ./build.sh kernel
+```
+
+## 构建目标
+
+```text
+./build.sh [all|pat|uboot|kernel|updateimg]
+```
+
+| target | 作用 |
+| --- | --- |
+| `kernel` | 应用当前平台 defconfig，编译 `Image`、`Image.gz`、DTB 和全部模块 |
+| `pat` | 下载或读取 DS423 PAT，解包并修补 initrd，生成 `rd.bin` 和 `uInitrd` |
+| `uboot` | 编译当前平台 U-Boot；主要用于 RK3399 和 RK3568 |
+| `updateimg` | 使用已有内核、DTB 和 `uInitrd` 生成启动及烧录镜像 |
+| `all` | 依次执行 `uboot -> kernel -> pat -> updateimg` |
+
+内核应通过 `./build.sh kernel` 编译，不要直接调用内核目录中的
+`make`。构建脚本会选择对应 defconfig、输出目录和 DTB，并清理已失效的
+模块产物。
+
+## 编译内核
+
+基本用法：
+
+```bash
+SOC=rk3566 JOBS=32 ./build.sh kernel
+```
+
+默认产物目录为 `build/out/kernel-7.3/`，主要文件包括：
+
+```text
+build/out/kernel-7.3/arch/arm64/boot/Image
+build/out/kernel-7.3/arch/arm64/boot/Image.gz
+build/out/kernel-7.3/arch/arm64/boot/dts/rockchip/<DTB_NAME>
+build/out/kernel-7.3/drivers/hwmon/syno_hddmon.ko
+```
+
+覆盖内核源码、输出目录、配置或 DTB：
+
+```bash
+SOC=rk3566 \
+KERNEL_SRC=/path/to/linux-5.10.x \
+KERNEL_BUILD=/path/to/kernel-out \
+KERNEL_DEFCONFIG=rk3566_dsm_defconfig \
+DTB_NAME=rk3566-oec-box-wxy4-dsm.dtb \
+JOBS=32 \
 ./build.sh kernel
 ```
 
-产物：
+如果使用自定义 `KERNEL_BUILD`，后续 `pat` 和 `updateimg` 也要传入同一个值。
 
-- `build/out/kernel-7.3/arch/arm64/boot/Image`
-- `build/out/kernel-7.3/arch/arm64/boot/dts/rockchip/rk3399-nanopc-t4-dsm.dtb`
+## 修补 PAT 和 initrd
 
-### 3. 解包官方 pat 并重打 rd.bin/uInitrd
-
-先把官方 `pat` 放到：
-
-- `build/DSM_DS423_86009.pat`
-
-然后执行：
+默认下载并处理 DS423 DSM 7.4.1-90080：
 
 ```bash
+SOC=rk3566 ./build.sh pat
+```
+
+可用的版本选择：
+
+| `DSM_PAT_VERSION` | PAT |
+| --- | --- |
+| `7.4.1` 或 `90080` | DSM 7.4.1-90080，默认 |
+| `7.4` 或 `90075` | DSM 7.4-90075 |
+| `7.3`、`7.3.2` 或 `86009` | DSM 7.3.2-86009 |
+
+使用本地 PAT：
+
+```bash
+SOC=rk3566 \
+DSM_PAT_VERSION=7.4.1 \
+PAT_FILE=/path/to/DSM_DS423_90080.pat \
 ./build.sh pat
 ```
 
-当前默认流程：
-
-1. 使用 `tools/SynoXtract/synoxtract` 解 `pat`
-2. 提取 `rd.bin`
-3. 解开 `rd.bin`
-4. 按 `patches/0001-*.patch` 顺序应用通用补丁（没有补丁时跳过）
-5. 修正 `initrd` 里的 `model.dtb` SATA 盘位 PCIe 路径
-6. 修正 `initrd` 里的 `synoinfo.conf` 盘位数量
-7. 执行 `patches/0000-rk-initrd-fixes.sh` 注入 RK3399 运行时修补
-8. 替换 `build/out/kernel-7.3/drivers/hwmon/syno_hddmon.ko`
-9. 重新打包 `rd.bin`
-10. 生成新的 `uInitrd`
-
-默认会把 DS423 的 `/internal_slot@1..6/ahci/pcie_root` 改成当前
-RK3399 + PCIe 转 SATA HBA 的路径：
-
-- `SYNO_SATA_PCIE_ROOT=0000:00:00.0,00.0`
-
-如果 PCIe HBA 枚举路径变化，可以在 `pat` 阶段覆盖：
+使用自定义下载地址：
 
 ```bash
-SYNO_SATA_PCIE_ROOT=0000:00:00.0,00.0 ./build.sh pat
-```
-
-`patches/` 目录不再按 DSM 7.2/7.3 分版本。版本相关且容易冲突的
-`linuxrc` / `webman` 修改已改为脚本注入，集中在
-`patches/0000-rk-initrd-fixes.sh`。
-
-关键产物：
-
-- `build/rd.bin`
-- `build/boot-patched/uInitrd`
-
-### 3.1 只修补已有 initrd 文件
-
-如果已经在 buildroot 或其他流程里拿到了 `rd.bin` / `uInitrd`，不需要走
-`PAT` 下载和解包流程，可以直接修补源文件：
-
-```bash
-scripts/patch-initrd-file.sh /path/to/rd.bin /path/to/rd.bin.patched
-```
-
-这个入口会自己解开输入 initrd、执行同一套 RK3399 initrd 修补、再重新打包。
-
-### 4. 生成 update.img
-
-```bash
-./build.sh updateimg
-```
-
-产物：
-
-- `output/dsm/boot.img`
-- `output/firmware/update.img`
-- `output/dsm/rk3399-dsm-update.img`
-
-默认不会在 `extlinux.conf` 固定 MAC 和序列号。如果没有手动传
-`mac1=`/`sn=`/`custom_sn=`，U-Boot 会从 RK vendor storage 读取
-LAN MAC 和 SN，并在启动内核前补成 DSM 需要的参数：
-
-- `root=/dev/md0`
-- `SYNO_FW_VERSION=M.115`
-
-`SYNO_FW_VERSION` 要和当前 DS423 `PAT` 内的 `uboot_DS423.bin` 版本一致。
-DS423 7.3.2-86009 里是 `M.115`。如果这里低于 `PAT` 内的版本，
-官方 `updater` 会尝试更新 `/dev/mtd7`，在 RK3399 启动环境里会因为没有
-Synology 原生 MTD flash 而安装失败。
-
-如需强制从 `extlinux.conf` 传 MAC 或序列号，构建时传环境变量即可。
-`SYNO_MAC1` 使用 12 位十六进制，不带冒号；`SYNO_CUSTOM_SN` 不设置时
-默认跟随 `SYNO_SN`：
-
-```bash
-SYNO_MAC1=021132423001 SYNO_SN=RKG3399DS42301 SYNO_FW_VERSION=M.115 ./build.sh updateimg
-```
-
-### 5. 全流程
-
-```bash
-./build.sh all
-```
-
-顺序是：
-
-1. `uboot`
-2. `kernel`
-3. `pat`
-4. `updateimg`
-
-## 脚本说明
-
-- [build.sh](/home/yxl/my_proj/syno/build.sh:1)
-  - 顶层入口，只转发到 `scripts/build-main.sh`
-- [scripts/build-main.sh](/home/yxl/my_proj/syno/scripts/build-main.sh:1)
-  - 主流程控制
-- [scripts/build-uboot.sh](/home/yxl/my_proj/syno/scripts/build-uboot.sh:1)
-  - 编译 `u-boot`
-- [scripts/pack-updateimg.sh](/home/yxl/my_proj/syno/scripts/pack-updateimg.sh:1)
-  - 编译内核、使用 `build/boot-patched/uInitrd` 组装 `boot.img/update.img`
-- [scripts/common.sh](/home/yxl/my_proj/syno/scripts/common.sh:1)
-  - `pat` 解包、`rd.bin` 解包、补丁和重打包公共逻辑
-- [scripts/download_and_patch_pat.sh](/home/yxl/my_proj/syno/scripts/download_and_patch_pat.sh:1)
-  - 处理 `pat`
-- [scripts/patch_boot_a_img.sh](/home/yxl/my_proj/syno/scripts/patch_boot_a_img.sh:1)
-  - 把新的 `uInitrd` 写回 `boot_a.img`
-
-## 当前 pat 解包路线
-
-当前优先使用：
-
-- [tools/SynoXtract/synoxtract](/home/yxl/my_proj/syno/tools/SynoXtract/synoxtract:1)
-
-已经验证可以直接解这份官方包：
-
-- [build/DSM_DS423_86009.pat](/home/yxl/my_proj/syno/build/DSM_DS423_86009.pat:1)
-
-并正确提取：
-
-- `rd.bin`
-- `zImage`
-- `model.dtb`
-- `VERSION`
-
-## 一句话记法
-
-日常只需要记这几个命令：
-
-```bash
-./build.sh uboot
-./build.sh kernel
+SOC=rk3566 \
+PAT_URL=https://example.com/DSM_DS423_xxxxx.pat \
+PAT_FILE="$PWD/build/DSM_DS423_xxxxx.pat" \
 ./build.sh pat
+```
+
+主要产物：
+
+```text
+build/pat-extract/          PAT 解包目录
+build/pat-rd/               原始 initrd rootfs
+build/pat-rd-patched/       修补后的 initrd rootfs
+build/rd.bin                修补后的 rd.bin
+build/boot-patched/uInitrd  打包镜像使用的 initrd
+```
+
+`pat` 阶段会使用当前内核输出中的 `syno_hddmon.ko`，因此第一次完整构建时
+应先执行 `kernel`，再执行 `pat`。
+
+已有 `rd.bin` 时可以跳过 PAT 下载和解包：
+
+```bash
+SOC=rk3566 scripts/patch-initrd-file.sh \
+  /path/to/rd.bin \
+  /path/to/rd.bin.patched
+```
+
+如不需要替换 `syno_hddmon.ko`：
+
+```bash
+SOC=rk3566 INSTALL_SYNO_HDDMON=0 \
+  scripts/patch-initrd-file.sh /path/to/rd.bin
+```
+
+## 编译 U-Boot
+
+RK3399：
+
+```bash
+SOC=rk3399 ./build.sh uboot
+```
+
+主要产物：
+
+```text
+u-boot/rk3399_loader*.bin
+u-boot/uboot.img
+u-boot/trust.img
+```
+
+RK3568：
+
+```bash
+SOC=rk3568 ./build.sh uboot
+```
+
+RK3566 WXY/OECT 只能使用已验证的板级 vendor bootloader。打包脚本会自动
+读取：
+
+```text
+tools/rkbin/rk3566/wxy-oect/MiniLoaderAll.bin
+tools/rkbin/rk3566/wxy-oect/bootloader.bin
+```
+
+不要用通用 RK3566 U-Boot 覆盖该板 bootloader，除非已经准备好通过
+MaskROM 恢复。
+
+## 生成镜像
+
+生成镜像前必须已有当前平台的内核、DTB 和
+`build/boot-patched/uInitrd`：
+
+```bash
+SOC=rk3566 ./build.sh updateimg
+```
+
+通用产物：
+
+```text
+output/dsm/boot.img
+output/firmware/update.img
+output/dsm/<soc>-dsm-update_YYYYMMDD.img
+```
+
+RK3566 还会生成包含 vendor bootloader 和 GPT 的完整 raw 镜像，以及对应的
+gzip 压缩文件：
+
+```text
+output/dsm/rk3566-dsm-raw_YYYYMMDD.img
+output/dsm/rk3566-dsm-raw_YYYYMMDD.img.gz
+```
+
+在 MaskROM/Loader 模式烧写 raw 镜像会覆盖目标 eMMC，请先确认设备：
+
+```bash
+sudo rkdeveloptool db tools/rkbin/rk3566/wxy-oect/MiniLoaderAll.bin
+sudo rkdeveloptool wl 0x0 output/dsm/rk3566-dsm-raw_YYYYMMDD.img
+sudo rkdeveloptool rd
+```
+
+raw 镜像默认大小为 128 MiB，包含 32 MiB `boot` 分区和一个占用剩余空间的
+`userdata` 分区。可在打包时覆盖：
+
+```bash
+SOC=rk3566 \
+RAW_IMAGE_SIZE=256M \
+BOOT_PART_SIZE=32M \
+EXTRA_PARTS='rdnew:16M,userdata:0' \
 ./build.sh updateimg
 ```
 
-或者直接：
+## 常用环境变量
+
+| 变量 | 说明 |
+| --- | --- |
+| `SOC` | `rk3399`、`rk3566` 或 `rk3568`，默认 `rk3399` |
+| `JOBS` | 内核并行编译任务数，默认 `nproc` |
+| `DSM_PAT_VERSION` | PAT 版本选择，默认 `7.4.1` |
+| `PAT_FILE` | 本地 PAT 路径 |
+| `PAT_URL` | 自定义 PAT 下载地址 |
+| `KERNEL_SRC` | 内核源码目录，默认 `linux-5.10.x` |
+| `KERNEL_BUILD` | 内核输出目录，默认 `build/out/kernel-7.3` |
+| `KERNEL_DEFCONFIG` | 覆盖当前平台默认 defconfig |
+| `DTB_NAME` | 覆盖当前平台默认 DTB 文件名 |
+| `CROSS_COMPILE` | 覆盖自动检测到的交叉工具链前缀 |
+| `UBOOT_DEFCONFIG` | 覆盖当前平台 U-Boot defconfig |
+| `SYNO_MAX_DISKS` | initrd 中的 DSM 内置盘位数量，默认 `6` |
+| `SYNO_SATA_PCIE_ROOT` | RK3399/RK3568 SATA HBA 的 `pcie_root` |
+| `SYNO_MAC1` | 固定 LAN1 MAC，12 位十六进制且不带冒号 |
+| `SYNO_SN` | 固定 DSM 序列号 |
+| `SYNO_CUSTOM_SN` | 固定 custom serial，默认跟随 `SYNO_SN` |
+| `SYNO_FW_VERSION` | DSM bootarg 版本标记，默认 `M.115` |
+| `SWIOTLB` | 内核 `swiotlb` bootarg，默认 `32768` |
+| `COHERENT_POOL` | 内核 `coherent_pool` bootarg，默认 `4M` |
+| `DEBUG_BOOTARGS` | 临时追加内核调试参数 |
+| `OUTPUT_DATE` | 输出文件日期，默认 `YYYYMMDD` |
+
+例如固定身份信息并重新打包：
 
 ```bash
-./build.sh all
+SOC=rk3566 \
+SYNO_MAC1=021132423001 \
+SYNO_SN=RKG3566DS42301 \
+SYNO_FW_VERSION=M.115 \
+./build.sh updateimg
 ```
+
+## 目录说明
+
+```text
+build.sh                 顶层构建入口
+linux-5.10.x/            DSM/Rockchip 内核源码
+u-boot/                  Rockchip U-Boot 源码
+scripts/                 构建、PAT 和镜像脚本
+patches/                 initrd 补丁和 overlay
+tools/SynoXtract/        PAT 解包工具
+tools/linux_pack/        Rockchip update.img 打包工具
+tools/rkbin/             各 SoC/板卡的 rkbin 与分区描述
+build/                   中间产物和内核输出
+output/                  最终启动及烧录镜像
+```
+
+## 常见注意事项
+
+- 修改内核后执行 `SOC=<soc> ./build.sh kernel`。
+- 修改 initrd 补丁后执行 `SOC=<soc> ./build.sh pat`，再执行 `updateimg`。
+- 切换 `SOC` 后应重新执行 `kernel` 和 `pat`，不要复用上一平台的 initrd。
+- `updateimg` 只使用已有产物，不会自动重新编译内核或重新修补 PAT。
+- RK3566 WXY/OECT 使用 vendor bootloader，正常流程不需要 `uboot` target。
