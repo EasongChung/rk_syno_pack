@@ -17,10 +17,27 @@ static void usage(const char *prog)
 		"usage:\n"
 		"  %s discover\n"
 		"  %s mark (--camera-dir DIR | --camera-id ID | --camera-name NAME) "
-		"--start UNIX --stop UNIX [--create-missing] [--no-backup] [--dry-run]\n"
+		"--start UNIX --stop UNIX [--create-missing | --force-recording] "
+		"[--no-backup] [--dry-run]\n"
 		"  %s mark --camera-group N --map FILE --start UNIX --stop UNIX "
-		"[--create-missing] [--no-backup] [--dry-run]\n",
+		"[--create-missing | --force-recording] [--no-backup] [--dry-run]\n",
 		prog, prog, prog);
+}
+
+static void print_json_string(const char *s)
+{
+	putchar('"');
+	for (; *s; s++) {
+		unsigned char c = *s;
+
+		if (c == '"' || c == '\\')
+			printf("\\%c", c);
+		else if (c < 0x20)
+			printf("\\u%04x", c);
+		else
+			putchar(c);
+	}
+	putchar('"');
 }
 
 static int parse_time_arg(const char *s, time_t *out)
@@ -49,19 +66,25 @@ static int cmd_mark(int argc, char **argv)
 	bool backup = true;
 	bool dry_run = false;
 	bool create_missing = false;
+	bool force_recording = false;
 	int camera_id = -1;
 	int camera_group = -1;
+	int selectors = 0;
 	int i, ret;
 
 	for (i = 0; i < argc; i++) {
 		if (!strcmp(argv[i], "--camera-dir") && i + 1 < argc) {
 			camera_dir = argv[++i];
+			selectors++;
 		} else if (!strcmp(argv[i], "--camera-name") && i + 1 < argc) {
 			camera_name = argv[++i];
+			selectors++;
 		} else if (!strcmp(argv[i], "--camera-id") && i + 1 < argc) {
 			camera_id = atoi(argv[++i]);
+			selectors++;
 		} else if (!strcmp(argv[i], "--camera-group") && i + 1 < argc) {
 			camera_group = atoi(argv[++i]);
+			selectors++;
 		} else if (!strcmp(argv[i], "--map") && i + 1 < argc) {
 			map_path = argv[++i];
 		} else if (!strcmp(argv[i], "--start") && i + 1 < argc) {
@@ -74,6 +97,8 @@ static int cmd_mark(int argc, char **argv)
 			backup = false;
 		} else if (!strcmp(argv[i], "--create-missing")) {
 			create_missing = true;
+		} else if (!strcmp(argv[i], "--force-recording")) {
+			force_recording = true;
 		} else if (!strcmp(argv[i], "--dry-run")) {
 			dry_run = true;
 		} else {
@@ -81,7 +106,8 @@ static int cmd_mark(int argc, char **argv)
 		}
 	}
 
-	if (!start || !stop || start >= stop)
+	if (!start || !stop || start >= stop || selectors != 1 ||
+	    (create_missing && force_recording))
 		return -EINVAL;
 
 	if (!camera_dir) {
@@ -90,7 +116,9 @@ static int cmd_mark(int argc, char **argv)
 		ret = ss_camera_discover(cams, MAX_CAMERAS, &nr_cams);
 		if (ret)
 			return ret;
-		ss_camera_apply_group_map(cams, nr_cams, map_path);
+		ret = ss_camera_apply_group_map(cams, nr_cams, map_path);
+		if (ret)
+			return ret;
 		idx = ss_camera_find(cams, nr_cams, camera_id, camera_name,
 				     camera_group);
 		if (idx < 0)
@@ -98,7 +126,12 @@ static int cmd_mark(int argc, char **argv)
 		camera_dir = cams[idx].camera_dir;
 	}
 
-	if (create_missing)
+	if (force_recording)
+		ret = ss_reclog_mark_range_force_recording(camera_dir, start, stop,
+						     backup, dry_run,
+						     results, MAX_RESULTS,
+						     &nr);
+	else if (create_missing)
 		ret = ss_reclog_mark_range_create_missing(camera_dir, start, stop,
 							  backup, dry_run,
 							  results, MAX_RESULTS,
@@ -106,14 +139,18 @@ static int cmd_mark(int argc, char **argv)
 	else
 		ret = ss_reclog_mark_range(camera_dir, start, stop, backup, dry_run,
 					   results, MAX_RESULTS, &nr);
-	printf("{\"ok\":%s,\"dry_run\":%s,\"camera_dir\":\"%s\",\"results\":[",
-	       ret ? "false" : "true", dry_run ? "true" : "false", camera_dir);
+	printf("{\"ok\":%s,\"dry_run\":%s,\"camera_dir\":",
+	       ret ? "false" : "true", dry_run ? "true" : "false");
+	print_json_string(camera_dir);
+	printf(",\"results\":[");
 	for (i = 0; i < (int)nr; i++) {
 		struct ss_reclog_result *r = &results[i];
 
-		printf("%s{\"path\":\"%s\",\"exists\":%u,\"touched\":%u,"
-		       "\"changed\":%u,\"err\":%d}",
-		       i ? "," : "", r->path, r->exists, r->touched,
+		printf("%s{\"path\":", i ? "," : "");
+		print_json_string(r->path);
+		printf(",\"exists\":%u,\"touched\":%u,\"recorded\":%u,"
+		       "\"skipped\":%u,\"changed\":%u,\"err\":%d}",
+		       r->exists, r->touched, r->recorded, r->skipped,
 		       r->changed, r->err);
 	}
 	printf("],\"err\":%d}\n", ret);

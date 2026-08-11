@@ -4,6 +4,10 @@ Read-only SysV shared-memory scanner for Surveillance Station stream buffers.
 
 It never writes to shared memory. The first pass is intentionally simple:
 
+`--capture` requires exactly one stream selector: `--group`, `--base`, or a
+non-zero `--prefix`. This prevents multiple camera streams from being mixed
+into one Annex-B output file.
+
 ```sh
 ./ss_shm_tap --list
 ./ss_shm_tap --groups
@@ -15,7 +19,7 @@ It never writes to shared memory. The first pass is intentionally simple:
 The scanner reports JPEG markers, H.264/H.265 Annex-B start-code markers, and
 basic byte statistics so we can identify which segments carry live frames.
 
-`--capture` polls the frame slots and writes an Annex-B HEVC stream in serial
+`--capture` polls the frame slots and writes an Annex-B HEVC stream in timestamp
 order. It waits for a key/config frame by default, so the output is suitable for
 feeding into FFmpeg, MPP, or a later motion detector without opening the camera
 RTSP stream again.

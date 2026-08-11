@@ -94,17 +94,25 @@ validate_syno_identity()
 configure_kernel_if_needed()
 {
 	local config="$KERNEL_BUILD/.config"
+	local config_id="$KERNEL_BUILD/.dsm-defconfig"
 	local defconfig="$KERNEL_SRC/arch/arm64/configs/$KERNEL_DEFCONFIG"
+	local applied_defconfig=""
 
-	if [ ! -f "$config" ]; then
-		log "kernel .config missing, applying $KERNEL_DEFCONFIG"
+	if [ -f "$config_id" ]; then
+		read -r applied_defconfig < "$config_id" || true
+	fi
+
+	if [ ! -f "$config" ] || [ "$applied_defconfig" != "$KERNEL_DEFCONFIG" ]; then
+		log "applying kernel config $KERNEL_DEFCONFIG"
 		make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" "$KERNEL_DEFCONFIG"
+		printf '%s\n' "$KERNEL_DEFCONFIG" > "$config_id"
 		return 0
 	fi
 
 	if [ "$defconfig" -nt "$config" ]; then
 		log "$KERNEL_DEFCONFIG is newer than .config, reapplying defconfig"
 		make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" "$KERNEL_DEFCONFIG"
+		printf '%s\n' "$KERNEL_DEFCONFIG" > "$config_id"
 		return 0
 	fi
 

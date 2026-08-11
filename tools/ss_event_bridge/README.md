@@ -1,5 +1,9 @@
 # Surveillance Station Event Bridge
 
+This is a diagnostic and repair tool, not a production event daemon. Database
+schemas are version-specific; inspect and back up the target DSM databases
+before using a command that is not `--dry-run`.
+
 This helper is for the non-binary-patch diagnostic path: take a completed
 recording row that already has `event.trigger_label = 1`, then write a matching
 `detection_event_motion` row and thumbnail container entry.
@@ -93,13 +97,14 @@ Older test rows or incomplete native rows may have `thumb_token` values like
 
 ```sh
 sudo python3 ss_event_bridge.py repair-thumbnails \
+  --cam-id 1 \
   --camera-dir '/volume1/surveillance/鲁能门口' \
   --limit 20
 ```
 
 The repair command does not delete rows. It only fills missing or zero-length
 thumbnail tokens when it can find a covering recording event and source
-thumbnail.
+thumbnail for the explicitly selected camera.
 
 ## Sync RecLog From Existing Motion Rows
 

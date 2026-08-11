@@ -5,6 +5,8 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,20 +175,22 @@ static char *trim(char *s)
 	return s;
 }
 
-static void bind_name_to_id(struct ss_camera *cams, unsigned int nr_cams,
+static bool bind_name_to_id(struct ss_camera *cams, unsigned int nr_cams,
 			    const char *name, int id)
 {
 	unsigned int i;
 
 	if (!name || !*name || id < 0)
-		return;
+		return false;
 
 	for (i = 0; i < nr_cams; i++) {
 		if (!strcmp(cams[i].name, name)) {
 			cams[i].id = id;
-			return;
+			return true;
 		}
 	}
+
+	return false;
 }
 
 static int add_db_path(char paths[][SS_CAMERA_PATH_LEN], unsigned int *nr_paths,
@@ -270,8 +274,8 @@ static int try_bind_ids_from_query(struct ss_camera *cams, unsigned int nr_cams,
 		*sep++ = 0;
 		id = atoi(trim(line));
 		name = trim(sep);
-		bind_name_to_id(cams, nr_cams, name, id);
-		bound++;
+		if (bind_name_to_id(cams, nr_cams, name, id))
+			bound++;
 	}
 
 	pclose(fp);
@@ -359,12 +363,19 @@ int ss_camera_apply_group_map(struct ss_camera *cams, unsigned int nr_cams,
 	while (fgets(line, sizeof(line), fp)) {
 		char *p = trim(line);
 		char *name;
+		char *end;
+		long value;
 		int group;
 		unsigned int i;
 
 		if (!*p || *p == '#')
 			continue;
-		group = strtol(p, &name, 0);
+		errno = 0;
+		value = strtol(p, &end, 0);
+		if (errno || end == p || value < 0 || value > INT_MAX)
+			continue;
+		group = (int)value;
+		name = end;
 		name = trim(name);
 		if (!*name)
 			continue;
@@ -392,6 +403,22 @@ int ss_camera_find(struct ss_camera *cams, unsigned int nr_cams,
 		if (name && *name && !strcmp(cams[i].name, name))
 			return (int)i;
 		if (group >= 0 && cams[i].group == group)
+			return (int)i;
+	}
+
+	return -1;
+}
+
+int ss_camera_find_path(struct ss_camera *cams, unsigned int nr_cams,
+			const char *camera_dir)
+{
+	unsigned int i;
+
+	if (!camera_dir || !*camera_dir)
+		return -1;
+
+	for (i = 0; i < nr_cams; i++) {
+		if (!strcmp(cams[i].camera_dir, camera_dir))
 			return (int)i;
 	}
 

@@ -2,9 +2,10 @@
 import argparse
 import json
 import os
-import shutil
 import sqlite3
 import time
+
+from ss_event_bridge import patch_reclog_file
 
 
 DEFAULT_DETECTION_DB = "/volume1/@surveillance/detection_event.db"
@@ -74,44 +75,7 @@ def load_motion_rows(db, camera_id, start, stop, include_bad_thumb, motion_ids):
 
 
 def patch_file(path, ranges, dry_run, backup):
-    if not os.path.exists(path):
-        return {"path": path, "exists": False, "changed": 0}
-
-    with open(path, "rb") as f:
-        data = bytearray(f.read())
-
-    try:
-        base = int(os.path.basename(path).split("_", 1)[0])
-    except ValueError:
-        return {"path": path, "exists": True, "changed": 0, "error": "bad reclog name"}
-
-    max_slots = max(0, (len(data) - RECLOG_HEADER_SIZE) // RECLOG_RECORD_SIZE)
-    changed = 0
-    touched = 0
-
-    for start, stop in ranges:
-        start = max(start, base)
-        stop = min(stop, base + max_slots)
-        for ts in range(start, stop):
-            idx = ts - base
-            off = RECLOG_HEADER_SIZE + idx * RECLOG_RECORD_SIZE
-            if off + 1 >= len(data):
-                continue
-            touched += 1
-            if data[off] == 0:
-                continue
-            if data[off + 1] != 1:
-                data[off + 1] = 1
-                changed += 1
-
-    if changed and not dry_run:
-        if backup:
-            bak = path + ".bak-" + time.strftime("%Y%m%d%H%M%S")
-            shutil.copy2(path, bak)
-        with open(path, "wb") as f:
-            f.write(data)
-
-    return {"path": path, "exists": True, "touched": touched, "changed": changed}
+    return patch_reclog_file(path, ranges, dry_run, backup)
 
 
 def patch_motion(args):

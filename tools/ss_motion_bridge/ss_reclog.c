@@ -83,15 +83,17 @@ out_close_in:
 static int backup_file(const char *path)
 {
 	char bak[640];
-	time_t now = time(NULL);
+	struct timespec now;
 	struct tm tm;
 	int ret;
 
-	localtime_r(&now, &tm);
+	clock_gettime(CLOCK_REALTIME, &now);
+	localtime_r(&now.tv_sec, &tm);
 	ret = snprintf(bak, sizeof(bak),
-		       "%s.bak-%04d%02d%02d%02d%02d%02d",
+		       "%s.bak-%04d%02d%02d%02d%02d%02d-%09ld-%ld",
 		       path, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-		       tm.tm_hour, tm.tm_min, tm.tm_sec);
+		       tm.tm_hour, tm.tm_min, tm.tm_sec, now.tv_nsec,
+		       (long)getpid());
 	if (ret < 0 || (size_t)ret >= sizeof(bak))
 		return -ENAMETOOLONG;
 
@@ -115,8 +117,11 @@ static int create_reclog_file(const char *path)
 	}
 
 	snprintf(dir_buf, sizeof(dir_buf), "%s", path);
-	if (!stat(dirname(dir_buf), &st))
-		fchown(fd, st.st_uid, st.st_gid);
+	if (!stat(dirname(dir_buf), &st) && fchown(fd, st.st_uid, st.st_gid) < 0 &&
+	    errno != EPERM) {
+		ret = -errno;
+		goto out_unlink;
+	}
 
 	fsync(fd);
 	close(fd);
@@ -154,16 +159,57 @@ static int ensure_reclog_size(int fd, time_t base, time_t stop,
 	return 0;
 }
 
+static int patch_records(int fd, time_t base, time_t start, time_t stop,
+			 bool force_recording, bool dry_run,
+			 struct ss_reclog_result *res)
+{
+	time_t ts;
+	int ret = 0;
+
+	for (ts = start; ts < stop; ts++) {
+		unsigned char record[2];
+		off_t off = RECLOG_HEADER_SIZE +
+			    (ts - base) * RECLOG_RECORD_SIZE;
+
+		if (pread(fd, record, sizeof(record), off) != sizeof(record))
+			return -EIO;
+
+		res->touched++;
+		if (!record[0] && !force_recording) {
+			res->skipped++;
+			continue;
+		}
+
+		res->recorded++;
+		if (record[0] == 1 && record[1] == 1)
+			continue;
+
+		res->changed++;
+		if (dry_run)
+			continue;
+
+		if (force_recording) {
+			record[0] = 1;
+			record[1] = 1;
+			if (pwrite(fd, record, sizeof(record), off) != sizeof(record))
+				return -EIO;
+		} else {
+			record[1] = 1;
+			if (pwrite(fd, &record[1], 1, off + 1) != 1)
+				return -EIO;
+		}
+	}
+
+	return ret;
+}
+
 static int mark_file(const char *path, time_t start, time_t stop, bool backup,
-		     bool dry_run, bool create_missing,
+		     bool dry_run, bool create_missing, bool force_recording,
 		     struct ss_reclog_result *res)
 {
 	struct stat st;
-	unsigned char *data;
 	time_t base;
-	unsigned int max_slots;
-	unsigned int touched = 0;
-	unsigned int changed = 0;
+	time_t available_stop;
 	bool created = false;
 	int fd;
 	int ret = 0;
@@ -185,8 +231,8 @@ static int mark_file(const char *path, time_t start, time_t stop, bool backup,
 			goto opened;
 		}
 		res->exists = 0;
-		res->err = ret ? ret : -errno;
-		return 0;
+		ret = ret ? ret : -errno;
+		goto out_result;
 	}
 
 opened:
@@ -202,86 +248,53 @@ opened:
 		goto out_close;
 	}
 
-	data = malloc(st.st_size);
-	if (!data) {
-		ret = -ENOMEM;
-		goto out_close;
-	}
-
-	if (pread(fd, data, st.st_size, 0) != st.st_size) {
-		ret = -EIO;
-		goto out_free;
-	}
-
 	base = strtol(strrchr(path, '/') + 1, NULL, 10);
 	if (!dry_run) {
 		ret = ensure_reclog_size(fd, base, stop, create_missing);
 		if (ret)
-			goto out_free;
+			goto out_close;
 		if (fstat(fd, &st) < 0) {
 			ret = -errno;
-			goto out_free;
-		}
-		free(data);
-		data = malloc(st.st_size);
-		if (!data) {
-			ret = -ENOMEM;
 			goto out_close;
 		}
-		if (pread(fd, data, st.st_size, 0) != st.st_size) {
-			ret = -EIO;
-			goto out_free;
-		}
-	}
-	max_slots = (st.st_size - RECLOG_HEADER_SIZE) / RECLOG_RECORD_SIZE;
-
-	if (start < base)
-		start = base;
-	if (stop > base + (time_t)max_slots)
-		stop = base + max_slots;
-
-	while (start < stop) {
-		off_t off = RECLOG_HEADER_SIZE +
-			    (start - base) * RECLOG_RECORD_SIZE;
-
-		if (off + 1 >= st.st_size)
-			break;
-		touched++;
-		if (create_missing && !data[off])
-			data[off] = 1;
-		if (data[off] && data[off + 1] != 1) {
-			data[off + 1] = 1;
-			changed++;
-		}
-		start++;
 	}
 
-	if (changed && !dry_run) {
-		if (backup && !created) {
+	available_stop = base +
+		(st.st_size - RECLOG_HEADER_SIZE) / RECLOG_RECORD_SIZE;
+	if (start < base || stop > available_stop) {
+		ret = -ERANGE;
+		goto out_close;
+	}
+
+	if (backup && !dry_run && !created) {
+		struct ss_reclog_result probe = { 0 };
+
+		ret = patch_records(fd, base, start, stop, force_recording, true,
+				    &probe);
+		if (ret)
+			goto out_close;
+		if (probe.changed) {
 			ret = backup_file(path);
 			if (ret)
-				goto out_free;
+				goto out_close;
 		}
-		if (pwrite(fd, data, st.st_size, 0) != st.st_size) {
-			ret = -EIO;
-			goto out_free;
-		}
-		fsync(fd);
 	}
 
-	res->touched = touched;
-	res->changed = changed;
+	ret = patch_records(fd, base, start, stop, force_recording, dry_run,
+			    res);
+	if (!ret && res->changed && !dry_run && fsync(fd) < 0)
+		ret = -errno;
 
-out_free:
-	free(data);
 out_close:
 	close(fd);
+out_result:
 	res->err = ret;
 	return ret;
 }
 
 static int mark_range(const char *camera_dir, time_t start, time_t stop,
 		      bool backup, bool dry_run, bool create_missing,
+		      bool force_recording,
 		      struct ss_reclog_result *results,
 		      unsigned int max_results, unsigned int *nr_results)
 {
@@ -308,7 +321,7 @@ static int mark_range(const char *camera_dir, time_t start, time_t stop,
 
 		res = &results[nr++];
 		ret = mark_file(path, start, part_stop, backup, dry_run,
-				create_missing, res);
+				create_missing, force_recording, res);
 		if (ret)
 			break;
 
@@ -324,7 +337,7 @@ int ss_reclog_mark_range(const char *camera_dir, time_t start, time_t stop,
 			 struct ss_reclog_result *results,
 			 unsigned int max_results, unsigned int *nr_results)
 {
-	return mark_range(camera_dir, start, stop, backup, dry_run, false,
+	return mark_range(camera_dir, start, stop, backup, dry_run, false, false,
 			  results, max_results, nr_results);
 }
 
@@ -335,6 +348,17 @@ int ss_reclog_mark_range_create_missing(const char *camera_dir,
 					 unsigned int max_results,
 					 unsigned int *nr_results)
 {
-	return mark_range(camera_dir, start, stop, backup, dry_run, true,
+	return mark_range(camera_dir, start, stop, backup, dry_run, true, false,
+			  results, max_results, nr_results);
+}
+
+int ss_reclog_mark_range_force_recording(const char *camera_dir,
+					  time_t start, time_t stop,
+					  bool backup, bool dry_run,
+					  struct ss_reclog_result *results,
+					  unsigned int max_results,
+					  unsigned int *nr_results)
+{
+	return mark_range(camera_dir, start, stop, backup, dry_run, true, true,
 			  results, max_results, nr_results);
 }

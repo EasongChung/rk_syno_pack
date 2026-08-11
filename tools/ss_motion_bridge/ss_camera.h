@@ -19,6 +19,8 @@ int ss_camera_apply_group_map(struct ss_camera *cams, unsigned int nr_cams,
 			      const char *path);
 int ss_camera_find(struct ss_camera *cams, unsigned int nr_cams,
 		   int id, const char *name, int group);
+int ss_camera_find_path(struct ss_camera *cams, unsigned int nr_cams,
+			const char *camera_dir);
 void ss_camera_print_json(const struct ss_camera *cams, unsigned int nr_cams);
 
 #endif

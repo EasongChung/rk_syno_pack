@@ -12,7 +12,7 @@ Usage:
   ./build.sh [all|pat|uboot|kernel|updateimg]
 
 Targets:
-  pat        download/extract/patch DSM 7.4-90075 pat and generate patched rd.bin/uInitrd
+  pat        download/extract/patch DSM 7.4.1-90080 pat and generate patched rd.bin/uInitrd
   uboot      build u-boot and loader artifacts locally
   kernel     build DSM kernel Image/dtb
   updateimg  generate Rockchip update.img and raw disk image using this project only
@@ -21,7 +21,7 @@ Targets:
 Environment:
   PAT_URL         official PAT URL
   PAT_FILE        local PAT file path
-  DSM_PAT_VERSION pat selector: 7.4 default, set 7.3 to use DSM 7.3.2-86009
+  DSM_PAT_VERSION pat selector: 7.4.1 default; 7.4 selects 90075, 7.3 selects 86009
   KERNEL_SRC      kernel source tree
   KERNEL_BUILD    kernel build output dir
   CROSS_COMPILE   aarch64 compiler prefix
@@ -44,7 +44,7 @@ msg() {
 target_pat() {
   msg "patching official pat"
   "$ROOT_DIR/scripts/download_and_patch_pat.sh" \
-    "${PAT_URL:-${DSM_PAT_VERSION:-7.4}}" \
+    "${PAT_URL:-${DSM_PAT_VERSION:-7.4.1}}" \
     "${PAT_FILE:-}" \
     "${FALLBACK_PAT_DIR:-}" \
     "${FALLBACK_RD_DIR:-}"

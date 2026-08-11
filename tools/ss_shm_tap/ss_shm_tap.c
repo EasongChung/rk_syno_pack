@@ -160,6 +160,9 @@ static bool prefix_match(unsigned long long key, unsigned long long prefix)
 		tmp >>= 4;
 	}
 
+	if (nibbles >= 16)
+		return key == prefix;
+
 	while (key >= (1ULL << (nibbles * 4)))
 		key >>= 4;
 
@@ -253,6 +256,26 @@ static uint32_t get_le32(const uint8_t *p)
 	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static void read_frame_header(const uint8_t *buf, struct frame_hdr *hdr)
+{
+	hdr->slot = get_le32(buf + 0);
+	hdr->aux_len = get_le32(buf + 4);
+	hdr->payload_len = get_le32(buf + 8);
+	hdr->serial = get_le32(buf + 12);
+	hdr->valid = get_le32(buf + 16);
+	hdr->frame_type = get_le32(buf + 20);
+	hdr->ts_lo = get_le32(buf + 24);
+	hdr->ts_hi = get_le32(buf + 28);
+	hdr->flags = get_le32(buf + 32);
+}
+
+static bool same_frame(const struct frame_hdr *a, const struct frame_hdr *b)
+{
+	return a->serial == b->serial &&
+	       a->payload_len == b->payload_len &&
+	       a->valid == 1 && b->valid == 1;
+}
+
 static int find_payload(const uint8_t *buf, size_t len, size_t *off)
 {
 	size_t i;
@@ -286,15 +309,7 @@ static int parse_frame_segment(const struct shm_seg *seg, struct frame_info *fi)
 	buf = addr;
 	memset(fi, 0, sizeof(*fi));
 
-	fi->hdr.slot = get_le32(buf + 0);
-	fi->hdr.aux_len = get_le32(buf + 4);
-	fi->hdr.payload_len = get_le32(buf + 8);
-	fi->hdr.serial = get_le32(buf + 12);
-	fi->hdr.valid = get_le32(buf + 16);
-	fi->hdr.frame_type = get_le32(buf + 20);
-	fi->hdr.ts_lo = get_le32(buf + 24);
-	fi->hdr.ts_hi = get_le32(buf + 28);
-	fi->hdr.flags = get_le32(buf + 32);
+	read_frame_header(buf, &fi->hdr);
 
 	ret = find_payload(buf, (size_t)size, &off);
 	if (ret)
@@ -366,14 +381,21 @@ static int print_frame_segment(const struct shm_seg *seg)
 	return 0;
 }
 
-static int cmp_frame_serial(const void *a, const void *b)
+static uint64_t frame_timestamp(const struct frame_info *frame)
+{
+	return ((uint64_t)frame->hdr.ts_hi << 32) | frame->hdr.ts_lo;
+}
+
+static int cmp_frame_time(const void *a, const void *b)
 {
 	const struct frame_info *fa = a;
 	const struct frame_info *fb = b;
+	uint64_t ta = frame_timestamp(fa);
+	uint64_t tb = frame_timestamp(fb);
 
-	if (fa->hdr.serial < fb->hdr.serial)
+	if (ta < tb)
 		return -1;
-	if (fa->hdr.serial > fb->hdr.serial)
+	if (ta > tb)
 		return 1;
 	return 0;
 }
@@ -419,8 +441,9 @@ static int group_frame_count(const struct shm_seg *segs, int n,
 		seg = find_seg_by_key(segs, n, first_key + i);
 		if (!seg)
 			break;
+		grp->slots = i + 1;
 		if (parse_frame_segment(seg, &fi))
-			break;
+			continue;
 
 		if (!grp->frames || fi.hdr.serial < grp->min_serial)
 			grp->min_serial = fi.hdr.serial;
@@ -431,7 +454,6 @@ static int group_frame_count(const struct shm_seg *segs, int n,
 		grp->frames++;
 	}
 
-	grp->slots = grp->frames;
 	grp->valid = grp->frames >= 2;
 	return grp->frames;
 }
@@ -576,7 +598,7 @@ static int collect_frames(const struct shm_seg *segs, int n,
 			nr++;
 	}
 
-	qsort(frames, nr, sizeof(frames[0]), cmp_frame_serial);
+	qsort(frames, nr, sizeof(frames[0]), cmp_frame_time);
 	return nr;
 }
 
@@ -585,6 +607,9 @@ static int write_frame_payload(FILE *fp, const struct frame_info *fi)
 	const uint8_t *buf;
 	const void *addr;
 	unsigned long long size;
+	struct frame_hdr before, after;
+	size_t payload_off;
+	uint8_t *payload = NULL;
 	int ret;
 
 	ret = attach_seg(fi->seg.shmid, &addr, &size);
@@ -592,13 +617,28 @@ static int write_frame_payload(FILE *fp, const struct frame_info *fi)
 		return ret;
 
 	buf = addr;
-	if (fi->payload_off + fi->hdr.payload_len > size) {
+	read_frame_header(buf, &before);
+	if (!same_frame(&fi->hdr, &before) ||
+	    find_payload(buf, (size_t)size, &payload_off) ||
+	    payload_off + before.payload_len > size) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (fwrite(buf + fi->payload_off, 1, fi->hdr.payload_len, fp) !=
-	    fi->hdr.payload_len) {
+	payload = malloc(before.payload_len);
+	if (!payload) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	memcpy(payload, buf + payload_off, before.payload_len);
+	__sync_synchronize();
+	read_frame_header(buf, &after);
+	if (!same_frame(&before, &after)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	if (fwrite(payload, 1, before.payload_len, fp) != before.payload_len) {
 		perror("fwrite");
 		ret = -EIO;
 		goto out;
@@ -606,6 +646,7 @@ static int write_frame_payload(FILE *fp, const struct frame_info *fi)
 
 	ret = 0;
 out:
+	free(payload);
 	shmdt(addr);
 	return ret;
 }
@@ -627,14 +668,22 @@ static int capture_stream(const char *path, unsigned int seconds,
 	unsigned long long end;
 	unsigned int written = 0;
 	unsigned int skipped = 0;
-	uint32_t last_serial = 0;
+	uint64_t last_timestamp = 0;
+	bool have_timestamp = false;
 	bool started = false;
-	bool selected = false;
 	unsigned long long first_key = 0;
 	unsigned int slots = 0;
 	FILE *fp;
 	int n;
 
+	n = read_segments(segs, MAX_SEGMENTS);
+	if (n < 0)
+		return n;
+	if (select_group(segs, n, prefix, group_index, base_key,
+			 &first_key, &slots)) {
+		fprintf(stderr, "stream group not found\n");
+		return 1;
+	}
 	fp = fopen(path, "wb");
 	if (!fp) {
 		perror(path);
@@ -652,27 +701,19 @@ static int capture_stream(const char *path, unsigned int seconds,
 			return n;
 		}
 
-		if (!selected) {
-			if (select_group(segs, n, prefix, group_index, base_key,
-					 &first_key, &slots)) {
-				fclose(fp);
-				fprintf(stderr, "stream group not found\n");
-				return 1;
-			}
-			selected = true;
-		}
-
 		nr = collect_frames(segs, n, prefix, first_key, slots, frames,
 				    MAX_SEGMENTS);
 		for (i = 0; i < nr; i++) {
 			struct frame_info *fi = &frames[i];
+			uint64_t timestamp = frame_timestamp(fi);
 
-			if (fi->hdr.serial <= last_serial)
+			if (have_timestamp && timestamp <= last_timestamp)
 				continue;
 
 			if (!started) {
 				if (fi->hevc_type != 32 && fi->hdr.frame_type != 2) {
-					last_serial = fi->hdr.serial;
+					last_timestamp = timestamp;
+					have_timestamp = true;
 					skipped++;
 					continue;
 				}
@@ -681,7 +722,8 @@ static int capture_stream(const char *path, unsigned int seconds,
 
 			if (write_frame_payload(fp, fi))
 				continue;
-			last_serial = fi->hdr.serial;
+			last_timestamp = timestamp;
+			have_timestamp = true;
 			written++;
 		}
 
@@ -810,6 +852,12 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (capture)
+		if (group_index < 0 && !base_key && !prefix) {
+			fprintf(stderr,
+				"capture requires --group, --base, or --prefix\n");
+			return 2;
+		}
 	if (capture)
 		return capture_stream(capture, seconds, prefix,
 				      group_index, base_key) ? 1 : 0;

@@ -1,4 +1,5 @@
 CC ?= gcc
+HOSTCC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
 LDFLAGS ?=
 
@@ -16,6 +17,12 @@ strip: ss_motion_bridge
 	$(STRIP) ss_motion_bridge
 
 clean:
-	rm -f ss_motion_bridge $(OBJS)
+	rm -f ss_motion_bridge test_reclog $(OBJS)
 
-.PHONY: all strip clean
+test: test_reclog
+	./test_reclog
+
+test_reclog: test_reclog.c ss_reclog.c ss_reclog.h
+	$(HOSTCC) -O2 -Wall -Wextra -o $@ test_reclog.c ss_reclog.c
+
+.PHONY: all strip clean test

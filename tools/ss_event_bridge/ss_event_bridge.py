@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import sqlite3
 import time
 
@@ -10,7 +11,6 @@ import time
 DEFAULT_RECORDING_DB = "/volume1/@surveillance/recording.db"
 DEFAULT_DETECTION_DB = "/volume1/@surveillance/detection_event.db"
 DEFAULT_RECORDING_SHARE = "/volume1/surveillance"
-DEFAULT_CAMERA_NAME = "Camera"
 DEFAULT_MOTION_SECONDS = 12
 MOTION_BUCKET_SECONDS = 1800
 RECLOG_HEADER_SIZE = 8
@@ -229,43 +229,62 @@ def patch_reclog_file(path, ranges, dry_run, backup):
     if not os.path.exists(path):
         return {"path": path, "exists": False, "changed": 0}
 
-    with open(path, "rb") as f:
-        original = f.read()
-    data = bytearray(original)
-
     try:
         base = int(os.path.basename(path).split("_", 1)[0])
     except ValueError:
         return {"path": path, "exists": True, "changed": 0, "error": "bad reclog name"}
 
-    max_slots = max(0, (len(data) - RECLOG_HEADER_SIZE) // RECLOG_RECORD_SIZE)
-    changed = 0
+    size = os.path.getsize(path)
+    max_slots = max(0, (size - RECLOG_HEADER_SIZE) // RECLOG_RECORD_SIZE)
+    potential = []
     touched = 0
+    skipped = 0
 
     for start, stop in ranges:
-        start = max(int(start), base)
-        stop = min(int(stop), base + max_slots)
-        for ts in range(start, stop):
-            off = RECLOG_HEADER_SIZE + (ts - base) * RECLOG_RECORD_SIZE
-            if off + 1 >= len(data):
-                continue
-            touched += 1
-            if data[off] == 0:
-                continue
-            if data[off + 1] != 1:
-                data[off + 1] = 1
-                changed += 1
+        if int(start) < base or int(stop) > base + max_slots:
+            return {
+                "path": path,
+                "exists": True,
+                "changed": 0,
+                "error": "range outside current RecLog",
+            }
 
-    if changed and not dry_run:
-        if backup:
-            bak = path + ".bak-" + time.strftime("%Y%m%d%H%M%S")
-            if not os.path.exists(bak):
-                with open(bak, "wb") as f:
-                    f.write(original)
-        with open(path, "wb") as f:
-            f.write(data)
+    flags = os.O_RDONLY if dry_run else os.O_RDWR
+    fd = os.open(path, flags)
+    try:
+        for start, stop in ranges:
+            for ts in range(int(start), int(stop)):
+                off = RECLOG_HEADER_SIZE + (ts - base) * RECLOG_RECORD_SIZE
+                record = os.pread(fd, 2, off)
+                if len(record) != 2:
+                    raise OSError("short RecLog read")
+                touched += 1
+                if record[0] == 0:
+                    skipped += 1
+                    continue
+                if record[1] != 1:
+                    potential.append(off + 1)
 
-    return {"path": path, "exists": True, "touched": touched, "changed": changed}
+        if potential and not dry_run:
+            if backup:
+                stamp = time.strftime("%Y%m%d%H%M%S")
+                bak = f"{path}.bak-{stamp}-{time.time_ns()}-{os.getpid()}"
+                shutil.copy2(path, bak)
+            for off in potential:
+                record = os.pread(fd, 2, off - 1)
+                if len(record) == 2 and record[0] and record[1] != 1:
+                    os.pwrite(fd, b"\x01", off)
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    return {
+        "path": path,
+        "exists": True,
+        "touched": touched,
+        "skipped": skipped,
+        "changed": len(potential),
+    }
 
 
 def sync_reclog_ranges(camera_dir, ranges, dry_run=False, backup=True):
@@ -392,16 +411,25 @@ def insert_alert(conn, event, camera_name, dry_run):
 
 def insert_detection(conn, event, camera_dir, recording_share, motion_seconds, dry_run):
     start, end, previews = choose_motion_window(event, camera_dir, motion_seconds)
+    event_key = f"ss_event_bridge:event:{event['id']}"
     exists = conn.execute(
         """
-        SELECT 1 FROM detection_event_motion
-        WHERE camera_id = ? AND start_time = ? AND end_time = ?
+        SELECT start_time, end_time, thumb_token
+        FROM detection_event_motion
+        WHERE description = ?
+           OR (camera_id = ? AND start_time = ? AND end_time = ?)
+        ORDER BY CASE WHEN description = ? THEN 0 ELSE 1 END
         LIMIT 1
         """,
-        (event["camera_id"], start, end),
+        (event_key, event["camera_id"], start, end, event_key),
     ).fetchone()
     if exists:
-        return {"inserted": False, "start": start, "end": end, "thumb_token": None}
+        return {
+            "inserted": False,
+            "start": exists["start_time"],
+            "end": exists["end_time"],
+            "thumb_token": exists["thumb_token"],
+        }
 
     quarter = start // 900
     thumb_token = None if dry_run else write_thumb_token(
@@ -413,9 +441,9 @@ def insert_detection(conn, event, camera_dir, recording_share, motion_seconds, d
             INSERT INTO detection_event_motion
                 (camera_id, ts_quarter, start_time, end_time, locked,
                  thumb_token, description)
-            VALUES (?, ?, ?, ?, 0, NULL, NULL)
+            VALUES (?, ?, ?, ?, 0, NULL, ?)
             """,
-            (event["camera_id"], quarter, start, end),
+            (event["camera_id"], quarter, start, end, event_key),
         )
         if thumb_token is not None:
             conn.execute(
@@ -449,28 +477,30 @@ def insert_detection(conn, event, camera_dir, recording_share, motion_seconds, d
 
 
 def bridge_event(args):
+    if args.with_alert and not args.camera_name:
+        raise SystemExit("--camera-name is required with --with-alert")
+
     with connect(args.recording_db) as rec:
         event = fetch_event(rec, args.event_id)
-        if args.dry_run:
-            print(f"would bridge event {event['id']}")
-            return
         alert_inserted = False
         if args.with_alert:
             with rec:
-                alert_inserted = insert_alert(rec, event, args.camera_name, False)
+                alert_inserted = insert_alert(
+                    rec, event, args.camera_name, args.dry_run
+                )
 
     with connect(args.detection_db) as det:
         with det:
             motion = insert_detection(
                 det, event, args.camera_dir, args.recording_share,
-                args.motion_seconds, False
+                args.motion_seconds, args.dry_run
             )
     reclog = []
     if args.sync_reclog and args.camera_dir:
         reclog = sync_reclog_ranges(
             args.camera_dir,
             [(motion["start"], motion["end"])],
-            dry_run=False,
+            dry_run=args.dry_run,
             backup=args.reclog_backup,
         )
 
@@ -481,6 +511,7 @@ def bridge_event(args):
         "reclog": reclog,
         "camera_dir": args.camera_dir,
         "recording_share": args.recording_share,
+        "dry_run": args.dry_run,
     }, ensure_ascii=False))
 
 
@@ -508,13 +539,14 @@ def repair_thumbnails(args):
             """
             SELECT id, camera_id, start_time, end_time, thumb_token
             FROM detection_event_motion
-            WHERE thumb_token IS NULL
-               OR thumb_token = ''
-               OR thumb_token LIKE '%,0'
+            WHERE camera_id = ?
+              AND (thumb_token IS NULL
+                   OR thumb_token = ''
+                   OR thumb_token LIKE '%,0')
             ORDER BY id DESC
             LIMIT ?
             """,
-            (args.limit,),
+            (args.cam_id, args.limit),
         ).fetchall()
 
         repaired = []
@@ -592,7 +624,7 @@ def main():
     p.add_argument("--recording-db", default=DEFAULT_RECORDING_DB)
     p.add_argument("--detection-db", default=DEFAULT_DETECTION_DB)
     p.add_argument("--recording-share", default=DEFAULT_RECORDING_SHARE)
-    p.add_argument("--camera-name", default=DEFAULT_CAMERA_NAME)
+    p.add_argument("--camera-name")
     p.add_argument("--camera-dir")
     p.add_argument("--motion-seconds", type=int, default=DEFAULT_MOTION_SECONDS)
     p.add_argument("--event-id", type=int, required=True)
@@ -612,7 +644,7 @@ def main():
     p.add_argument("--recording-db", default=DEFAULT_RECORDING_DB)
     p.add_argument("--detection-db", default=DEFAULT_DETECTION_DB)
     p.add_argument("--recording-share", default=DEFAULT_RECORDING_SHARE)
-    p.add_argument("--camera-name", default=DEFAULT_CAMERA_NAME)
+    p.add_argument("--camera-name")
     p.add_argument("--camera-dir")
     p.add_argument("--motion-seconds", type=int, default=DEFAULT_MOTION_SECONDS)
     p.add_argument("--cam-id", type=int)
@@ -631,6 +663,7 @@ def main():
     p.add_argument("--detection-db", default=DEFAULT_DETECTION_DB)
     p.add_argument("--recording-share", default=DEFAULT_RECORDING_SHARE)
     p.add_argument("--camera-dir", required=True)
+    p.add_argument("--cam-id", type=int, required=True)
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=repair_thumbnails)
 

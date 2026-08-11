@@ -22,6 +22,12 @@ Example:
   --start 1783429500 \
   --stop 1783429510
 
+# Extend a partial RecLog, but only mark seconds whose recording bit is set.
+./ss_motion_bridge mark \
+  --camera-name '鲁能门口' \
+  --start 1783429500 --stop 1783429510 \
+  --create-missing
+
 ./ss_motion_bridge mark \
   --camera-group 0 \
   --map /var/tmp/ss_motion_bridge.map \
@@ -54,6 +60,14 @@ Use `--dry-run` to verify the discovered RecLog path and changed second count
 without modifying metadata. Real writes need permission to update the camera's
 `@SSRECMETA/RecLog` files, so the bridge should run as root or as the
 Surveillance Station package user in production.
+
+Normal writes return `ERANGE` when the requested interval is outside a partial
+RecLog. `--create-missing` may create or extend the file, but it never changes
+the recording-present bit. `--force-recording` explicitly sets both recording
+and motion bits and should only be used for controlled repair work.
+
+Writes update only the affected per-second bytes. They do not rewrite or
+truncate the complete RecLog while Surveillance Station is appending to it.
 
 Framework direction:
 

@@ -12,12 +12,15 @@ SYNO_HDDMON_KO="${SYNO_HDDMON_KO:-${KERNEL_BUILD_DIR}/drivers/hwmon/syno_hddmon.
 ROOT_MODULE_DEP_LINES=()
 
 pat_url_for() {
-  case "${1:-7.4}" in
+  case "${1:-7.4.1}" in
     7.3|7.3.2|86009)
       printf '%s\n' 'https://global.synologydownload.com/download/DSM/release/7.3.2/86009/DSM_DS423_86009.pat'
       ;;
     7.4|90075)
       printf '%s\n' 'https://global.synologydownload.com/download/DSM/release/7.4/90075/DSM_DS423_90075.pat'
+      ;;
+    7.4.1|90080)
+      printf '%s\n' 'https://global.synologydownload.com/download/DSM/release/7.4.1/90080/DSM_DS423_90080.pat'
       ;;
     http://*|https://*)
       printf '%s\n' "$1"
@@ -29,7 +32,7 @@ pat_url_for() {
   esac
 }
 
-DSM_PAT_VERSION_DEFAULT="${DSM_PAT_VERSION:-7.4}"
+DSM_PAT_VERSION_DEFAULT="${DSM_PAT_VERSION:-7.4.1}"
 PAT_URL_DEFAULT="$(pat_url_for "${DSM_PAT_VERSION_DEFAULT}")"
 PAT_FILE_DEFAULT="${WORK_DIR}/$(basename "${PAT_URL_DEFAULT}")"
 PAT_EXTRACT_DIR="${WORK_DIR}/pat-extract"
@@ -220,6 +223,9 @@ patch_model_dtb_rk3566_sata_slots() {
       fdtput -t x "${model_dtb}" "${rtk_ahci_node}" ata_port "$((slot - 1))"
       fdtput -d "${model_dtb}" "${ahci_node}" pcie_root 2>/dev/null || true
 
+      if fdtget -t s "${model_dtb}" "${ahci_node}" pcie_root >/dev/null 2>&1; then
+        die "failed to remove ${ahci_node}/pcie_root from ${model_dtb}"
+      fi
       actual="$(fdtget -t x "${model_dtb}" "${ahci_node}" ata_port)"
       [ "${actual}" = "$((slot - 1))" ] || \
         die "failed to patch ${ahci_node}/ata_port in ${model_dtb}: got ${actual}"
