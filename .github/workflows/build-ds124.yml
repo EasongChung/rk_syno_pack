@@ -64,14 +64,14 @@ jobs:
           ./build.sh pat
 
       - name: Pack boot images
+        env:
+          SYNO_HW_VERSION: ${{ github.event.inputs.syno_hw_version }}
+          SYNO_SN: ${{ github.event.inputs.syno_sn }}
+          SYNO_MAC1: ${{ github.event.inputs.syno_mac1 }}
+          SYNO_CUSTOM_SN: ${{ github.event.inputs.syno_custom_sn }}
+          SYNO_FW_VERSION: ${{ github.event.inputs.syno_fw_version }}
         run: |
-          SOC=rk3566 \
-          SYNO_HW_VERSION="${{ github.event.inputs.syno_hw_version }}" \
-          SYNO_SN="${{ github.event.inputs.syno_sn }}" \
-          SYNO_MAC1="${{ github.event.inputs.syno_mac1 }}" \
-          SYNO_CUSTOM_SN="${{ github.event.inputs.syno_custom_sn }}" \
-          SYNO_FW_VERSION="${{ github.event.inputs.syno_fw_version }}" \
-          ./build.sh updateimg
+          SOC=rk3566 ./build.sh updateimg
 
       - name: List outputs
         run: |
