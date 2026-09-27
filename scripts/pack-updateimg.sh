@@ -453,7 +453,7 @@ fi
 install_root_modules
 
 BOOTARGS=(
-	root=/dev/md0
+	root="${ROOT_DEVICE:-/dev/md0}"
 	netif_num=1
 	syno_hw_version="${SYNO_HW_VERSION:-DS423}"
 	syno_fw_version="$SYNO_FW_VERSION"
