@@ -1,0 +1,87 @@
+name: Build DS124 DSM Boot Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      pat_url:
+        description: 'DSM pat download URL (DS124)'
+        required: false
+        default: 'https://global.synologydownload.com/download/DSM/release/7.4.1/90080/DSM_DS124_90080.pat'
+      syno_hw_version:
+        description: 'Synology model spoof'
+        required: false
+        default: 'DS124'
+      syno_sn:
+        description: 'DSM serial number (optional whitewash)'
+        required: false
+        default: ''
+      syno_mac1:
+        description: 'LAN1 MAC, 12 hex chars without colon (optional)'
+        required: false
+        default: ''
+      syno_custom_sn:
+        description: 'custom serial (defaults to SN when empty)'
+        required: false
+        default: ''
+      syno_fw_version:
+        description: 'uboot version marker'
+        required: false
+        default: 'M.115'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev dwarves \
+            cpio xz-utils patch curl e2fsprogs device-tree-compiler \
+            dosfstools mtools gdisk gzip vim-common \
+            libsodium-dev libmsgpack-dev g++
+
+      - name: Build SynoXtract
+        run: |
+          g++ -O2 -std=c++17 -o tools/SynoXtract/synoxtract tools/SynoXtract/main.cpp -lsodium
+          chmod +x tools/SynoXtract/synoxtract
+          ./tools/SynoXtract/synoxtract --help 2>&1 | head -3 || true
+
+      - name: Build kernel (rk3566)
+        run: |
+          SOC=rk3566 JOBS=4 ./build.sh kernel
+
+      - name: Patch DSM124 pat initrd
+        run: |
+          SOC=rk3566 \
+          PAT_URL="${{ github.event.inputs.pat_url }}" \
+          ./build.sh pat
+
+      - name: Pack boot images
+        run: |
+          SOC=rk3566 \
+          SYNO_HW_VERSION="${{ github.event.inputs.syno_hw_version }}" \
+          SYNO_SN="${{ github.event.inputs.syno_sn }}" \
+          SYNO_MAC1="${{ github.event.inputs.syno_mac1 }}" \
+          SYNO_CUSTOM_SN="${{ github.event.inputs.syno_custom_sn }}" \
+          SYNO_FW_VERSION="${{ github.event.inputs.syno_fw_version }}" \
+          ./build.sh updateimg
+
+      - name: List outputs
+        run: |
+          find output build/rd.bin -type f -exec ls -la {} \; 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds124-boot-images
+          path: |
+            output/dsm/
+            build/rd.bin
+          if-no-files-found: error
