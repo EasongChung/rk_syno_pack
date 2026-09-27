@@ -12,13 +12,13 @@ on:
         required: false
         default: 'DS124'
       syno_sn:
-        description: 'DSM serial number (optional whitewash)'
+        description: 'DSM serial number (default whitewash, override at dispatch)'
         required: false
-        default: ''
+        default: '152ALSN997256'
       syno_mac1:
-        description: 'LAN1 MAC, 12 hex chars without colon (optional)'
+        description: 'LAN1 MAC, 12 hex chars without colon (default whitewash)'
         required: false
-        default: ''
+        default: '00113242B90F'
       syno_custom_sn:
         description: 'custom serial (defaults to SN when empty)'
         required: false
