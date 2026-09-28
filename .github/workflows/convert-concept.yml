@@ -33,23 +33,27 @@ jobs:
 
       - name: Install rknn-toolkit2
         run: |
+          pip install --quiet "numpy<2" "onnx==1.13.1" "onnxoptimizer==0.3.10" "onnxruntime==1.16.3" 2>&1 | tail -2
           pip install --quiet tensorflow==2.12.0 2>&1 | tail -1 || pip install --quiet tensorflow 2>&1 | tail -1
-          pip install --quiet "numpy<2" 2>&1 | tail -1
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
           ls whl/ 2>/dev/null
           pip install whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -3
+          python -c "import onnx; print('onnx', onnx.__version__)" 
 
       - name: Inspect TFLite
         run: |
           python - << 'EOF'
           import tensorflow as tf
           p = 'out/x86/models/concept/detector/model_float16.tflite'
-          it = tf.lite.Interpreter(model_path=p)
+          import json, sys
+          print('file size:', __import__('os').path.getsize(p))
+          it = tf.lite.Interpreter(model_path=p, experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
           it.allocate_tensors()
           print('INPUTS:')
           for d in it.get_input_details(): print('  ', d['name'], d['shape'], d['dtype'])
           print('OUTPUTS:')
           for d in it.get_output_details(): print('  ', d['name'], d['shape'], d['dtype'])
+          sys.stdout.flush()
           EOF
 
       - name: Convert to RKNN
