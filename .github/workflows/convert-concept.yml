@@ -41,9 +41,15 @@ jobs:
           echo "=== synoxtract produced:"
           ls -la out/x86x/
           if [ -f out/x86x/package.tgz ]; then
-            echo "=== package.tgz is:"; file out/x86x/package.tgz
+            FMT=$(file -b out/x86x/package.tgz)
+            echo "=== package.tgz is: $FMT"
             mkdir -p out/x86
-            tar xf out/x86x/package.tgz -C out/x86 || tar xzf out/x86x/package.tgz -C out/x86
+            case "$FMT" in
+              *XZ*)  tar xJf out/x86x/package.tgz -C out/x86 ;;
+              *gzip*) tar xzf out/x86x/package.tgz -C out/x86 ;;
+              *bzip2*) tar xjf out/x86x/package.tgz -C out/x86 ;;
+              *) tar xf out/x86x/package.tgz -C out/x86 ;;
+            esac
           fi
           echo "=== concept detector dir:"
           ls -la out/x86/models/concept/detector/
