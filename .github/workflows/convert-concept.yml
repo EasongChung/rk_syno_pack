@@ -36,7 +36,7 @@ jobs:
       - name: Install rknn-toolkit2 (protobuf pinned, no tensorflow)
         run: |
           pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram 2>&1 | tail -2
-          pip install --quiet "onnx>=1.16.1" onnxoptimizer "onnxruntime>=1.10.0" 2>&1 | tail -2
+          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" 2>&1 | tail -2
           pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
           ls whl/
