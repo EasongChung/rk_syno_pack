@@ -33,8 +33,15 @@ jobs:
           ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x || true
           ./tools/SynoXtract/synoxtract -i arm.spk -d out/armx || true
           mkdir -p out/x86 out/arm
-          tar xzf out/x86x/package.tgz -C out/x86
-          tar xzf out/armx/package.tgz -C out/arm
+          echo "=== package.tgz magic ==="
+          xxd out/x86x/package.tgz | head -2
+          echo "=== try extract x86 ==="
+          tar xf out/x86x/package.tgz -C out/x86 || tar xJf out/x86x/package.tgz -C out/x86 || tar xjf out/x86x/package.tgz -C out/x86 || (cd out/x86 && ../../tools/SynoXtract/synoxtract -i ../x86x/package.tgz -d . || true)
+          echo "=== try extract arm ==="
+          tar xf out/armx/package.tgz -C out/arm || tar xJf out/armx/package.tgz -C out/arm || tar xjf out/armx/package.tgz -C out/arm || (cd out/arm && ../../tools/SynoXtract/synoxtract -i ../armx/package.tgz -d . || true)
+          echo "=== extracted x86 top ==="
+          ls out/x86 | head -30
+          ls out/arm | head -30
           echo "=== x86 appstore tree ==="
           find out/x86 -maxdepth 3 -type d | head -40
           echo "=== model files in x86 ==="
