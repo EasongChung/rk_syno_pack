@@ -1,0 +1,83 @@
+name: Convert Concept TFLite to RKNN
+
+on:
+  workflow_dispatch:
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libsodium-dev libmsgpack-dev curl
+          g++ -O2 -std=c++17 -o tools/SynoXtract/synoxtract tools/SynoXtract/main.cpp -lsodium
+
+      - name: Download and extract x86 SPK
+        run: |
+          curl -L --fail -o x86.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk"
+          mkdir -p out/x86x out/x86
+          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x || true
+          tar xf out/x86x/package.tgz -C out/x86 || tar xJf out/x86x/package.tgz -C out/x86 || true
+          ls -la out/x86/models/concept/detector/
+
+      - name: Install rknn-toolkit2
+        run: |
+          pip install --quiet tensorflow==2.12.0 2>&1 | tail -1 || pip install --quiet tensorflow 2>&1 | tail -1
+          pip install --quiet "numpy<2" 2>&1 | tail -1
+          pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
+          ls whl/ 2>/dev/null
+          pip install whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -3
+
+      - name: Inspect TFLite
+        run: |
+          python - << 'EOF'
+          import tensorflow as tf
+          p = 'out/x86/models/concept/detector/model_float16.tflite'
+          it = tf.lite.Interpreter(model_path=p)
+          it.allocate_tensors()
+          print('INPUTS:')
+          for d in it.get_input_details(): print('  ', d['name'], d['shape'], d['dtype'])
+          print('OUTPUTS:')
+          for d in it.get_output_details(): print('  ', d['name'], d['shape'], d['dtype'])
+          EOF
+
+      - name: Convert to RKNN
+        run: |
+          python - << 'EOF'
+          import numpy as np
+          from rknn.api import RKNN
+          tflite = 'out/x86/models/concept/detector/model_float16.tflite'
+          rknn = RKNN(verbose=True)
+          rknn.config(mean_values=[[127.5, 127.5, 127.5]], std_values=[[127.5, 127.5, 127.5]],
+                      target_platform='rk3566', quantized_dtype='asymmetric_quantized-8')
+          print('--> load_tflite')
+          assert rknn.load_tflite(model=tflite) == 0
+          print('--> build')
+          assert rknn.build(do_quantization=False) == 0
+          print('--> export')
+          assert rknn.export_rknn('concept_fp16.rknn') == 0
+          rknn.release()
+          print('DONE')
+          EOF
+          ls -la *.rknn
+
+      - name: Upload rknn
+        uses: actions/upload-artifact@v4
+        with:
+          name: concept-rknn
+          path: |
+            *.rknn
+            out/x86/models/concept/detector/labels.txt
+            out/x86/models/concept/detector/thresholds.txt
+          if-no-files-found: warn
