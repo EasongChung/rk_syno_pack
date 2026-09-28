@@ -36,7 +36,7 @@ jobs:
       - name: Install rknn-toolkit2 (protobuf pinned, no tensorflow)
         run: |
           pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram 2>&1 | tail -2
-          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" flatbuffers "tf2onnx==1.19.0" 2>&1 | tail -2
+          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" flatbuffers "tf2onnx==1.17.0" 2>&1 | tail -2
           pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
           pip install --quiet "protobuf==4.25.4" "numpy==1.26.4" 2>&1 | tail -1
           python -c "import google.protobuf as p; print('protobuf', p.__version__)"
