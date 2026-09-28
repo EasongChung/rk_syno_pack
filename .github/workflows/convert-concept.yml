@@ -66,6 +66,21 @@ jobs:
         run: |
           python - << 'EOF'
           import numpy as np, os, traceback
+          # === shim: rknn-toolkit2 compiled .so uses onnx.mapping (removed in onnx>=1.14) ===
+          import onnx, types
+          if not hasattr(onnx, 'mapping'):
+              m = types.SimpleNamespace()
+              m.TENSOR_TYPE_TO_NP_TYPE = {
+                  1: np.dtype('float32'), 2: np.dtype('uint8'), 3: np.dtype('int8'),
+                  4: np.dtype('uint16'), 5: np.dtype('int16'), 6: np.dtype('int32'),
+                  7: np.dtype('int64'), 9: np.dtype('bool'), 10: np.dtype('float16'),
+                  11: np.dtype('float64'), 12: np.dtype('uint32'), 13: np.dtype('uint64'),
+                  14: np.dtype('complex64'), 15: np.dtype('complex128'),
+              }
+              m.NP_TYPE_TO_TENSOR_TYPE = {v: k for k, v in m.TENSOR_TYPE_TO_NP_TYPE.items()}
+              m.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = m.TENSOR_TYPE_TO_NP_TYPE
+              onnx.mapping = m
+              print('onnx.mapping shim injected')
           from rknn.api import RKNN
           tflite = 'out/x86/models/concept/detector/model_float16.tflite'
           ok = False
