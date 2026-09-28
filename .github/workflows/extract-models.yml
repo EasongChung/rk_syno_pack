@@ -1,0 +1,50 @@
+name: Extract Concept Models from SPK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libsodium-dev libmsgpack-dev curl
+
+      - name: Build SynoXtract
+        run: |
+          g++ -O2 -std=c++17 -o tools/SynoXtract/synoxtract tools/SynoXtract/main.cpp -lsodium
+
+      - name: Download SPKs
+        run: |
+          curl -L --fail -o x86.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk"
+          curl -L --fail -o arm.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-armada38x-1.9.1-10928.spk"
+          ls -la *.spk
+
+      - name: Extract both
+        run: |
+          mkdir -p out/x86 out/arm
+          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86 || true
+          ./tools/SynoXtract/synoxtract -i arm.spk -d out/arm || true
+          echo "=== x86 list ==="; find out/x86 -type f | head -80
+          echo "=== arm list ==="; find out/arm -type f | head -80
+
+      - name: Collect model files
+        run: |
+          mkdir -p models
+          find out -type f \( -iname "*.pb" -o -iname "*.xml" -o -iname "*.bin" -o -iname "*.tflite" -o -iname "*.nb" -o -iname "*.onnx" -o -iname "*.dnn" \) -exec cp --parents {} models/ \; 2>/dev/null || true
+          find models -type f | head -60
+          du -sh models || true
+
+      - name: Upload models
+        uses: actions/upload-artifact@v4
+        with:
+          name: concept-models
+          path: models/
+          if-no-files-found: warn
