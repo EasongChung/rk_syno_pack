@@ -2,11 +2,6 @@ name: Convert Concept TFLite to RKNN
 
 on:
   workflow_dispatch:
-    inputs:
-      concept_source:
-        description: 'SPK URL for concept model extraction (default: x86_64 SynologyPhotos)'
-        required: false
-        default: 'https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk'
 
 jobs:
   convert:
@@ -32,25 +27,19 @@ jobs:
       - name: Download and decrypt x86 SPK
         run: |
           set -euo pipefail
-          URL="${{ github.event.inputs.concept_source }}"
-          [ -z "$URL" ] && URL='https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk'
-          echo "=== source: $URL"
-          curl -L --fail -o x86.spk "$URL"
+          curl -L --fail -o x86.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk"
           mkdir -p out/x86x out/x86
           ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x
           echo "=== synoxtract produced:"
           ls -la out/x86x/
-          if [ -f out/x86x/package.tgz ]; then
-            FMT=$(file -b out/x86x/package.tgz)
-            echo "=== package.tgz is: $FMT"
-            mkdir -p out/x86
-            case "$FMT" in
-              *XZ*)  tar xJf out/x86x/package.tgz -C out/x86 ;;
-              *gzip*) tar xzf out/x86x/package.tgz -C out/x86 ;;
-              *bzip2*) tar xjf out/x86x/package.tgz -C out/x86 ;;
-              *) tar xf out/x86x/package.tgz -C out/x86 ;;
-            esac
-          fi
+          FMT=$(file -b out/x86x/package.tgz)
+          echo "=== package.tgz is: $FMT"
+          case "$FMT" in
+            *XZ*)  tar xJf out/x86x/package.tgz -C out/x86 ;;
+            *gzip*) tar xzf out/x86x/package.tgz -C out/x86 ;;
+            *bzip2*) tar xjf out/x86x/package.tgz -C out/x86 ;;
+            *) tar xf out/x86x/package.tgz -C out/x86 ;;
+          esac
           echo "=== concept detector dir:"
           ls -la out/x86/models/concept/detector/
           echo "=== tflite magic ==="
@@ -66,28 +55,27 @@ jobs:
             out/x86/models/concept/detector/thresholds.txt
           if-no-files-found: error
 
-      - name: Install rknn-toolkit2 + tflite2onnx
+      - name: Install tf2onnx (tensorflow-cpu) + rknn-toolkit2
         run: |
           set -euo pipefail
           pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram
-          # tflite2onnx: pure-python tflite->onnx, needs only tflite (flatbuffers) + onnx; no tensorflow
-          pip install --quiet "tflite2onnx==0.4.1" "tflite==2.18.0" "onnx==1.16.1" "protobuf==4.25.4" "onnxruntime==1.16.3"
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           python -c "import torch; print('torch', torch.__version__)"
           pip install --quiet "protobuf==4.25.4" "numpy==1.26.4"
+          python -c "import tensorflow as tf; print('tf', tf.__version__)"
+          python -c "import tf2onnx; print('tf2onnx', tf2onnx.__version__)"
+          python -c "import onnx; print('onnx', onnx.__version__)"
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl
           pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-          python -c "import onnx; print('onnx', onnx.__version__)"
-          python -c "from tflite2onnx import convert; print('tflite2onnx ok')"
-          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
           python -c "from rknn.api import RKNN; print('rknn api ok')"
 
       - name: Convert TFLite -> ONNX -> RKNN
         run: |
           set -euo pipefail
           python - << 'EOF'
-          import os, types, traceback, subprocess
-          import numpy as np
+          import os, types, numpy as np
           import onnx
 
           def apply_mapping_shim():
@@ -110,59 +98,29 @@ jobs:
           src = 'out/x86/models/concept/detector/model_float16.tflite'
           assert os.path.exists(src), 'tflite missing'
 
-          # ---- step 1: tflite -> onnx ----
-          try:
-              from tflite2onnx import convert
-              import tflite2onnx.op.padding as _padmod
-              _orig_transform = _padmod.Padding.transform
-              def _idempotent_transform(self):
-                  # shared SAME-pad initializer is converted once; later ops see it flat
-                  if len(self.inputs[1].shape) == 1:
-                      return
-                  _orig_transform(self)
-              _padmod.Padding.transform = _idempotent_transform
-              convert(src, 'concept.onnx')
-              print('tflite2onnx OK')
-          except Exception:
-              traceback.print_exc()
-              print('=== tflite2onnx failed, falling back to tf2onnx ===')
-              subprocess.run(['pip','install','-q','tensorflow-cpu==2.15.1','tf2onnx==1.16.1'], check=True)
-              subprocess.run(['pip','install','-q','protobuf==4.25.4','numpy==1.26.4'], check=True)
-              apply_mapping_shim()
-              r = subprocess.run(['python','-m','tf2onnx.convert','--tflite',src,
-                                  '--output','concept.onnx','--opset','13'],
-                                 capture_output=True, text=True)
-              print(r.stdout[-3000:]); print(r.stderr[-3000:])
-              assert os.path.exists('concept.onnx'), 'both converters failed'
+          # ---- tflite -> onnx via tf2onnx ----
+          import subprocess
+          r = subprocess.run(['python','-m','tf2onnx.convert','--tflite',src,
+                              '--output','concept.onnx','--opset','13'],
+                             capture_output=True, text=True)
+          print(r.stdout[-2000:]); print(r.stderr[-2000:])
+          assert os.path.exists('concept.onnx'), 'tf2onnx failed'
 
           m = onnx.load('concept.onnx')
           print('onnx ir', m.ir_version, 'opset', [(o.domain, o.version) for o in m.opset_import])
           print('onnx inputs', [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input])
           print('onnx outputs', [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output])
 
-          # ---- step 1.5: fp16 initializers -> fp32 (tflite2onnx writes fp16 as-is) ----
-          from onnx import numpy_helper, TensorProto
-          g = m.graph
-          changed = False
-          new_inits = []
-          for init in g.initializer:
-              if init.data_type == TensorProto.FLOAT16:
-                  arr = numpy_helper.to_array(init).astype(np.float32)
-                  new_inits.append(numpy_helper.from_array(arr, init.name))
-                  changed = True
-              else:
-                  new_inits.append(init)
-          if changed:
-              del g.initializer[:]
-              g.initializer.extend(new_inits)
-              for vi in list(g.value_info) + list(g.input) + list(g.output):
-                  tt = vi.type.tensor_type
-                  if tt.elem_type == TensorProto.FLOAT16:
-                      tt.elem_type = TensorProto.FLOAT
-              print('converted fp16 initializers to fp32')
-          onnx.save(m, 'concept.onnx')
+          # ---- smoke test: run the graph once to prove it is semantically sound ----
+          import onnxruntime as ort
+          sess = ort.InferenceSession('concept.onnx', providers=['CPUExecutionProvider'])
+          ishape = [d if isinstance(d, int) else 1 for d in sess.get_inputs()[0].shape]
+          dummy = np.random.rand(*ishape).astype(np.float32)
+          out = sess.run(None, {sess.get_inputs()[0].name: dummy})
+          print('smoke output', [o.shape for o in out], 'finite:', bool(np.isfinite(out[0]).all()))
+          del sess
 
-          # ---- step 2: onnx -> rknn ----
+          # ---- onnx -> rknn ----
           from rknn.api import RKNN
           rknn = RKNN(verbose=True)
           rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
