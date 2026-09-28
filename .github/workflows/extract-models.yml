@@ -27,19 +27,34 @@ jobs:
           curl -L --fail -o arm.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-armada38x-1.9.1-10928.spk"
           ls -la *.spk
 
-      - name: Extract both
+      - name: Extract SPKs and inner package.tgz
         run: |
           mkdir -p out/x86 out/arm
-          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86 || true
-          ./tools/SynoXtract/synoxtract -i arm.spk -d out/arm || true
-          echo "=== x86 list ==="; find out/x86 -type f | head -80
-          echo "=== arm list ==="; find out/arm -type f | head -80
+          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x || true
+          ./tools/SynoXtract/synoxtract -i arm.spk -d out/armx || true
+          mkdir -p out/x86 out/arm
+          tar xzf out/x86x/package.tgz -C out/x86
+          tar xzf out/armx/package.tgz -C out/arm
+          echo "=== x86 appstore tree ==="
+          find out/x86 -maxdepth 3 -type d | head -40
+          echo "=== model files in x86 ==="
+          find out/x86 -type f \( -iname "*.pb" -o -iname "*.xml" -o -iname "*.bin" -o -iname "*.tflite" -o -iname "*.nb" -o -iname "*.onnx" -o -iname "*.dnn" -o -iname "*.model" \) | head -60
+          echo "=== model files in arm ==="
+          find out/arm -type f \( -iname "*.pb" -o -iname "*.xml" -o -iname "*.bin" -o -iname "*.tflite" -o -iname "*.nb" -o -iname "*.onnx" -o -iname "*.dnn" -o -iname "*.model" \) | head -60
 
-      - name: Collect model files
+      - name: Collect model dirs
         run: |
           mkdir -p models
-          find out -type f \( -iname "*.pb" -o -iname "*.xml" -o -iname "*.bin" -o -iname "*.tflite" -o -iname "*.nb" -o -iname "*.onnx" -o -iname "*.dnn" \) -exec cp --parents {} models/ \; 2>/dev/null || true
-          find models -type f | head -60
+          # preserve full directory structure of models/ and npu/ folders
+          for arch in x86 arm; do
+            find out/$arch -type d \( -name models -o -name npu -o -name detector -o -name network \) -print0 2>/dev/null | while IFS= read -r -d '' d; do
+              rel=${d#out/$arch/}
+              mkdir -p "models/$arch/$(dirname "$rel")"
+              cp -r "$d" "models/$arch/$rel" 2>/dev/null || true
+            done
+          done
+          echo "=== collected ==="
+          find models -type f | head -80
           du -sh models || true
 
       - name: Upload models
