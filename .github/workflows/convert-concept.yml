@@ -2,6 +2,11 @@ name: Convert Concept TFLite to RKNN
 
 on:
   workflow_dispatch:
+    inputs:
+      concept_source:
+        description: 'SPK URL for concept model extraction (default: x86_64 SynologyPhotos)'
+        required: false
+        default: 'https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk'
 
 jobs:
   convert:
@@ -17,55 +22,64 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps + SynoXtract
+      - name: Install deps + build SynoXtract
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ libsodium-dev libmsgpack-dev curl
+          sudo apt-get install -y g++ libsodium-dev libmsgpack-dev curl xxd
           g++ -O2 -std=c++17 -o tools/SynoXtract/synoxtract tools/SynoXtract/main.cpp -lsodium
+          echo "BUILD_OK $(ls -la tools/SynoXtract/synoxtract)"
 
-      - name: Download and extract x86 SPK
+      - name: Download and decrypt x86 SPK
         run: |
-          curl -L --fail -o x86.spk "https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk"
+          set -euo pipefail
+          URL="${{ github.event.inputs.concept_source }}"
+          [ -z "$URL" ] && URL='https://global.synologydownload.com/download/Package/spk/SynologyPhotos/1.9.1-10928/SynologyPhotos-x86_64-1.9.1-10928.spk'
+          echo "=== source: $URL"
+          curl -L --fail -o x86.spk "$URL"
           mkdir -p out/x86x out/x86
-          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x || true
-          tar xf out/x86x/package.tgz -C out/x86 || tar xJf out/x86x/package.tgz -C out/x86 || true
+          ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x
+          echo "=== synoxtract produced:"
+          ls -la out/x86x/
+          if [ -f out/x86x/package.tgz ]; then
+            echo "=== package.tgz is:"; file out/x86x/package.tgz
+            mkdir -p out/x86
+            tar xf out/x86x/package.tgz -C out/x86 || tar xzf out/x86x/package.tgz -C out/x86
+          fi
+          echo "=== concept detector dir:"
           ls -la out/x86/models/concept/detector/
           echo "=== tflite magic ==="
           xxd out/x86/models/concept/detector/model_float16.tflite | head -3
 
-      - name: Install rknn-toolkit2 (protobuf pinned, no tensorflow)
-        run: |
-          pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram 2>&1 | tail -2
-          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" flatbuffers "tf2onnx==1.17.0" 2>&1 | tail -2
-          pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
-          pip install --quiet "protobuf==4.25.4" "numpy==1.26.4" 2>&1 | tail -1
-          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
-          pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
-          ls whl/
-          pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -2
-          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
-          python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -1
-          python -c "import onnx; print('onnx', onnx.__version__, '| has mapping:', hasattr(onnx, 'mapping'))"
+      - name: Upload extracted tflite + labels
+        uses: actions/upload-artifact@v4
+        with:
+          name: concept-tflite
+          path: |
+            out/x86/models/concept/detector/model_float16.tflite
+            out/x86/models/concept/detector/labels.txt
+            out/x86/models/concept/detector/thresholds.txt
+          if-no-files-found: error
 
-      - name: Inspect TFLite (no tensorflow)
+      - name: Install rknn-toolkit2 + tflite2onnx
         run: |
-          python - << 'EOF'
-          import os
-          p = 'out/x86/models/concept/detector/model_float16.tflite'
-          print('size:', os.path.getsize(p))
-          with open(p,'rb') as f: head = f.read(8)
-          print('head:', head.hex(), 'is TFL3:', head[4:8] == b'TFL3')
-          print('expected: input [1,395,395,3] fp32 -> output [1,335] fp32 (from earlier tf-lite run)')
-          EOF
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram
+          # tflite2onnx: pure-python tflite->onnx, needs only tflite (flatbuffers) + onnx; no tensorflow
+          pip install --quiet "tflite2onnx==0.4.1" "tflite==2.18.0" "onnx==1.16.1" "protobuf==4.25.4"
+          pip download rknn-toolkit2==2.3.2 --no-deps -d whl
+          pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+          python -c "import onnx,msgpack; print('onnx', onnx.__version__)"
+          python -c "from tflite2onnx import convert; print('tflite2onnx ok')"
+          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
+          python -c "from rknn.api import RKNN; print('rknn api ok')"
 
       - name: Convert TFLite -> ONNX -> RKNN
         run: |
-          python -m tf2onnx.convert --tflite out/x86/models/concept/detector/model_float16.tflite --output concept.onnx --opset 13 2>&1 | tail -5 || true
-          ls -la concept.onnx 2>/dev/null || echo "tf2onnx failed"
+          set -euo pipefail
           python - << 'EOF'
-          import numpy as np, os, types
-          # shim: rknn-toolkit2 compiled .so uses onnx.mapping (removed in onnx>=1.14)
+          import os, types, numpy as np
           import onnx
+          # shim: rknn-toolkit2 compiled .so references onnx.mapping (removed in onnx>=1.14)
           if not hasattr(onnx, 'mapping'):
               m = types.SimpleNamespace()
               m.TENSOR_TYPE_TO_NP_TYPE = {
@@ -79,28 +93,34 @@ jobs:
               m.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = m.TENSOR_TYPE_TO_NP_TYPE
               onnx.mapping = m
               print('onnx.mapping shim injected')
-          assert os.path.exists('concept.onnx'), 'concept.onnx missing'
+          src = 'out/x86/models/concept/detector/model_float16.tflite'
+          assert os.path.exists(src), 'tflite missing: ' + src
+          from tflite2onnx import convert
+          convert(src, 'concept.onnx')
+          print('onnx written:', os.path.getsize('concept.onnx'))
+          m = onnx.load('concept.onnx')
+          print('onnx ir', m.ir_version, 'opset', [(o.domain, o.version) for o in m.opset_import])
+          print('onnx inputs', [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input])
+          print('onnx outputs', [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output])
           from rknn.api import RKNN
           rknn = RKNN(verbose=True)
           rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
-          print('--> load_onnx')
-          assert rknn.load_onnx(model='concept.onnx') == 0
-          print('--> build')
-          assert rknn.build(do_quantization=False) == 0
-          print('--> export')
-          assert rknn.export_rknn('concept_fp16.rknn') == 0
+          assert rknn.load_onnx(model='concept.onnx') == 0, 'load_onnx failed'
+          print('--> load_onnx ok')
+          assert rknn.build(do_quantization=False) == 0, 'build failed'
+          print('--> build ok')
+          assert rknn.export_rknn('concept_fp16.rknn') == 0, 'export failed'
           rknn.release()
-          print('FINAL OK')
+          print('FINAL OK', os.path.getsize('concept_fp16.rknn'))
           EOF
-          ls -la *.rknn
 
       - name: Upload rknn
         uses: actions/upload-artifact@v4
         with:
           name: concept-rknn
           path: |
-            *.rknn
+            concept_fp16.rknn
             concept.onnx
             out/x86/models/concept/detector/labels.txt
             out/x86/models/concept/detector/thresholds.txt
-          if-no-files-found: warn
+          if-no-files-found: error
