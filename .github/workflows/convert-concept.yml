@@ -33,33 +33,28 @@ jobs:
           echo "=== tflite magic ==="
           xxd out/x86/models/concept/detector/model_float16.tflite | head -3
 
-      - name: Install rknn-toolkit2 (with onnx<1.14 forced last)
+      - name: Install rknn-toolkit2 (protobuf pinned, no tensorflow)
         run: |
-          pip install --quiet "numpy<=1.26.4" "protobuf>=4.21.6,<=4.25.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram "onnxruntime>=1.10.0" 2>&1 | tail -2
-          pip install --quiet tensorflow==2.12.0 2>&1 | tail -1 || pip install --quiet "tensorflow<=2.14.0" 2>&1 | tail -1 || true
+          pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram 2>&1 | tail -2
+          pip install --quiet "onnx>=1.16.1" onnxoptimizer "onnxruntime>=1.10.0" 2>&1 | tail -2
+          pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
           ls whl/
           pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -2
-          pip install --quiet "onnx>=1.16.1" onnxoptimizer 2>&1 | tail -2
-          pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
+          pip install --quiet "protobuf==4.25.4" "numpy==1.26.4" 2>&1 | tail -1
+          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
           python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -1
           python -c "import onnx; print('onnx', onnx.__version__, '| has mapping:', hasattr(onnx, 'mapping'))"
 
-      - name: Inspect TFLite
+      - name: Inspect TFLite (no tensorflow)
         run: |
           python - << 'EOF'
-          import tensorflow as tf, os
+          import os
           p = 'out/x86/models/concept/detector/model_float16.tflite'
           print('size:', os.path.getsize(p))
           with open(p,'rb') as f: head = f.read(8)
           print('head:', head.hex(), 'is TFL3:', head[4:8] == b'TFL3')
-          it = tf.lite.Interpreter(model_path=p)
-          try:
-              it.allocate_tensors()
-          except Exception as e:
-              print('allocate failed:', e)
-          print('INPUTS:', [(d['name'], list(d['shape']), str(d['dtype'])) for d in it.get_input_details()])
-          print('OUTPUTS:', [(d['name'], list(d['shape']), str(d['dtype'])) for d in it.get_output_details()])
+          print('expected: input [1,395,395,3] fp32 -> output [1,335] fp32 (from earlier tf-lite run)')
           EOF
 
       - name: Convert to RKNN (tflite path, tf2onnx fallback)
