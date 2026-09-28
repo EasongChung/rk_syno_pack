@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps
+      - name: Install deps + SynoXtract
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ libsodium-dev libmsgpack-dev curl
@@ -30,51 +30,78 @@ jobs:
           ./tools/SynoXtract/synoxtract -i x86.spk -d out/x86x || true
           tar xf out/x86x/package.tgz -C out/x86 || tar xJf out/x86x/package.tgz -C out/x86 || true
           ls -la out/x86/models/concept/detector/
+          echo "=== tflite magic ==="
+          xxd out/x86/models/concept/detector/model_float16.tflite | head -3
 
-      - name: Install rknn-toolkit2
+      - name: Install rknn-toolkit2 (with onnx<1.14 forced last)
         run: |
-          pip install --quiet "numpy<2" "onnx==1.13.1" "onnxoptimizer==0.3.10" "onnxruntime==1.16.3" 2>&1 | tail -2
-          pip install --quiet tensorflow==2.12.0 2>&1 | tail -1 || pip install --quiet tensorflow 2>&1 | tail -1
+          pip install --quiet "numpy<=1.26.4" "protobuf>=4.21.6,<=4.25.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram "onnxruntime>=1.10.0" 2>&1 | tail -2
+          pip install --quiet tensorflow==2.12.0 2>&1 | tail -1 || pip install --quiet "tensorflow<=2.14.0" 2>&1 | tail -1 || true
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
-          ls whl/ 2>/dev/null
-          pip install whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -3
-          python -c "import onnx; print('onnx', onnx.__version__)" 
+          ls whl/
+          pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -2
+          pip install --quiet "onnx==1.13.1" "onnxoptimizer==0.3.10" 2>&1 | tail -2 || pip install --quiet "onnx==1.13.1" 2>&1 | tail -2
+          python -c "import onnx; print('onnx', onnx.__version__, '| has mapping:', hasattr(onnx, 'mapping'))"
 
       - name: Inspect TFLite
         run: |
           python - << 'EOF'
-          import tensorflow as tf
+          import tensorflow as tf, os
           p = 'out/x86/models/concept/detector/model_float16.tflite'
-          import json, sys
-          print('file size:', __import__('os').path.getsize(p))
-          it = tf.lite.Interpreter(model_path=p, experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
-          it.allocate_tensors()
-          print('INPUTS:')
-          for d in it.get_input_details(): print('  ', d['name'], d['shape'], d['dtype'])
-          print('OUTPUTS:')
-          for d in it.get_output_details(): print('  ', d['name'], d['shape'], d['dtype'])
-          sys.stdout.flush()
+          print('size:', os.path.getsize(p))
+          with open(p,'rb') as f: head = f.read(8)
+          print('head:', head.hex(), 'is TFL3:', head[4:8] == b'TFL3')
+          it = tf.lite.Interpreter(model_path=p)
+          try:
+              it.allocate_tensors()
+          except Exception as e:
+              print('allocate failed:', e)
+          print('INPUTS:', [(d['name'], list(d['shape']), str(d['dtype'])) for d in it.get_input_details()])
+          print('OUTPUTS:', [(d['name'], list(d['shape']), str(d['dtype'])) for d in it.get_output_details()])
           EOF
 
-      - name: Convert to RKNN
+      - name: Convert to RKNN (tflite path, tf2onnx fallback)
         run: |
           python - << 'EOF'
-          import numpy as np
+          import numpy as np, os, traceback
           from rknn.api import RKNN
           tflite = 'out/x86/models/concept/detector/model_float16.tflite'
-          rknn = RKNN(verbose=True)
-          rknn.config(mean_values=[[127.5, 127.5, 127.5]], std_values=[[127.5, 127.5, 127.5]],
-                      target_platform='rk3566', quantized_dtype='asymmetric_quantized-8')
-          print('--> load_tflite')
-          assert rknn.load_tflite(model=tflite) == 0
-          print('--> build')
-          assert rknn.build(do_quantization=False) == 0
-          print('--> export')
-          assert rknn.export_rknn('concept_fp16.rknn') == 0
-          rknn.release()
-          print('DONE')
+          ok = False
+          try:
+              rknn = RKNN(verbose=False)
+              rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]],
+                          target_platform='rk3566')
+              r = rknn.load_tflite(model=tflite)
+              print('load_tflite ->', r)
+              if r == 0:
+                  r = rknn.build(do_quantization=False)
+                  print('build ->', r)
+                  if r == 0:
+                      r = rknn.export_rknn('concept_fp16.rknn')
+                      print('export ->', r)
+                      ok = (r == 0)
+              rknn.release()
+          except Exception:
+              traceback.print_exc()
+          if not ok:
+              print('=== tflite path failed, trying tf2onnx ===')
+              import subprocess
+              subprocess.run(['pip','install','-q','tf2onnx'], check=False)
+              r = subprocess.run(['python','-m','tf2onnx.convert','--tflite',tflite,'--output','concept.onnx'], capture_output=True, text=True)
+              print(r.stdout[-2000:] if r.stdout else '', r.stderr[-2000:] if r.stderr else '')
+              if os.path.exists('concept.onnx'):
+                  rknn = RKNN(verbose=False)
+                  rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
+                  r = rknn.load_onnx(model='concept.onnx')
+                  print('load_onnx ->', r)
+                  if r == 0:
+                      r = rknn.build(do_quantization=False); print('build ->', r)
+                      if r == 0:
+                          r = rknn.export_rknn('concept_fp16.rknn'); print('export ->', r); ok = (r==0)
+                  rknn.release()
+          print('FINAL OK:', ok)
           EOF
-          ls -la *.rknn
+          ls -la *.rknn 2>/dev/null || true
 
       - name: Upload rknn
         uses: actions/upload-artifact@v4
@@ -82,6 +109,7 @@ jobs:
           name: concept-rknn
           path: |
             *.rknn
+            concept.onnx
             out/x86/models/concept/detector/labels.txt
             out/x86/models/concept/detector/thresholds.txt
           if-no-files-found: warn
