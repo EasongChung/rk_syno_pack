@@ -54,7 +54,7 @@ jobs:
           echo "=== concept detector dir:"
           ls -la out/x86/models/concept/detector/
           echo "=== tflite magic ==="
-          xxd out/x86/models/concept/detector/model_float16.tflite | head -3
+          xxd -l 32 out/x86/models/concept/detector/model_float16.tflite
 
       - name: Upload extracted tflite + labels
         uses: actions/upload-artifact@v4
@@ -74,7 +74,7 @@ jobs:
           pip install --quiet "tflite2onnx==0.4.1" "tflite==2.18.0" "onnx==1.16.1" "protobuf==4.25.4"
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl
           pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
-          python -c "import onnx,msgpack; print('onnx', onnx.__version__)"
+          python -c "import onnx; print('onnx', onnx.__version__)"
           python -c "from tflite2onnx import convert; print('tflite2onnx ok')"
           python -c "import google.protobuf as p; print('protobuf', p.__version__)"
           python -c "from rknn.api import RKNN; print('rknn api ok')"
