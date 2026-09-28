@@ -111,6 +111,23 @@ jobs:
           print('onnx inputs', [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input])
           print('onnx outputs', [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output])
 
+          # ---- normalize input layout to NCHW (tf2onnx emits NHWC; rknn expects NCHW) ----
+          from onnx import helper
+          g = m.graph
+          inp = g.input[0]
+          dims = [d.dim_value for d in inp.type.tensor_type.shape.dim]
+          if len(dims) == 4 and dims[3] == 3:
+              orig_name = inp.name
+              nchw_name = orig_name + '_nchw'
+              inp.name = nchw_name
+              dims_nchw = [dims[0], dims[3], dims[1], dims[2]]
+              for i, v in enumerate(dims_nchw):
+                  inp.type.tensor_type.shape.dim[i].dim_value = v
+              tp = helper.make_node('Transpose', [nchw_name], [orig_name], perm=[0, 2, 3, 1], name='nchw_to_nhwc')
+              g.node.insert(0, tp)
+              onnx.save(m, 'concept.onnx')
+              print('input rewritten to NCHW', dims_nchw, 'via Transpose ->', orig_name)
+
           # ---- smoke test: run the graph once to prove it is semantically sound ----
           import onnxruntime as ort
           sess = ort.InferenceSession('concept.onnx', providers=['CPUExecutionProvider'])
@@ -120,15 +137,19 @@ jobs:
           print('smoke output', [o.shape for o in out], 'finite:', bool(np.isfinite(out[0]).all()))
           del sess
 
-          # ---- onnx -> rknn ----
+          # ---- onnx -> rknn (no mean/std: server feeds pre-normalized float input) ----
           from rknn.api import RKNN
           rknn = RKNN(verbose=True)
-          rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
-          assert rknn.load_onnx(model='concept.onnx') == 0, 'load_onnx failed'
-          print('--> load_onnx ok')
-          assert rknn.build(do_quantization=False) == 0, 'build failed'
-          print('--> build ok')
-          assert rknn.export_rknn('concept_fp16.rknn') == 0, 'export failed'
+          rknn.config(target_platform='rk3566')
+          ret = rknn.load_onnx(model='concept.onnx')
+          print('load_onnx ->', ret)
+          assert ret == 0, 'load_onnx failed'
+          ret = rknn.build(do_quantization=False)
+          print('build ->', ret)
+          assert ret == 0, 'build failed'
+          ret = rknn.export_rknn('concept_fp16.rknn')
+          print('export ->', ret)
+          assert ret == 0, 'export failed'
           rknn.release()
           print('FINAL OK', os.path.getsize('concept_fp16.rknn'))
           EOF
