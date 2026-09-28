@@ -36,12 +36,13 @@ jobs:
       - name: Install rknn-toolkit2 (protobuf pinned, no tensorflow)
         run: |
           pip install --quiet "numpy==1.26.4" psutil "ruamel.yaml" scipy tqdm opencv-python fast-histogram 2>&1 | tail -2
-          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" 2>&1 | tail -2
+          pip install --quiet "onnx==1.16.1" "onnxruntime>=1.10.0" flatbuffers "tf2onnx==1.19.0" 2>&1 | tail -2
           pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
+          pip install --quiet "protobuf==4.25.4" "numpy==1.26.4" 2>&1 | tail -1
+          python -c "import google.protobuf as p; print('protobuf', p.__version__)"
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
           ls whl/
           pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -2
-          pip install --quiet "protobuf==4.25.4" "numpy==1.26.4" 2>&1 | tail -1
           python -c "import google.protobuf as p; print('protobuf', p.__version__)"
           python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -1
           python -c "import onnx; print('onnx', onnx.__version__, '| has mapping:', hasattr(onnx, 'mapping'))"
@@ -57,12 +58,14 @@ jobs:
           print('expected: input [1,395,395,3] fp32 -> output [1,335] fp32 (from earlier tf-lite run)')
           EOF
 
-      - name: Convert to RKNN (tflite path, tf2onnx fallback)
+      - name: Convert TFLite -> ONNX -> RKNN
         run: |
+          python -m tf2onnx.convert --tflite out/x86/models/concept/detector/model_float16.tflite --output concept.onnx --opset 13 2>&1 | tail -5 || true
+          ls -la concept.onnx 2>/dev/null || echo "tf2onnx failed"
           python - << 'EOF'
-          import numpy as np, os, traceback
-          # === shim: rknn-toolkit2 compiled .so uses onnx.mapping (removed in onnx>=1.14) ===
-          import onnx, types
+          import numpy as np, os, types
+          # shim: rknn-toolkit2 compiled .so uses onnx.mapping (removed in onnx>=1.14)
+          import onnx
           if not hasattr(onnx, 'mapping'):
               m = types.SimpleNamespace()
               m.TENSOR_TYPE_TO_NP_TYPE = {
@@ -76,44 +79,20 @@ jobs:
               m.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = m.TENSOR_TYPE_TO_NP_TYPE
               onnx.mapping = m
               print('onnx.mapping shim injected')
+          assert os.path.exists('concept.onnx'), 'concept.onnx missing'
           from rknn.api import RKNN
-          tflite = 'out/x86/models/concept/detector/model_float16.tflite'
-          ok = False
-          try:
-              rknn = RKNN(verbose=False)
-              rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]],
-                          target_platform='rk3566')
-              r = rknn.load_tflite(model=tflite)
-              print('load_tflite ->', r)
-              if r == 0:
-                  r = rknn.build(do_quantization=False)
-                  print('build ->', r)
-                  if r == 0:
-                      r = rknn.export_rknn('concept_fp16.rknn')
-                      print('export ->', r)
-                      ok = (r == 0)
-              rknn.release()
-          except Exception:
-              traceback.print_exc()
-          if not ok:
-              print('=== tflite path failed, trying tf2onnx ===')
-              import subprocess
-              subprocess.run(['pip','install','-q','tf2onnx'], check=False)
-              r = subprocess.run(['python','-m','tf2onnx.convert','--tflite',tflite,'--output','concept.onnx'], capture_output=True, text=True)
-              print(r.stdout[-2000:] if r.stdout else '', r.stderr[-2000:] if r.stderr else '')
-              if os.path.exists('concept.onnx'):
-                  rknn = RKNN(verbose=False)
-                  rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
-                  r = rknn.load_onnx(model='concept.onnx')
-                  print('load_onnx ->', r)
-                  if r == 0:
-                      r = rknn.build(do_quantization=False); print('build ->', r)
-                      if r == 0:
-                          r = rknn.export_rknn('concept_fp16.rknn'); print('export ->', r); ok = (r==0)
-                  rknn.release()
-          print('FINAL OK:', ok)
+          rknn = RKNN(verbose=True)
+          rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
+          print('--> load_onnx')
+          assert rknn.load_onnx(model='concept.onnx') == 0
+          print('--> build')
+          assert rknn.build(do_quantization=False) == 0
+          print('--> export')
+          assert rknn.export_rknn('concept_fp16.rknn') == 0
+          rknn.release()
+          print('FINAL OK')
           EOF
-          ls -la *.rknn 2>/dev/null || true
+          ls -la *.rknn
 
       - name: Upload rknn
         uses: actions/upload-artifact@v4
