@@ -86,31 +86,83 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'EOF'
-          import os, types, numpy as np
+          import os, types, traceback, subprocess
+          import numpy as np
           import onnx
-          # shim: rknn-toolkit2 compiled .so references onnx.mapping (removed in onnx>=1.14)
-          if not hasattr(onnx, 'mapping'):
-              m = types.SimpleNamespace()
-              m.TENSOR_TYPE_TO_NP_TYPE = {
-                  1: np.dtype('float32'), 2: np.dtype('uint8'), 3: np.dtype('int8'),
-                  4: np.dtype('uint16'), 5: np.dtype('int16'), 6: np.dtype('int32'),
-                  7: np.dtype('int64'), 9: np.dtype('bool'), 10: np.dtype('float16'),
-                  11: np.dtype('float64'), 12: np.dtype('uint32'), 13: np.dtype('uint64'),
-                  14: np.dtype('complex64'), 15: np.dtype('complex128'),
-              }
-              m.NP_TYPE_TO_TENSOR_TYPE = {v: k for k, v in m.TENSOR_TYPE_TO_NP_TYPE.items()}
-              m.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = m.TENSOR_TYPE_TO_NP_TYPE
-              onnx.mapping = m
-              print('onnx.mapping shim injected')
+
+          def apply_mapping_shim():
+              # rknn-toolkit2 compiled .so references onnx.mapping (removed in onnx>=1.14)
+              if not hasattr(onnx, 'mapping'):
+                  m = types.SimpleNamespace()
+                  m.TENSOR_TYPE_TO_NP_TYPE = {
+                      1: np.dtype('float32'), 2: np.dtype('uint8'), 3: np.dtype('int8'),
+                      4: np.dtype('uint16'), 5: np.dtype('int16'), 6: np.dtype('int32'),
+                      7: np.dtype('int64'), 9: np.dtype('bool'), 10: np.dtype('float16'),
+                      11: np.dtype('float64'), 12: np.dtype('uint32'), 13: np.dtype('uint64'),
+                      14: np.dtype('complex64'), 15: np.dtype('complex128'),
+                  }
+                  m.NP_TYPE_TO_TENSOR_TYPE = {v: k for k, v in m.TENSOR_TYPE_TO_NP_TYPE.items()}
+                  m.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = m.TENSOR_TYPE_TO_NP_TYPE
+                  onnx.mapping = m
+                  print('onnx.mapping shim injected')
+          apply_mapping_shim()
+
           src = 'out/x86/models/concept/detector/model_float16.tflite'
-          assert os.path.exists(src), 'tflite missing: ' + src
-          from tflite2onnx import convert
-          convert(src, 'concept.onnx')
-          print('onnx written:', os.path.getsize('concept.onnx'))
+          assert os.path.exists(src), 'tflite missing'
+
+          # ---- step 1: tflite -> onnx ----
+          try:
+              from tflite2onnx import convert
+              import tflite2onnx.op.padding as _padmod
+              _orig_transform = _padmod.Padding.transform
+              def _idempotent_transform(self):
+                  # shared SAME-pad initializer is converted once; later ops see it flat
+                  if len(self.inputs[1].shape) == 1:
+                      return
+                  _orig_transform(self)
+              _padmod.Padding.transform = _idempotent_transform
+              convert(src, 'concept.onnx')
+              print('tflite2onnx OK')
+          except Exception:
+              traceback.print_exc()
+              print('=== tflite2onnx failed, falling back to tf2onnx ===')
+              subprocess.run(['pip','install','-q','tensorflow-cpu==2.15.1','tf2onnx==1.16.1'], check=True)
+              subprocess.run(['pip','install','-q','protobuf==4.25.4','numpy==1.26.4'], check=True)
+              apply_mapping_shim()
+              r = subprocess.run(['python','-m','tf2onnx.convert','--tflite',src,
+                                  '--output','concept.onnx','--opset','13'],
+                                 capture_output=True, text=True)
+              print(r.stdout[-3000:]); print(r.stderr[-3000:])
+              assert os.path.exists('concept.onnx'), 'both converters failed'
+
           m = onnx.load('concept.onnx')
           print('onnx ir', m.ir_version, 'opset', [(o.domain, o.version) for o in m.opset_import])
           print('onnx inputs', [(i.name, [d.dim_value for d in i.type.tensor_type.shape.dim]) for i in m.graph.input])
           print('onnx outputs', [(o.name, [d.dim_value for d in o.type.tensor_type.shape.dim]) for o in m.graph.output])
+
+          # ---- step 1.5: fp16 initializers -> fp32 (tflite2onnx writes fp16 as-is) ----
+          from onnx import numpy_helper, TensorProto
+          g = m.graph
+          changed = False
+          new_inits = []
+          for init in g.initializer:
+              if init.data_type == TensorProto.FLOAT16:
+                  arr = numpy_helper.to_array(init).astype(np.float32)
+                  new_inits.append(numpy_helper.from_array(arr, init.name))
+                  changed = True
+              else:
+                  new_inits.append(init)
+          if changed:
+              del g.initializer[:]
+              g.initializer.extend(new_inits)
+              for vi in list(g.value_info) + list(g.input) + list(g.output):
+                  tt = vi.type.tensor_type
+                  if tt.elem_type == TensorProto.FLOAT16:
+                      tt.elem_type = TensorProto.FLOAT
+              print('converted fp16 initializers to fp32')
+          onnx.save(m, 'concept.onnx')
+
+          # ---- step 2: onnx -> rknn ----
           from rknn.api import RKNN
           rknn = RKNN(verbose=True)
           rknn.config(mean_values=[[127.5,127.5,127.5]], std_values=[[127.5,127.5,127.5]], target_platform='rk3566')
