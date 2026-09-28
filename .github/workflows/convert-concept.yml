@@ -40,7 +40,9 @@ jobs:
           pip download rknn-toolkit2==2.3.2 --no-deps -d whl 2>&1 | tail -2 || true
           ls whl/
           pip install --quiet --no-deps whl/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl 2>&1 | tail -2
-          pip install --quiet "onnx==1.13.1" "onnxoptimizer==0.3.10" 2>&1 | tail -2 || pip install --quiet "onnx==1.13.1" 2>&1 | tail -2
+          pip install --quiet "onnx>=1.16.1" onnxoptimizer 2>&1 | tail -2
+          pip install --quiet "torch>=1.10.1,<=2.4.0" --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -2 || pip install --quiet "torch" 2>&1 | tail -2
+          python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -1
           python -c "import onnx; print('onnx', onnx.__version__, '| has mapping:', hasattr(onnx, 'mapping'))"
 
       - name: Inspect TFLite
