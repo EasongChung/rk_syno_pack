@@ -362,21 +362,21 @@ static int sw_activity_by_ledtrig_disk_syno(struct ata_port* ap, u32 state)
 		if (led_cdev->activated && alt_cdev) {
 			pp->syno_alt_phase = !pp->syno_alt_phase;
 			if (pp->syno_alt_phase) {
-				led_set_brightness_nosleep(led_cdev, LED_OFF);
-				led_set_brightness_nosleep(alt_cdev, alt_cdev->max_brightness);
+				led_set_brightness(led_cdev, LED_OFF);
+				led_set_brightness(alt_cdev, alt_cdev->max_brightness);
 			} else {
-				led_set_brightness_nosleep(led_cdev, led_cdev->max_brightness);
-				led_set_brightness_nosleep(alt_cdev, LED_OFF);
+				led_set_brightness(led_cdev, led_cdev->max_brightness);
+				led_set_brightness(alt_cdev, LED_OFF);
 			}
 		} else {
 			ledtrig_syno_disk_activity_on(led_cdev);
 		}
 	} else if (SYNO_LED_BLINK_OFF == state) {
 		if (led_cdev->activated) {
-			led_set_brightness_nosleep(led_cdev, led_cdev->max_brightness);
+			led_set_brightness(led_cdev, led_cdev->max_brightness);
 		}
 		if (alt_cdev) {
-			led_set_brightness_nosleep(alt_cdev, LED_OFF);
+			led_set_brightness(alt_cdev, LED_OFF);
 		}
 	}
 
