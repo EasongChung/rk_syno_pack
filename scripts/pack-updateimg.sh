@@ -279,6 +279,119 @@ patch_kernel_disk_led()
 		grep -q 'sw_activity = <1>' "$dts" || die "$dts: failed to add sw_activity"
 	fi
 
+	# Dual-color disk activity blink: alternate green/blue on IO instead of
+	# on/off blinking. Slots without led_blue fall back to the stock oneshot.
+	local ahci_c="$KERNEL_SRC/drivers/ata/libahci.c"
+	local ahci_h="$KERNEL_SRC/drivers/ata/ahci.h"
+	local synolib_h="$KERNEL_SRC/include/linux/synolib.h"
+	local alt_body
+
+	if [ -f "$dtsi" ] && ! grep -q 'blue_led: blue-led' "$dtsi"; then
+		perl -0pi -e 's/\t\tblue-led \{/\t\tblue_led: blue-led {/' "$dtsi"
+		grep -q 'blue_led: blue-led' "$dtsi" || die "$dtsi: failed to label blue-led"
+	fi
+
+	if ! grep -q 'led_blue = <&blue_led>' "$dts"; then
+		perl -0pi -e 's/(\t\tled_type = "trig_disk_syno";\n)/$1\t\tled_blue = <&blue_led>;\n/g' "$dts"
+		grep -q 'led_blue = <&blue_led>' "$dts" || die "$dts: failed to add led_blue"
+	fi
+
+	if [ -f "$synolib_h" ] && ! grep -q 'DT_HDD_ALT_LED' "$synolib_h"; then
+		perl -0pi -e 's/(\#define DT_HDD_GREEN_LED "led_green"\n)/$1\#define DT_HDD_ALT_LED "led_blue"\n/' "$synolib_h"
+		grep -q 'DT_HDD_ALT_LED' "$synolib_h" || die "$synolib_h: failed to add DT_HDD_ALT_LED"
+	fi
+
+	if [ -f "$ahci_h" ] && ! grep -q 'syno_alt_phase' "$ahci_h"; then
+		perl -0pi -e 's/(\tint\t+\(\*syno_set_blink\)\(struct ata_port\* ap, u32 state\);\n)/$1\tunsigned int\t\tsyno_alt_phase;\n/' "$ahci_h"
+		grep -q 'syno_alt_phase' "$ahci_h" || die "$ahci_h: failed to add syno_alt_phase"
+	fi
+
+	if [ -f "$ahci_c" ] && ! grep -q 'DT_HDD_ALT_LED' "$ahci_c"; then
+		log "wiring dual-color disk LED blink into libahci.c"
+		alt_body="$(cat <<'NBU_ALT_EOF'
+static int sw_activity_by_ledtrig_disk_syno(struct ata_port* ap, u32 state)
+{
+	int ret = -EINVAL;
+	struct device_node *pSlotNode = NULL;
+	struct device_node *pLedNode = NULL;
+	struct device_node *pAltNode = NULL;
+	struct led_classdev *led_cdev = NULL;
+	struct led_classdev *alt_cdev = NULL;
+	struct ahci_port_priv *pp = NULL;
+
+	if (!ap) {
+		goto Err;
+	}
+
+	for_each_child_of_node(of_root, pSlotNode) {
+		if (ap->ops->syno_compare_node_info(ap, pSlotNode)) {
+			break;
+		}
+	}
+	if (!pSlotNode) {
+		goto Err;
+	}
+
+	pLedNode = of_parse_phandle(pSlotNode, DT_HDD_GREEN_LED, 0);
+	pAltNode = of_parse_phandle(pSlotNode, DT_HDD_ALT_LED, 0);
+	of_node_put(pSlotNode);
+	if (!pLedNode) {
+		goto Err;
+	}
+
+	led_cdev = of_leddev_get(pLedNode);
+	of_node_put(pLedNode);
+	if (IS_ERR(led_cdev)) {
+		goto Err;
+	}
+
+	if (pAltNode) {
+		alt_cdev = of_leddev_get(pAltNode);
+		of_node_put(pAltNode);
+		if (IS_ERR(alt_cdev)) {
+			alt_cdev = NULL;
+		}
+	}
+
+	pp = ap->private_data;
+	if (!pp) {
+		goto Err;
+	}
+
+	if (SYNO_LED_BLINK_ON == state) {
+		if (led_cdev->activated && alt_cdev) {
+			pp->syno_alt_phase = !pp->syno_alt_phase;
+			if (pp->syno_alt_phase) {
+				led_set_brightness_nosleep(led_cdev, LED_OFF);
+				led_set_brightness_nosleep(alt_cdev, alt_cdev->max_brightness);
+			} else {
+				led_set_brightness_nosleep(led_cdev, led_cdev->max_brightness);
+				led_set_brightness_nosleep(alt_cdev, LED_OFF);
+			}
+		} else {
+			ledtrig_syno_disk_activity_on(led_cdev);
+		}
+	} else if (SYNO_LED_BLINK_OFF == state) {
+		if (led_cdev->activated) {
+			led_set_brightness_nosleep(led_cdev, led_cdev->max_brightness);
+		}
+		if (alt_cdev) {
+			led_set_brightness_nosleep(alt_cdev, LED_OFF);
+		}
+	}
+
+	ret = 0;
+
+Err:
+	return ret;
+}
+#endif /* MY_ABC_HERE */
+NBU_ALT_EOF
+)"
+		perl -0pi -e 'BEGIN { $nb = pop; } s/static int sw_activity_by_ledtrig_disk_syno\(struct ata_port\* ap, u32 state\)\n\{.*?\n\}\n#endif \/\* MY_ABC_HERE \*\//$nb/s' "$ahci_c" "$alt_body"
+		grep -q 'DT_HDD_ALT_LED' "$ahci_c" || die "$ahci_c: failed to patch dual-color blink"
+	fi
+
 	if [ -f "$trig" ] && ! grep -q 'led_cdev->activated = true' "$trig"; then
 		log "activating disk LED trigger by default in $trig"
 		perl -0pi -e 's/(syno_disk_trig_activate\(struct led_classdev \*led_cdev\)\n\{\n)/$1\tled_cdev->activated = true;\n/' "$trig"

@@ -89,6 +89,7 @@ jobs:
           echo "== DTB: $DTB"
           echo -n "slot1_led_type="; fdtget -t s "$DTB" /internal_slot@1 led_type
           echo -n "slot1_led_green="; fdtget -t x "$DTB" /internal_slot@1 led_green
+          echo -n "slot1_led_blue="; fdtget -t x "$DTB" /internal_slot@1 led_blue
           echo -n "slot1_sw_activity="; fdtget -t x "$DTB" /internal_slot@1/ahci sw_activity
           echo -n "green_default_trigger="; fdtget -t s "$DTB" /gpio-leds/green-led linux,default-trigger
           echo -n "npu_reg="; fdtget -t x "$DTB" /npu@fde40000 reg
