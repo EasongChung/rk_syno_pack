@@ -240,6 +240,52 @@ install_root_modules()
 	done < "$manifest"
 }
 
+# Wire the OEC green LED to disk activity the way the stock firmware does:
+# the AHCI software-activity path reads led_type/led_green from the slot node
+# and pokes the LED class trigger "disk_syno" on every queued command. The
+# factory synobios module (which normally flips the trigger's "activated"
+# flag) cannot load against this kernel because it re-exports a symbol that
+# is built in, so the trigger is activated at registration instead.
+patch_kernel_disk_led()
+{
+	local dtsi="$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3566-oec-box.dtsi"
+	local dts="$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3566-oec-box-wxy4-dsm.dts"
+	local trig="$KERNEL_SRC/drivers/leds/trigger/ledtrig-disk-syno.c"
+
+	if [ ! -f "$dts" ]; then
+		return 0
+	fi
+
+	if grep -q 'led_green = <&green-led>' "$dts"; then
+		log "disk-activity LED wiring already present in DTS"
+	else
+		need_file "$dtsi" "DTS include for this SoC is missing"
+		log "wiring green LED to disk activity in DTS"
+
+		if ! grep -q 'green-led: green-led' "$dtsi"; then
+			perl -0pi -e 's/\t\tgreen-led \{/\t\tgreen-led: green-led {/' "$dtsi"
+		fi
+		if ! grep -q 'linux,default-trigger = "disk_syno"' "$dtsi"; then
+			perl -0pi -e 's/(\t\tgreen-led: green-led \{\n)/$1\t\t\tlinux,default-trigger = "disk_syno";\n/' "$dtsi"
+		fi
+
+		perl -0pi -e 's/(\tinternal_slot\@\d+ \{\n\t\tprotocol_type = "sata";\n)/$1\t\tled_type = "trig_disk_syno";\n\t\tled_green = <&green-led>;\n/g' "$dts"
+		perl -0pi -e 's/(\t\tahci \{\n)/$1\t\t\tsw_activity = <1>;\n/g' "$dts"
+
+		grep -q 'green-led: green-led' "$dtsi" || die "$dtsi: failed to label green-led"
+		grep -q 'linux,default-trigger = "disk_syno"' "$dtsi" || die "$dtsi: failed to add default trigger"
+		grep -q 'led_type = "trig_disk_syno"' "$dts" || die "$dts: failed to add led_type"
+		grep -q 'led_green = <&green-led>' "$dts" || die "$dts: failed to add led_green"
+		grep -q 'sw_activity = <1>' "$dts" || die "$dts: failed to add sw_activity"
+	fi
+
+	if [ -f "$trig" ] && ! grep -q 'led_cdev->activated = true' "$trig"; then
+		log "activating disk LED trigger by default in $trig"
+		perl -0pi -e 's/(syno_disk_trig_activate\(struct led_classdev \*led_cdev\)\n\{\n)/$1\tled_cdev->activated = true;\n/' "$trig"
+		grep -q 'led_cdev->activated = true' "$trig" || die "$trig: failed to enable default activation"
+	fi
+}
+
 prune_stale_kernel_modules()
 {
 	local order="$KERNEL_BUILD/modules.order"
@@ -409,6 +455,7 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 	ensure_cross_compile
 
 	configure_kernel_if_needed
+	patch_kernel_disk_led
 	log "building kernel Image and dtb"
 	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image Image.gz dtbs
 	log "building all kernel modules"

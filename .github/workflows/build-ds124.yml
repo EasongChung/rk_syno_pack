@@ -82,6 +82,20 @@ jobs:
         run: |
           find output build/rd.bin -type f -exec ls -la {} \; 2>/dev/null || true
 
+      - name: Verify boot image
+        run: |
+          set -eu
+          DTB=$(ls output/dsm/boot-root/boot/*.dtb)
+          echo "== DTB: $DTB"
+          echo -n "slot1_led_type="; fdtget -t s "$DTB" /internal_slot@1 led_type
+          echo -n "slot1_led_green="; fdtget -t x "$DTB" /internal_slot@1 led_green
+          echo -n "slot1_sw_activity="; fdtget -t x "$DTB" /internal_slot@1/ahci sw_activity
+          echo -n "green_default_trigger="; fdtget -t s "$DTB" /gpio-leds/green-led linux,default-trigger
+          echo -n "npu_reg="; fdtget -t x "$DTB" /npu@fde40000 reg
+          echo "== bootargs"
+          grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*' \
+            output/dsm/boot-root/boot/extlinux/extlinux.conf
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
