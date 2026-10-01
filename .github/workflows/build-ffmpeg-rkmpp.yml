@@ -79,8 +79,15 @@ jobs:
           # ffmpeg's configure has two probes for this library: it first asks
           # pkg-config for a module literally named "rkmpp" and then for
           # "rockchip_mpp >= 1.3.8". Only the second name is what the cmake
-          # install ships, so expose both.
-          cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"             "$PREFIX/lib/pkgconfig/rkmpp.pc"
+          # install ships, so expose both. Both probes then compile and link a
+          # test program against mpp_create, which lives in librockchip_mpp.so
+          # but needs the librockchip_vpu HAL library linked in too - the
+          # stock pc file omits that, so add it as Libs.private.
+          for mod in rockchip_mpp rkmpp; do
+            pc="$PREFIX/lib/pkgconfig/$mod.pc"
+            cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc" "$pc"
+            grep -q '^Libs.private' "$pc" || echo 'Libs.private: -L${libdir} -lrockchip_mpp -lrockchip_vpu' >> "$pc"
+          done
           echo "== librockchip_mpp installed =="
           ls "$PREFIX"/lib/librockchip_mpp.so*
           echo "== pkg-config modules available =="
