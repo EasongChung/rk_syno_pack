@@ -42,12 +42,12 @@ static const struct file_operations rga_dumb_fops = {
 	.owner		= THIS_MODULE,
 	.open		= drm_open,
 	.release	= drm_release,
-	.mmap		= drm_gem_mmap,
-	.poll		= drm_poll,
-	.read		= drm_read,
 	.unlocked_ioctl	= drm_ioctl,
 	.compat_ioctl	= drm_compat_ioctl,
+	.poll		= drm_poll,
+	.read		= drm_read,
 	.llseek		= noop_llseek,
+	.mmap		= drm_gem_cma_mmap,
 };
 
 static struct drm_driver rga_dumb_driver = {
@@ -59,12 +59,17 @@ static struct drm_driver rga_dumb_driver = {
 	.major			= 1,
 	.minor			= 0,
 
+	.gem_create_object	= drm_gem_cma_create_object_default_funcs,
 	.dumb_create		= drm_gem_cma_dumb_create,
 	.dumb_map_offset	= drm_gem_dumb_map_offset,
 	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
 	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
+	.gem_prime_get_sg_table	= drm_gem_cma_prime_get_sg_table,
 	.gem_prime_import_sg_table = drm_gem_cma_prime_import_sg_table,
 	.gem_prime_mmap		= drm_gem_prime_mmap,
+	.gem_prime_vmap		= drm_gem_cma_prime_vmap,
+	.gem_prime_vunmap	= drm_gem_cma_prime_vunmap,
+	.gem_free_object_unlocked = drm_gem_cma_free_object,
 };
 
 static int rga_dumb_probe(struct platform_device *pdev)
