@@ -30,6 +30,7 @@
 #include <drm/drm_gem_cma_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_print.h>
+#include <drm/drm_prime.h>
 
 #define DRIVER_NAME	"rga-dumb"
 #define DRIVER_DESC	"CMA dumb buffer device for librga"
@@ -57,8 +58,11 @@ static struct drm_driver rga_dumb_driver = {
 	.minor			= 0,
 
 	.dumb_create		= drm_gem_cma_dumb_create,
-	.dumb_map_offset	= drm_gem_cma_dumb_map_offset,
+	.dumb_map_offset	= drm_gem_dumb_map_offset,
+	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
+	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
 	.gem_prime_import_sg_table = drm_gem_cma_prime_import_sg_table,
+	.gem_prime_mmap		= drm_gem_prime_mmap,
 };
 
 static int rga_dumb_probe(struct platform_device *pdev)
