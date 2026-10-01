@@ -59,8 +59,24 @@ jobs:
             ..
           make -j"$(nproc)"
           make install
+          # Rockchip mpp installs libs and headers but no pkg-config file,
+          # which ffmpeg's configure requires for --enable-rkmpp.
+          mkdir -p "$PREFIX/lib/pkgconfig"
+          printf '%s\n' \
+            'prefix=/opt/rk/usr' \
+            'libdir=${prefix}/lib' \
+            'includedir=${prefix}/include' \
+            '' \
+            'Name: rockchip_mpp' \
+            'Description: Rockchip Media Process Platform' \
+            'Version: 1.0.0' \
+            'Libs: -L${libdir} -lrockchip_mpp' \
+            'Cflags: -I${includedir}/rockchip' \
+            > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
           echo "== librockchip_mpp installed =="
           ls "$PREFIX"/lib/librockchip_mpp.so*
+          echo "== pkg-config file =="
+          cat "$PREFIX"/lib/pkgconfig/rockchip_mpp.pc
 
       - name: Build RKRGA (librga)
         working-directory: ${{ github.workspace }}
@@ -95,8 +111,26 @@ jobs:
             -Dlibrga_demo=false
           ninja -C build
           meson install -C build
+          # meson does install librga.pc; verify it is where ffmpeg looks
+          mkdir -p "$PREFIX/lib/pkgconfig"
+          if [ ! -f "$PREFIX/lib/pkgconfig/librga.pc" ]; then
+            printf '%s\n' \
+              'prefix=/opt/rk/usr' \
+              'libdir=${prefix}/lib' \
+              'includedir=${prefix}/include' \
+              '' \
+              'Name: librga' \
+              'Description: Rockchip Raster 2D Graphic Acceleration Unit' \
+              'Version: 2.1.0' \
+              'Libs: -L${libdir} -lrga' \
+              'Cflags: -I${includedir}' \
+              > "$PREFIX/lib/pkgconfig/librga.pc"
+          fi
           echo "== librga installed =="
           ls "$PREFIX"/lib/librga.so*
+          echo "== pkg-config sees them =="
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion librga
 
       - name: Configure and build FFmpeg with rkmpp
         working-directory: ${{ github.workspace }}
