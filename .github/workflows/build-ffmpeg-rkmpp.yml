@@ -146,7 +146,6 @@ jobs:
             --target-os=linux \
             --cross-prefix=aarch64-linux-gnu- \
             --enable-cross-compile \
-            --pkg-config=aarch64-linux-gnu-pkg-config \
             --prefix="$PREFIX" \
             --enable-shared \
             --disable-static \
@@ -156,7 +155,11 @@ jobs:
             --enable-version3 \
             --enable-rkmpp \
             --enable-rkrga \
-            --enable-neon 2>&1 | tail -25
+            --pkg-config=pkg-config \
+            --pkg-config-flags=--static \
+            --extra-cflags=-I/opt/rk/usr/include -I/opt/rk/usr/include/rockchip \
+            --extra-ldflags=-L/opt/rk/usr/lib \
+            --enable-neon 2>&1 | tail -30
           make -j"$(nproc)"
 
       - name: Install and verify rkmpp decoders
