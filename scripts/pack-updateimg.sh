@@ -441,6 +441,20 @@ patch_kernel_multi_rga()
 	if [ -f "$soc_dtsi" ] && ! grep -q 'rockchip,rga2' "$soc_dtsi"; then
 		die "rk3568.dtsi: rga2 compatible missing"
 	fi
+
+	# librga/mpp allocate video buffers through /dev/dma_heap/cma. The stock
+	# defconfig leaves CONFIG_DMABUF_HEAPS_CMA off, so only /dev/dma_heap/system
+	# exists; userspace then falls back to a DRM allocation path that the
+	# panfrost/RKNPU card cannot serve (ENOSYS) and crashes. CONFIG_DMA_CMA is
+	# already =y in this defconfig, so the dependency is satisfied.
+	if grep -q '^# CONFIG_DMABUF_HEAPS_CMA is not set' "$defconfig"; then
+		perl -0pi -e 's/^# CONFIG_DMABUF_HEAPS_CMA is not set\r?$/CONFIG_DMABUF_HEAPS_CMA=y/gm' "$defconfig"
+		log "enabled CONFIG_DMABUF_HEAPS_CMA (/dev/dma_heap/cma for librga)"
+	fi
+	if grep -q '^CONFIG_DMABUF_HEAPS_CMA=y' "$defconfig"; then
+		log "dma-buf CMA heap already enabled"
+	fi
+	grep -q '^CONFIG_DMABUF_HEAPS_CMA=y' "$defconfig" || die "$defconfig: failed to enable CONFIG_DMABUF_HEAPS_CMA"
 }
 
 prune_stale_kernel_modules()

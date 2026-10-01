@@ -94,8 +94,9 @@ jobs:
           echo -n "green_default_trigger="; fdtget -t s "$DTB" /gpio-leds/green-led linux,default-trigger
           echo -n "npu_reg="; fdtget -t x "$DTB" /npu@fde40000 reg
           echo "== RGA/VPU kernel config (from build .config, authoritative)"
-          grep -E "^CONFIG_ROCKCHIP_MULTI_RGA=|^# CONFIG_VIDEO_ROCKCHIP_RGA is not set" build/out/kernel-7.3/.config
+          grep -E "^CONFIG_ROCKCHIP_MULTI_RGA=|^# CONFIG_VIDEO_ROCKCHIP_RGA is not set|^CONFIG_DMABUF_HEAPS_CMA=" build/out/kernel-7.3/.config
           grep -qE "^CONFIG_ROCKCHIP_MULTI_RGA=y" build/out/kernel-7.3/.config || { echo "ERROR: multi_rga missing from kernel config"; exit 1; }
+          grep -qE "^CONFIG_DMABUF_HEAPS_CMA=y" build/out/kernel-7.3/.config || { echo "ERROR: CMA heap missing - librga needs /dev/dma_heap/cma"; exit 1; }
           echo "== bootargs"
           grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*' \
             output/dsm/boot-root/boot/extlinux/extlinux.conf
