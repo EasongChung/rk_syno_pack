@@ -34,8 +34,8 @@ jobs:
           apt-get update
           apt-get install -y \
             build-essential pkg-config git wget ca-certificates \
-            yasm nasm cmake ninja-build meson \
-            libdrm-dev libudev-dev libsdl2-dev \
+            yasm nasm cmake \
+            libdrm-dev \
             zlib1g-dev
 
           PREFIX=/opt/rk/usr
@@ -58,20 +58,34 @@ jobs:
           make install
           cd /tmp
 
-          # RKRGA
+          # RKRGA - built with cmake, not meson: meson pulls in
+          # python3-setuptools whose postinst segfaults under qemu.
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
           cd rkrga
-          meson setup . build \
-            --prefix="$PREFIX" \
-            --libdir=lib \
-            --buildtype=release \
-            --default-library=shared \
-            -Dcpp_args=-fpermissive \
-            -Dlibdrm=false \
-            -Dlibrga_demo=false
-          ninja -C build
-          meson install -C build
+          mkdir -p build && cd build
+          cmake \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            ..
+          make -j"$(nproc)"
+          make install
           cd /tmp
+          # cmake install may not drop a pkg-config file; ffmpeg needs one.
+          mkdir -p "$PREFIX/lib/pkgconfig"
+          if [ ! -f "$PREFIX/lib/pkgconfig/librga.pc" ]; then
+            printf '%s\n' \
+              "prefix=$PREFIX" \
+              'libdir=${prefix}/lib' \
+              'includedir=${prefix}/include' \
+              '' \
+              'Name: librga' \
+              'Description: Rockchip Raster 2D Graphic Acceleration Unit' \
+              'Version: 2.1.0' \
+              'Libs: -L${libdir} -lrga' \
+              'Cflags: -I${includedir}' \
+              > "$PREFIX/lib/pkgconfig/librga.pc"
+          fi
 
           # ffmpeg itself
           cd ffmpeg
