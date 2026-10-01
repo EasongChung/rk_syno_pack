@@ -1,0 +1,149 @@
+name: Build Jellyfin FFmpeg (RK3566 / rkmpp)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_branch:
+        description: 'nyanmisaka/jellyfin-ffmpeg branch with rockchip support'
+        required: false
+        default: 'next-rockchip'
+      keep_debug:
+        description: 'keep unstripped debug symbols'
+        required: false
+        default: 'no'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install cross toolchain dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config yasm nasm cmake ninja-build meson \
+            git wget xz-utils \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
+
+      - name: Checkout jellyfin-ffmpeg (rockchip branch)
+        run: |
+          git clone -b "${{ github.event.inputs.ffmpeg_branch }}" \
+            --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
+          cd ffmpeg
+          echo "== branch =="
+          git log --oneline -1
+          echo "== rockchip decoders present in configure =="
+          grep -c "rkmpp" configure
+
+      - name: Build RKMPP (librockchip_mpp)
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          mkdir -p "$PREFIX"
+          git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
+          cd mpp
+          mkdir build && cd build
+          cmake \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DBUILD_TEST=OFF \
+            -DHAVE_DRM=ON \
+            ..
+          make -j"$(nproc)"
+          make install
+          echo "== librockchip_mpp installed =="
+          ls "$PREFIX"/lib/librockchip_mpp.so*
+
+      - name: Build RKRGA (librga)
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
+          cd rkrga
+          printf '%s\n' \
+            '[binaries]' \
+            "c = 'aarch64-linux-gnu-gcc'" \
+            "cpp = 'aarch64-linux-gnu-g++'" \
+            "ar = 'aarch64-linux-gnu-ar'" \
+            "strip = 'aarch64-linux-gnu-strip'" \
+            "pkg-config = 'aarch64-linux-gnu-pkg-config'" \
+            '' \
+            '[host_machine]' \
+            "system = 'linux'" \
+            "cpu_family = 'aarch64'" \
+            "cpu = 'aarch64'" \
+            "endian = 'little'" \
+            > cross.txt
+          meson setup . build \
+            --cross-file cross.txt \
+            --prefix="$PREFIX" \
+            --libdir=lib \
+            --buildtype=release \
+            --default-library=shared \
+            -Dcpp_args=-fpermissive \
+            -Dlibdrm=false \
+            -Dlibrga_demo=false
+          ninja -C build
+          meson install -C build
+          echo "== librga installed =="
+          ls "$PREFIX"/lib/librga.so*
+
+      - name: Configure and build FFmpeg with rkmpp
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          cd ffmpeg
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+          ./configure \
+            --arch=aarch64 \
+            --target-os=linux \
+            --cross-prefix=aarch64-linux-gnu- \
+            --enable-cross-compile \
+            --pkg-config=aarch64-linux-gnu-pkg-config \
+            --prefix="$PREFIX" \
+            --enable-shared \
+            --disable-static \
+            --disable-doc \
+            --disable-debug \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-rkmpp \
+            --enable-rkrga \
+            --enable-libdrm \
+            --enable-neon 2>&1 | tail -25
+          make -j"$(nproc)"
+
+      - name: Install and verify rkmpp decoders
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          cd ffmpeg
+          make install
+          echo "== installed ffmpeg =="
+          ls -la "$PREFIX"/bin/ffmpeg
+          echo "== rkmpp decoders compiled in =="
+          strings "$PREFIX"/lib/libavcodec.so* | grep -oE "h264_rkmpp|hevc_rkmpp|vp9_rkmpp|av1_rkmpp" | sort -u | head
+          echo "== hwaccels =="
+          strings "$PREFIX"/lib/libavcodec.so* | grep -oE "^rkmpp$" | head -2
+
+      - name: Package artifact
+        run: |
+          set -eu
+          cd /opt/rk/usr
+          tar -czf /tmp/ffmpeg-rk3566-rkmpp.tar.gz \
+            bin/ffmpeg bin/ffprobe \
+            lib/ \
+            include/
+          ls -la /tmp/ffmpeg-rk3566-rkmpp.tar.gz
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-rk3566-rkmpp
+          path: /tmp/ffmpeg-rk3566-rkmpp.tar.gz
+          if-no-files-found: error
