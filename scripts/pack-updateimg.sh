@@ -457,6 +457,75 @@ patch_kernel_multi_rga()
 	grep -q '^CONFIG_DMABUF_HEAPS_CMA=y' "$defconfig" || die "$defconfig: failed to enable CONFIG_DMABUF_HEAPS_CMA"
 }
 
+# Register a standalone CMA-backed DRM device that only implements the dumb
+# buffer entry points.
+#
+# librga 2.x allocates video buffers with DRM_IOCTL_MODE_CREATE_DUMB. This
+# board has no display-subsystem node, so the rockchip DRM master never
+# probes and the only DRM cards are panfrost and RKNPU, which do not
+# implement that ioctl - librga then segfaults on the NULL result. The
+# driver added here answers the ioctl against the kernel CMA area; it has
+# no crtc/modesetting and is only reached by userspace opening /dev/dri.
+patch_kernel_rga_dumb_driver()
+{
+	local src_dir="$PROJECT_DIR/patches-vpu"
+	local drv_src="$src_dir/rga-dumb-drv.c"
+	local drv_dst_dir="$KERNEL_SRC/drivers/gpu/drm/rockchip"
+	local kconfig="$drv_dst_dir/Kconfig"
+	local makefile="$drv_dst_dir/Makefile"
+	local dtsi="$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3568.dtsi"
+	local defconfig="$KERNEL_SRC/arch/arm64/configs/$KERNEL_DEFCONFIG"
+	local marker="NBU_OEC_RGA_DUMB"
+
+	[ -f "$drv_src" ] || return 0
+
+	if grep -q "$marker" "$makefile" 2>/dev/null; then
+		log "rga dumb DRM driver already wired into the kernel tree"
+	else
+		log "adding CMA dumb-buffer DRM driver for librga"
+		cp -f "$drv_src" "$drv_dst_dir/rga-dumb-drv.c"
+		need_file "$drv_dst_dir/rga-dumb-drv.c" "failed to install rga-dumb-drv.c"
+
+		{
+			echo ""
+			echo "# $marker: CMA dumb buffer device for userspace librga"
+			echo "obj-\$(CONFIG_DRM_OEC_RGA_DUMB) += rga-dumb-drv.o"
+		} >> "$makefile"
+
+		{
+			echo ""
+			echo "# $marker"
+			echo "config DRM_OEC_RGA_DUMB"
+			echo "	tristate \"OEC RK3566 CMA dumb buffer DRM device\""
+			echo "	depends on DRM"
+			echo "	select DRM_GEM_CMA_HELPER"
+			echo "	help"
+			echo "	  Registers a DRM device that only implements the dumb buffer"
+			echo "	  entry points on top of the kernel CMA area. Userspace librga"
+			echo "	  needs DRM_IOCTL_MODE_CREATE_DUMB, which no other DRM device on"
+			echo "	  this board provides. Say M unless you know you need it."
+		} >> "$kconfig"
+
+		grep -q "$marker" "$makefile" || die "$makefile: failed to add rga dumb driver"
+		grep -q "$marker" "$kconfig" || die "$kconfig: failed to add DRM_OEC_RGA_DUMB"
+	fi
+
+	if grep -q '^CONFIG_DRM_OEC_RGA_DUMB=y' "$defconfig"; then
+		log "CONFIG_DRM_OEC_RGA_DUMB already enabled"
+	else
+		printf '\n# %s\nCONFIG_DRM_OEC_RGA_DUMB=y\n' "$marker" >> "$defconfig"
+		grep -q '^CONFIG_DRM_OEC_RGA_DUMB=y' "$defconfig" || die "$defconfig: failed to enable DRM_OEC_RGA_DUMB"
+	fi
+
+	# DTS node the platform driver binds to. No reg/clock/power-domain: the
+	# driver only needs a device to attach the DRM device to.
+	if [ -f "$dtsi" ] && ! grep -q "oec-rga-dumb" "$dtsi"; then
+		perl -0pi -e 's/(\trkvenc_opp_table: rkvenc-opp-table \{)/\toec_rga_dumb: oec-rga-dumb {\n\t\tcompatible = "rockchip,oec-rga-dumb";\n\t\tstatus = "okay";\n\t};\n\n$1/s' "$dtsi"
+		grep -q "oec-rga-dumb" "$dtsi" || die "$dtsi: failed to add oec-rga-dumb node"
+		log "added oec-rga-dumb device node to rk3568.dtsi"
+	fi
+}
+
 prune_stale_kernel_modules()
 {
 	local order="$KERNEL_BUILD/modules.order"
@@ -630,6 +699,7 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 	# generated .config (which editing it always makes true), and that rerun
 	# would drop anything appended after the fact.
 	patch_kernel_multi_rga
+	patch_kernel_rga_dumb_driver
 	configure_kernel_if_needed
 	patch_kernel_disk_led
 	log "building kernel Image and dtb"

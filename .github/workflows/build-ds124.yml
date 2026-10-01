@@ -97,6 +97,9 @@ jobs:
           grep -E "^CONFIG_ROCKCHIP_MULTI_RGA=|^# CONFIG_VIDEO_ROCKCHIP_RGA is not set|^CONFIG_DMABUF_HEAPS_CMA=" build/out/kernel-7.3/.config
           grep -qE "^CONFIG_ROCKCHIP_MULTI_RGA=y" build/out/kernel-7.3/.config || { echo "ERROR: multi_rga missing from kernel config"; exit 1; }
           grep -qE "^CONFIG_DMABUF_HEAPS_CMA=y" build/out/kernel-7.3/.config || { echo "ERROR: CMA heap missing - librga needs /dev/dma_heap/cma"; exit 1; }
+          grep -qE "^CONFIG_DRM_OEC_RGA_DUMB=y" build/out/kernel-7.3/.config || { echo "ERROR: DRM dumb buffer device missing for librga"; exit 1; }
+          echo "== DRM dumb device in DTB"
+          fdtget -t s "$DTB" /oec-rga-dumb compatible
           echo "== bootargs"
           grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*' \
             output/dsm/boot-root/boot/extlinux/extlinux.conf
