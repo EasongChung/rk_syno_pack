@@ -23,8 +23,24 @@ jobs:
             build-essential pkg-config yasm nasm cmake ninja-build meson \
             git wget xz-utils \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross
-          echo "== note: no --enable-libdrm; rkmpp is the hwaccel we need =="
+            libc6-dev-arm64-cross libdrm-dev
+          # Ubuntu has no libdrm-dev:arm64 package, but --enable-libdrm only
+          # needs pkg-config metadata plus headers for the cross compiler.
+          mkdir -p /opt/rk/usr/lib/pkgconfig /opt/rk/usr/include/libdrm /opt/rk/usr/include
+          cp -a /usr/include/libdrm/* /opt/rk/usr/include/libdrm/
+          cp -a /usr/include/drm/* /opt/rk/usr/include/ 2>/dev/null || true
+          printf '%s\n' \
+            'prefix=/opt/rk/usr' \
+            'libdir=${prefix}/lib' \
+            'includedir=${prefix}/include' \
+            '' \
+            'Name: libdrm' \
+            'Description: Userspace interface to Kernel DRM services' \
+            'Version: 2.4.120' \
+            'Libs: -L${libdir} -ldrm' \
+            'Cflags: -I${includedir}' \
+            > /opt/rk/usr/lib/pkgconfig/libdrm.pc
+          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm
 
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
         run: |
@@ -155,6 +171,7 @@ jobs:
             --enable-version3 \
             --enable-rkmpp \
             --enable-rkrga \
+            --enable-libdrm \
             --pkg-config=pkg-config \
             --pkg-config-flags=--static \
             --extra-cflags="-I/opt/rk/usr/include -I/opt/rk/usr/include/rockchip" \
