@@ -114,6 +114,7 @@ jobs:
           INNER
 
           docker run --rm --platform linux/arm64 \
+            -e FFMPEG_BRANCH="$FFMPEG_BRANCH" \
             -v /tmp/build.sh:/build.sh:ro \
             -v /tmp/out:/out \
             arm64v8/ubuntu:24.04 bash /build.sh
