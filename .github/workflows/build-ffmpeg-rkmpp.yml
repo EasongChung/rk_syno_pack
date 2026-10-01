@@ -67,6 +67,8 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
+            -DRGA_SAMPLES_ENABLE=false \
+            -DCMAKE_CXX_FLAGS="-DLINUX=1 -Wno-error" \
             ..
           make -j"$(nproc)"
           make install
