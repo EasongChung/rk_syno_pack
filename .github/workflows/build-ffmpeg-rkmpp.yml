@@ -40,7 +40,10 @@ jobs:
             'Libs: -L${libdir} -ldrm' \
             'Cflags: -I${includedir}' \
             > /opt/rk/usr/lib/pkgconfig/libdrm.pc
-          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm
+          echo "== probe libdrm via pkg-config =="
+          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm || echo "PROBE_FAILED"
+          echo "== ls the pkgconfig dir =="
+          ls -la /opt/rk/usr/lib/pkgconfig/
 
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
         run: |
