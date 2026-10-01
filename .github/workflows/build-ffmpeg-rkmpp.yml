@@ -107,6 +107,11 @@ jobs:
           set -eu
           PREFIX=/opt/rk/usr
           cd ffmpeg
+          echo "== pkg-config sees rockchip_mpp? =="
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp || echo "MISSING"
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --libs --cflags rockchip_mpp || true
+          echo "== the installed pc file =="
+          cat "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --enable-shared \
