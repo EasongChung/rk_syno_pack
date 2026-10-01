@@ -419,10 +419,13 @@ patch_kernel_multi_rga()
 		log "multi_rga driver already enabled in $KERNEL_DEFCONFIG"
 	else
 		log "switching to multi_rga driver (userspace librga needs /dev/rga)"
-		perl -0pi -e 's/\nCONFIG_VIDEO_ROCKCHIP_RGA=y\n/\n# CONFIG_VIDEO_ROCKCHIP_RGA is not set\n/g' "$defconfig"
+		# The defconfig carries this symbol twice; the build warns
+		# "override: reassigning to symbol" and the last occurrence wins,
+		# so every line has to be neutralized, not just the first one.
+		perl -0pi -e 's/^CONFIG_VIDEO_ROCKCHIP_RGA=y$/# CONFIG_VIDEO_ROCKCHIP_RGA is not set/gm' "$defconfig"
 		printf '\n# rk3566-oec-box: multi_rga for userspace librga /dev/rga\nCONFIG_ROCKCHIP_MULTI_RGA=y\nCONFIG_ROCKCHIP_RGA_ASYNC=y\n' >> "$defconfig"
 		grep -q '^CONFIG_ROCKCHIP_MULTI_RGA=y' "$defconfig" || die "$defconfig: failed to enable CONFIG_ROCKCHIP_MULTI_RGA"
-		grep -q '^# CONFIG_VIDEO_ROCKCHIP_RGA is not set' "$defconfig" || die "$defconfig: failed to disable legacy V4L2 RGA"
+		grep -q '^CONFIG_VIDEO_ROCKCHIP_RGA=y' "$defconfig" && die "$defconfig: CONFIG_VIDEO_ROCKCHIP_RGA still enabled"
 	fi
 
 	if grep -q '^# CONFIG_VIDEO_ROCKCHIP_RGA is not set' "$defconfig"; then
