@@ -52,7 +52,7 @@ jobs:
           ls -la mpp/ | head -5
           ls mpp/CMakeLists.txt
           cd mpp
-          mkdir build && cd build
+          mkdir -p build && cd build
           cmake \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_BUILD_TYPE=Release \
