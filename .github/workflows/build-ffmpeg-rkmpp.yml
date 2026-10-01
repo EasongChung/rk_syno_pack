@@ -7,72 +7,47 @@ on:
         description: 'nyanmisaka/jellyfin-ffmpeg branch with rockchip support'
         required: false
         default: 'next-rockchip'
-      keep_debug:
-        description: 'keep unstripped debug symbols'
-        required: false
-        default: 'no'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Install cross toolchain dependencies
+      - name: Set up QEMU and aarch64 base image
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config yasm nasm cmake ninja-build meson \
-            git wget xz-utils binutils \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross libdrm-dev
-          # Ubuntu ships no libdrm-dev:arm64, but ffmpeg's configure does a
-          # real cross link test against -ldrm, so the aarch64 shared objects
-          # have to exist. Pull them from Debian's arm64 archive instead of
-          # synthesizing metadata only.
-          mkdir -p /opt/rk/dl/libdrm && cd /opt/rk/dl/libdrm
-          LIBM_VER=2.4.123-1~bpo12+1
-          wget -q "http://ftp.debian.org/debian/pool/main/libd/libdrm/libdrm-dev_${LIBM_VER}_arm64.deb"
-          wget -q "http://ftp.debian.org/debian/pool/main/libd/libdrm/libdrm2_${LIBM_VER}_arm64.deb"
-          ls -la
-          mkdir -p /opt/rk/dl/x && cd /opt/rk/dl/x
-          for d in /opt/rk/dl/libdrm/*.deb; do
-            ar x "$d" && tar xf data.tar.*
-          done
-          echo "== extracted contents =="
-          find . -name "*.so*" | head -8
-          echo "== copy into the rk prefix =="
-          cp -a usr/lib/aarch64-linux-gnu/*.so* /opt/rk/usr/lib/ 2>/dev/null || true
-          cp -a usr/include/* /opt/rk/usr/include/ 2>/dev/null || true
-          cp -a usr/lib/aarch64-linux-gnu/pkgconfig/*.pc /opt/rk/usr/lib/pkgconfig/ 2>/dev/null || true
-          ls /opt/rk/usr/lib/ | head
-          echo "== probe with the real arm64 library =="
-          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm || echo "PROBE FAILED"
-          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --libs libdrm
+          sudo apt-get install -y qemu-user-static binfmt-support
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes >/dev/null 2>&1 || true
+          docker pull arm64v8/ubuntu:24.04
 
-      - name: Checkout jellyfin-ffmpeg (rockchip branch)
-        run: |
-          git clone -b "${{ github.event.inputs.ffmpeg_branch }}" \
-            --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
-          cd ffmpeg
-          echo "== branch =="
-          git log --oneline -1
-          echo "== rockchip decoders present in configure =="
-          grep -c "rkmpp" configure
-
-      - name: Build RKMPP (librockchip_mpp)
-        working-directory: ${{ github.workspace }}
+      - name: Build ffmpeg natively inside an aarch64 container
+        env:
+          FFMPEG_BRANCH: ${{ github.event.inputs.ffmpeg_branch }}
         run: |
           set -eu
+          # Native aarch64 build: no cross toolchain, no synthesized .pc files,
+          # apt pulls arm64 packages directly. This sidesteps the entire class
+          # of "lib not found using pkg-config" issues that a cross build hits.
+          mkdir -p /tmp/out
+          cat > /tmp/build.sh <<'INNER'
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y \
+            build-essential pkg-config git wget ca-certificates \
+            yasm nasm cmake ninja-build meson \
+            libdrm-dev libudev-dev libsdl2-dev \
+            zlib1g-dev
+
           PREFIX=/opt/rk/usr
-          mkdir -p "$PREFIX"
-          rm -rf mpp
-          git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git mpp
-          mkdir -p mpp/build
-          cd mpp/build
+          cd /tmp
+          git clone -b "$FFMPEG_BRANCH" --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
+          echo "== rockchip decoders present in configure =="
+          grep -c rkmpp ffmpeg/configure
+
+          # RKMPP
+          git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
+          mkdir -p mpp/build && cd mpp/build
           cmake \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=ON \
@@ -81,49 +56,12 @@ jobs:
             ..
           make -j"$(nproc)"
           make install
-          # Rockchip mpp installs libs and headers but no pkg-config file,
-          # which ffmpeg's configure requires for --enable-rkmpp.
-          mkdir -p "$PREFIX/lib/pkgconfig"
-          printf '%s\n' \
-            'prefix=/opt/rk/usr' \
-            'libdir=${prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: rockchip_mpp' \
-            'Description: Rockchip Media Process Platform' \
-            'Version: 1.3.8' \
-            'Libs: -L${libdir} -lrockchip_mpp' \
-            'Cflags: -I${includedir}/rockchip' \
-            > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
-          echo "== librockchip_mpp installed =="
-          ls "$PREFIX"/lib/librockchip_mpp.so*
-          echo "== pkg-config file =="
-          cat "$PREFIX"/lib/pkgconfig/rockchip_mpp.pc
+          cd /tmp
 
-      - name: Build RKRGA (librga)
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -eu
-          PREFIX=/opt/rk/usr
-          rm -rf rkrga
+          # RKRGA
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
           cd rkrga
-          printf '%s\n' \
-            '[binaries]' \
-            "c = 'aarch64-linux-gnu-gcc'" \
-            "cpp = 'aarch64-linux-gnu-g++'" \
-            "ar = 'aarch64-linux-gnu-ar'" \
-            "strip = 'aarch64-linux-gnu-strip'" \
-            "pkg-config = 'aarch64-linux-gnu-pkg-config'" \
-            '' \
-            '[host_machine]' \
-            "system = 'linux'" \
-            "cpu_family = 'aarch64'" \
-            "cpu = 'aarch64'" \
-            "endian = 'little'" \
-            > cross.txt
           meson setup . build \
-            --cross-file cross.txt \
             --prefix="$PREFIX" \
             --libdir=lib \
             --buildtype=release \
@@ -133,41 +71,11 @@ jobs:
             -Dlibrga_demo=false
           ninja -C build
           meson install -C build
-          # meson does install librga.pc; verify it is where ffmpeg looks
-          mkdir -p "$PREFIX/lib/pkgconfig"
-          if [ ! -f "$PREFIX/lib/pkgconfig/librga.pc" ]; then
-            printf '%s\n' \
-              'prefix=/opt/rk/usr' \
-              'libdir=${prefix}/lib' \
-              'includedir=${prefix}/include' \
-              '' \
-              'Name: librga' \
-              'Description: Rockchip Raster 2D Graphic Acceleration Unit' \
-              'Version: 2.1.0' \
-              'Libs: -L${libdir} -lrga' \
-              'Cflags: -I${includedir}' \
-              > "$PREFIX/lib/pkgconfig/librga.pc"
-          fi
-          echo "== librga installed =="
-          ls "$PREFIX"/lib/librga.so*
-          echo "== pkg-config sees them =="
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion librga
+          cd /tmp
 
-      - name: Configure and build FFmpeg with rkmpp
-        working-directory: ${{ github.workspace }}
-        env:
-          PKG_CONFIG_PATH: /opt/rk/usr/lib/pkgconfig
-        run: |
-          set -eu
-          PREFIX=/opt/rk/usr
+          # ffmpeg itself
           cd ffmpeg
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-          ./configure \
-            --arch=aarch64 \
-            --target-os=linux \
-            --cross-prefix=aarch64-linux-gnu- \
-            --enable-cross-compile \
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --enable-shared \
             --disable-static \
@@ -178,40 +86,30 @@ jobs:
             --enable-rkmpp \
             --enable-rkrga \
             --enable-libdrm \
-            --pkg-config=pkg-config \
-            --pkg-config-flags=--static \
-            --extra-cflags="-I/opt/rk/usr/include -I/opt/rk/usr/include/rockchip" \
-            --extra-ldflags="-L/opt/rk/usr/lib" \
-            --enable-neon 2>&1 | tail -30
+            --enable-neon
           make -j"$(nproc)"
-
-      - name: Install and verify rkmpp decoders
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -eu
-          PREFIX=/opt/rk/usr
-          cd ffmpeg
           make install
-          echo "== installed ffmpeg =="
-          ls -la "$PREFIX"/bin/ffmpeg
-          echo "== rkmpp decoders compiled in =="
-          strings "$PREFIX"/lib/libavcodec.so* | grep -oE "h264_rkmpp|hevc_rkmpp|vp9_rkmpp|av1_rkmpp" | sort -u | head
-          echo "== hwaccels =="
-          strings "$PREFIX"/lib/libavcodec.so* | grep -oE "^rkmpp$" | head -2
 
-      - name: Package artifact
-        run: |
-          set -eu
-          cd /opt/rk/usr
-          tar -czf /tmp/ffmpeg-rk3566-rkmpp.tar.gz \
-            bin/ffmpeg bin/ffprobe \
-            lib/ \
-            include/
-          ls -la /tmp/ffmpeg-rk3566-rkmpp.tar.gz
+          echo "== rkmpp decoders in the built libavcodec =="
+          strings "$PREFIX"/lib/libavcodec.so* | grep -oE "h264_rkmpp|hevc_rkmpp|vp9_rkmpp|av1_rkmpp" | sort -u
+          echo "== ffmpeg binary =="
+          "$PREFIX"/bin/ffmpeg -hide_banner -version | head -2
+
+          cd "$PREFIX"
+          tar -czf /tmp/out/ffmpeg-rk3566-rkmpp.tar.gz bin/ffmpeg bin/ffprobe lib/ include/
+          INNER
+
+          docker run --rm --platform linux/arm64 \
+            -v /tmp/build.sh:/build.sh:ro \
+            -v /tmp/out:/out \
+            arm64v8/ubuntu:24.04 bash /build.sh
+
+          echo "== artifact =="
+          ls -la /tmp/out/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-rk3566-rkmpp
-          path: /tmp/ffmpeg-rk3566-rkmpp.tar.gz
+          path: /tmp/out/ffmpeg-rk3566-rkmpp.tar.gz
           if-no-files-found: error
