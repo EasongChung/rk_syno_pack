@@ -35,10 +35,12 @@ jobs:
           grep -c rkmpp configure
 
       - name: Build RKMPP (librockchip_mpp)
+        working-directory: ${{ github.workspace }}
         run: |
           set -eu
           PREFIX=/opt/rk/usr
           mkdir -p "$PREFIX"
+          rm -rf mpp
           git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
           cd mpp
           mkdir build && cd build
@@ -69,9 +71,11 @@ jobs:
           ls "$PREFIX"/lib/librockchip_mpp.so*
 
       - name: Build RKRGA (librga)
+        working-directory: ${{ github.workspace }}
         run: |
           set -eu
           PREFIX=/opt/rk/usr
+          rm -rf rkrga
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
           cd rkrga
           meson setup . build \
@@ -88,6 +92,7 @@ jobs:
           ls "$PREFIX"/lib/librga.so*
 
       - name: Configure and build FFmpeg with rkmpp
+        working-directory: ${{ github.workspace }}
         run: |
           set -eu
           PREFIX=/opt/rk/usr
@@ -107,6 +112,7 @@ jobs:
           make -j"$(nproc)"
 
       - name: Install and verify rkmpp decoders
+        working-directory: ${{ github.workspace }}
         run: |
           set -eu
           PREFIX=/opt/rk/usr
