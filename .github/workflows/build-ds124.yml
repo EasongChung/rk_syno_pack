@@ -93,6 +93,8 @@ jobs:
           echo -n "slot1_sw_activity="; fdtget -t x "$DTB" /internal_slot@1/ahci sw_activity
           echo -n "green_default_trigger="; fdtget -t s "$DTB" /gpio-leds/green-led linux,default-trigger
           echo -n "npu_reg="; fdtget -t x "$DTB" /npu@fde40000 reg
+          echo "== RGA/VPU kernel config"
+          grep -E "^CONFIG_ROCKCHIP_MULTI_RGA=|^# CONFIG_VIDEO_ROCKCHIP_RGA is not set" linux-5.10.x/arch/arm64/configs/rk3566_dsm_defconfig
           echo "== bootargs"
           grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*' \
             output/dsm/boot-root/boot/extlinux/extlinux.conf

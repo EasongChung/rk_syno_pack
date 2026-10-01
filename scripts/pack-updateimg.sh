@@ -399,6 +399,43 @@ NBU_ALT_EOF
 	fi
 }
 
+# Switch the OEC box to Rockchip's multi_rga driver.
+#
+# The old V4L2 RGA driver (CONFIG_VIDEO_ROCKCHIP_RGA) only registers
+# /dev/video0, while current userspace librga (>= 2.x) talks to the
+# multi_rga misc device /dev/rga. Without it librga falls back to DRM and
+# issues DRM_IOCTL_MODE_CREATE_DUMB on the panfrost/RKNPU card, which
+# returns ENOSYS and segfaults the process. Both drivers match
+# compatible "rockchip,rga2", so exactly one of them may be enabled.
+patch_kernel_multi_rga()
+{
+	local defconfig="$KERNEL_SRC/arch/arm64/configs/$KERNEL_DEFCONFIG"
+	local rga_drv="$KERNEL_SRC/drivers/video/rockchip/rga3/rga_drv.c"
+
+	[ -f "$defconfig" ] || return 0
+	[ -f "$rga_drv" ] || return 0
+
+	if grep -q '^CONFIG_ROCKCHIP_MULTI_RGA=y' "$defconfig"; then
+		log "multi_rga driver already enabled in $KERNEL_DEFCONFIG"
+	else
+		log "switching to multi_rga driver (userspace librga needs /dev/rga)"
+		perl -0pi -e 's/\nCONFIG_VIDEO_ROCKCHIP_RGA=y\n/\n# CONFIG_VIDEO_ROCKCHIP_RGA is not set\n/g' "$defconfig"
+		printf '\n# rk3566-oec-box: multi_rga for userspace librga /dev/rga\nCONFIG_ROCKCHIP_MULTI_RGA=y\nCONFIG_ROCKCHIP_RGA_ASYNC=y\n' >> "$defconfig"
+		grep -q '^CONFIG_ROCKCHIP_MULTI_RGA=y' "$defconfig" || die "$defconfig: failed to enable CONFIG_ROCKCHIP_MULTI_RGA"
+		grep -q '^# CONFIG_VIDEO_ROCKCHIP_RGA is not set' "$defconfig" || die "$defconfig: failed to disable legacy V4L2 RGA"
+	fi
+
+	if grep -q '^# CONFIG_VIDEO_ROCKCHIP_RGA is not set' "$defconfig"; then
+		log "legacy V4L2 RGA disabled (conflicts with multi_rga)"
+	fi
+
+	# multi_rga binds compatible "rockchip,rga2"; the SoC dtsi must keep it.
+	local soc_dtsi="$KERNEL_SRC/arch/arm64/boot/dts/rockchip/rk3568.dtsi"
+	if [ -f "$soc_dtsi" ] && ! grep -q 'rockchip,rga2' "$soc_dtsi"; then
+		die "rk3568.dtsi: rga2 compatible missing"
+	fi
+}
+
 prune_stale_kernel_modules()
 {
 	local order="$KERNEL_BUILD/modules.order"
@@ -569,6 +606,7 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 
 	configure_kernel_if_needed
 	patch_kernel_disk_led
+	patch_kernel_multi_rga
 	log "building kernel Image and dtb"
 	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image Image.gz dtbs
 	log "building all kernel modules"
