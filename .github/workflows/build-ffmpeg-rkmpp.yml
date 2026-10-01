@@ -140,7 +140,11 @@ jobs:
             --enable-rkmpp \
             --enable-rkrga \
             --enable-libdrm \
-            --enable-neon
+            --enable-neon || {
+            echo "== configure failed; rkmpp section of config.log =="
+            grep -B3 -A20 "rockchip_mpp" ffbuild/config.log | tail -50
+            exit 1
+          }
           make -j"$(nproc)"
 
       - name: Install and verify rkmpp decoders
