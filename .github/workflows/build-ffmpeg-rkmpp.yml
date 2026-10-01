@@ -10,43 +10,38 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Native arm64 hardware: no qemu emulation. A qemu-emulated build dies in
+    # Rockchip's mpp JPEG encoder HAL (hal_jpege_vepu540c.c exits 139), which
+    # no flag can fix.
+    runs-on: ubuntu-24.04-arm
     steps:
-      - name: Set up QEMU and aarch64 base image
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes >/dev/null 2>&1 || true
-          docker pull --platform linux/arm64 arm64v8/ubuntu:24.04
-
-      - name: Build ffmpeg natively inside an aarch64 container
-        env:
-          FFMPEG_BRANCH: ${{ github.event.inputs.ffmpeg_branch }}
-        run: |
-          set -eu
-          # Native aarch64 build: no cross toolchain, no synthesized .pc files,
-          # apt pulls arm64 packages directly. This sidesteps the entire class
-          # of "lib not found using pkg-config" issues that a cross build hits.
-          mkdir -p /tmp/out
-          cat > /tmp/build.sh <<'INNER'
-          set -eux
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y \
-            build-essential pkg-config git wget ca-certificates \
-            yasm nasm cmake \
-            libdrm-dev \
+          sudo apt-get install -y \
+            build-essential pkg-config yasm nasm cmake ninja-build meson \
+            git wget ca-certificates \
+            libdrm-dev libudev-dev \
             zlib1g-dev
 
-          PREFIX=/opt/rk/usr
-          cd /tmp
-          git clone -b "$FFMPEG_BRANCH" --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
-          echo "== rockchip decoders present in configure =="
-          grep -c rkmpp ffmpeg/configure
+      - name: Checkout jellyfin-ffmpeg (rockchip branch)
+        run: |
+          git clone -b "${{ github.event.inputs.ffmpeg_branch }}" \
+            --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
+          cd ffmpeg
+          echo "== branch =="
+          git log --oneline -1
+          echo "== rkmpp occurrences in configure =="
+          grep -c rkmpp configure
 
-          # RKMPP
+      - name: Build RKMPP (librockchip_mpp)
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          mkdir -p "$PREFIX"
           git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
-          mkdir -p mpp/build && cd mpp/build
+          cd mpp
+          mkdir build && cd build
           cmake \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_BUILD_TYPE=Release \
@@ -56,40 +51,46 @@ jobs:
             ..
           make -j"$(nproc)"
           make install
-          cd /tmp
+          # The mpp cmake build installs no pkg-config file, which
+          # --enable-rkmpp needs; synthesize one.
+          mkdir -p "$PREFIX/lib/pkgconfig"
+          printf '%s\n' \
+            "prefix=$PREFIX" \
+            'libdir=${prefix}/lib' \
+            'includedir=${prefix}/include' \
+            '' \
+            'Name: rockchip_mpp' \
+            'Description: Rockchip Media Process Platform' \
+            'Version: 1.3.8' \
+            'Libs: -L${libdir} -lrockchip_mpp' \
+            'Cflags: -I${includedir}/rockchip' \
+            > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
+          echo "== librockchip_mpp installed =="
+          ls "$PREFIX"/lib/librockchip_mpp.so*
 
-          # RKRGA - built with cmake, not meson: meson pulls in
-          # python3-setuptools whose postinst segfaults under qemu.
+      - name: Build RKRGA (librga)
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
           cd rkrga
-          mkdir -p build && cd build
-          cmake \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
-            -DRGA_SAMPLES_ENABLE=false \
-            -DCMAKE_CXX_FLAGS="-DLINUX=1 -Wno-error" \
-            ..
-          make -j"$(nproc)"
-          make install
-          cd /tmp
-          # cmake install may not drop a pkg-config file; ffmpeg needs one.
-          mkdir -p "$PREFIX/lib/pkgconfig"
-          if [ ! -f "$PREFIX/lib/pkgconfig/librga.pc" ]; then
-            printf '%s\n' \
-              "prefix=$PREFIX" \
-              'libdir=${prefix}/lib' \
-              'includedir=${prefix}/include' \
-              '' \
-              'Name: librga' \
-              'Description: Rockchip Raster 2D Graphic Acceleration Unit' \
-              'Version: 2.1.0' \
-              'Libs: -L${libdir} -lrga' \
-              'Cflags: -I${includedir}' \
-              > "$PREFIX/lib/pkgconfig/librga.pc"
-          fi
+          meson setup . build \
+            --prefix="$PREFIX" \
+            --libdir=lib \
+            --buildtype=release \
+            --default-library=shared \
+            -Dcpp_args=-fpermissive \
+            -Dlibdrm=false \
+            -Dlibrga_demo=false
+          ninja -C build
+          meson install -C build
+          echo "== librga installed =="
+          ls "$PREFIX"/lib/librga.so*
 
-          # ffmpeg itself
+      - name: Configure and build FFmpeg with rkmpp
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
           cd ffmpeg
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
@@ -104,29 +105,33 @@ jobs:
             --enable-libdrm \
             --enable-neon
           make -j"$(nproc)"
-          make install
 
-          echo "== rkmpp decoders in the built libavcodec =="
+      - name: Install and verify rkmpp decoders
+        run: |
+          set -eu
+          PREFIX=/opt/rk/usr
+          cd ffmpeg
+          make install
+          echo "== installed ffmpeg =="
+          ls -la "$PREFIX"/bin/ffmpeg
+          echo "== rkmpp decoders compiled in =="
           strings "$PREFIX"/lib/libavcodec.so* | grep -oE "h264_rkmpp|hevc_rkmpp|vp9_rkmpp|av1_rkmpp" | sort -u
-          echo "== ffmpeg binary =="
+          echo "== version =="
           "$PREFIX"/bin/ffmpeg -hide_banner -version | head -2
 
-          cd "$PREFIX"
-          tar -czf /tmp/out/ffmpeg-rk3566-rkmpp.tar.gz bin/ffmpeg bin/ffprobe lib/ include/
-          INNER
-
-          docker run --rm --platform linux/arm64 \
-            -e FFMPEG_BRANCH="$FFMPEG_BRANCH" \
-            -v /tmp/build.sh:/build.sh:ro \
-            -v /tmp/out:/out \
-            arm64v8/ubuntu:24.04 bash /build.sh
-
-          echo "== artifact =="
-          ls -la /tmp/out/
+      - name: Package artifact
+        run: |
+          set -eu
+          cd /opt/rk/usr
+          tar -czf /tmp/ffmpeg-rk3566-rkmpp.tar.gz \
+            bin/ffmpeg bin/ffprobe \
+            lib/ \
+            include/
+          ls -la /tmp/ffmpeg-rk3566-rkmpp.tar.gz
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-rk3566-rkmpp
-          path: /tmp/out/ffmpeg-rk3566-rkmpp.tar.gz
+          path: /tmp/ffmpeg-rk3566-rkmpp.tar.gz
           if-no-files-found: error
