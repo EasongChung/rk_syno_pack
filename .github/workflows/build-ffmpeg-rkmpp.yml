@@ -23,11 +23,8 @@ jobs:
             build-essential pkg-config yasm nasm cmake ninja-build meson \
             git wget xz-utils \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            libc6-dev-arm64-cross \
-            libdrm-dev:arm64 libdrm-dev
-          echo "== arm64 libdrm visible to cross pkg-config =="
-          aarch64-linux-gnu-pkg-config --modversion libdrm || echo "(checking multiarch paths)"
-          ls /usr/lib/aarch64-linux-gnu/pkgconfig/ | grep -i drm || echo "(no arm64 pkgconfig dir)"
+            libc6-dev-arm64-cross
+          echo "== note: no --enable-libdrm; rkmpp is the hwaccel we need =="
 
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
         run: |
@@ -41,8 +38,6 @@ jobs:
 
       - name: Build RKMPP (librockchip_mpp)
         working-directory: ${{ github.workspace }}
-        env:
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: |
           set -eu
           PREFIX=/opt/rk/usr
@@ -106,7 +101,7 @@ jobs:
       - name: Configure and build FFmpeg with rkmpp
         working-directory: ${{ github.workspace }}
         env:
-          PKG_CONFIG_PATH: /opt/rk/usr/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_PATH: /opt/rk/usr/lib/pkgconfig
         run: |
           set -eu
           PREFIX=/opt/rk/usr
@@ -127,7 +122,6 @@ jobs:
             --enable-version3 \
             --enable-rkmpp \
             --enable-rkrga \
-            --enable-libdrm \
             --enable-neon 2>&1 | tail -25
           make -j"$(nproc)"
 
