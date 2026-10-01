@@ -142,7 +142,7 @@ jobs:
             --enable-libdrm \
             --enable-neon || {
             echo "== configure failed; rkmpp section of config.log =="
-            grep -B3 -A20 "rockchip_mpp" ffbuild/config.log | tail -50
+            grep -A40 "test_ld cc" ffbuild/config.log | head -60
             exit 1
           }
           make -j"$(nproc)"
