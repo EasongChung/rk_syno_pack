@@ -76,8 +76,16 @@ jobs:
             'Libs: -L${libdir} -lrockchip_mpp' \
             'Cflags: -I${includedir}/rockchip' \
             > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
+          # ffmpeg's configure has two probes for this library: it first asks
+          # pkg-config for a module literally named "rkmpp" and then for
+          # "rockchip_mpp >= 1.3.8". Only the second name is what the cmake
+          # install ships, so expose both.
+          cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"             "$PREFIX/lib/pkgconfig/rkmpp.pc"
           echo "== librockchip_mpp installed =="
           ls "$PREFIX"/lib/librockchip_mpp.so*
+          echo "== pkg-config modules available =="
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rkmpp
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp
 
       - name: Build RKRGA (librga)
         working-directory: /tmp/build
