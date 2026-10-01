@@ -30,6 +30,13 @@ jobs:
             libdrm-dev libudev-dev \
             zlib1g-dev
 
+      - name: Prepare system prefix
+        run: |
+          echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/usrlocal.conf
+          sudo ldconfig
+          echo "== pkg-config default search path =="
+          pkg-config --variable pc_path pkg-config
+
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
         working-directory: /tmp/build
         run: |
@@ -45,7 +52,7 @@ jobs:
         working-directory: /tmp/build
         run: |
           set -eu
-          PREFIX=/opt/rk/usr
+          PREFIX=/usr/local
           mkdir -p "$PREFIX"
           rm -rf mpp
           git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
@@ -76,14 +83,10 @@ jobs:
             'Libs: -L${libdir} -lrockchip_mpp' \
             'Cflags: -I${includedir}/rockchip' \
             > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
-          # ffmpeg's configure has two probes for this library: it first asks
-          # pkg-config for a module literally named "rkmpp" and then for
-          # "rockchip_mpp >= 1.3.8". Only the second name is what the cmake
-          # install ships, so expose both. Both probes then compile and link a
-          # test program against mpp_create, which lives in librockchip_mpp.so
-          # but needs the librockchip_vpu HAL library linked in too - the
-          # stock pc file omits that, so add it as Libs.private.
-          # the cmake install already ships rockchip_mpp.pc and rockchip_vpu.pc
+          # ffmpeg probes this library twice: once for a module named exactly
+          # "rkmpp", then for "rockchip_mpp >= 1.3.8". The cmake install only
+          # ships rockchip_mpp.pc, so create the rkmpp alias, and add
+          # librockchip_vpu to the link line (mpp_create's own object needs it).
           if [ ! -e "$PREFIX/lib/pkgconfig/rkmpp.pc" ]; then
             cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc" "$PREFIX/lib/pkgconfig/rkmpp.pc"
           fi
@@ -93,14 +96,14 @@ jobs:
           echo "== librockchip_mpp installed =="
           ls "$PREFIX"/lib/librockchip_mpp.so*
           echo "== pkg-config modules available =="
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rkmpp
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp
+          pkg-config --modversion rkmpp
+          pkg-config --modversion rockchip_mpp
 
       - name: Build RKRGA (librga)
         working-directory: /tmp/build
         run: |
           set -eu
-          PREFIX=/opt/rk/usr
+          PREFIX=/usr/local
           rm -rf rkrga
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
           ls rkrga/meson.build
@@ -122,14 +125,14 @@ jobs:
         working-directory: /tmp/build
         run: |
           set -eu
-          PREFIX=/opt/rk/usr
+          PREFIX=/usr/local
           cd ffmpeg
           echo "== pkg-config sees rockchip_mpp? =="
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --modversion rockchip_mpp || echo "MISSING"
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" pkg-config --libs --cflags rockchip_mpp || true
+          pkg-config --modversion rockchip_mpp || echo "MISSING"
+          pkg-config --libs --cflags rockchip_mpp || true
           echo "== the installed pc file =="
           cat "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
-          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
+          ./configure \
             --prefix="$PREFIX" \
             --enable-shared \
             --disable-static \
@@ -151,7 +154,7 @@ jobs:
         working-directory: /tmp/build
         run: |
           set -eu
-          PREFIX=/opt/rk/usr
+          PREFIX=/usr/local
           cd ffmpeg
           make install
           echo "== installed ffmpeg =="
@@ -164,7 +167,7 @@ jobs:
       - name: Package artifact
         run: |
           set -eu
-          cd /opt/rk/usr
+          cd /usr/local
           tar -czf /tmp/ffmpeg-rk3566-rkmpp.tar.gz \
             bin/ffmpeg bin/ffprobe \
             lib/ \
