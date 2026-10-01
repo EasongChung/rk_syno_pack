@@ -15,6 +15,12 @@ jobs:
     # no flag can fix.
     runs-on: ubuntu-24.04-arm
     steps:
+      - name: Setup build directory
+        run: |
+          sudo mkdir -p /tmp/build
+          sudo chown "$USER":"$USER" /tmp/build
+          echo "workdir ready"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -25,6 +31,7 @@ jobs:
             zlib1g-dev
 
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
+        working-directory: /tmp/build
         run: |
           git clone -b "${{ github.event.inputs.ffmpeg_branch }}" \
             --depth 1 https://github.com/nyanmisaka/jellyfin-ffmpeg.git ffmpeg
@@ -35,13 +42,15 @@ jobs:
           grep -c rkmpp configure
 
       - name: Build RKMPP (librockchip_mpp)
-        working-directory: ${{ github.workspace }}
+        working-directory: /tmp/build
         run: |
           set -eu
           PREFIX=/opt/rk/usr
           mkdir -p "$PREFIX"
           rm -rf mpp
           git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git
+          ls -la mpp/ | head -5
+          ls mpp/CMakeLists.txt
           cd mpp
           mkdir build && cd build
           cmake \
@@ -71,12 +80,13 @@ jobs:
           ls "$PREFIX"/lib/librockchip_mpp.so*
 
       - name: Build RKRGA (librga)
-        working-directory: ${{ github.workspace }}
+        working-directory: /tmp/build
         run: |
           set -eu
           PREFIX=/opt/rk/usr
           rm -rf rkrga
           git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
+          ls rkrga/meson.build
           cd rkrga
           meson setup . build \
             --prefix="$PREFIX" \
@@ -92,7 +102,7 @@ jobs:
           ls "$PREFIX"/lib/librga.so*
 
       - name: Configure and build FFmpeg with rkmpp
-        working-directory: ${{ github.workspace }}
+        working-directory: /tmp/build
         run: |
           set -eu
           PREFIX=/opt/rk/usr
@@ -112,7 +122,7 @@ jobs:
           make -j"$(nproc)"
 
       - name: Install and verify rkmpp decoders
-        working-directory: ${{ github.workspace }}
+        working-directory: /tmp/build
         run: |
           set -eu
           PREFIX=/opt/rk/usr
