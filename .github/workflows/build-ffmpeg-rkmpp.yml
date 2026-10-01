@@ -21,29 +21,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential pkg-config yasm nasm cmake ninja-build meson \
-            git wget xz-utils \
+            git wget xz-utils binutils \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             libc6-dev-arm64-cross libdrm-dev
-          # Ubuntu has no libdrm-dev:arm64 package, but --enable-libdrm only
-          # needs pkg-config metadata plus headers for the cross compiler.
-          mkdir -p /opt/rk/usr/lib/pkgconfig /opt/rk/usr/include/libdrm /opt/rk/usr/include
-          cp -a /usr/include/libdrm/* /opt/rk/usr/include/libdrm/
-          cp -a /usr/include/drm/* /opt/rk/usr/include/ 2>/dev/null || true
-          printf '%s\n' \
-            'prefix=/opt/rk/usr' \
-            'libdir=${prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: libdrm' \
-            'Description: Userspace interface to Kernel DRM services' \
-            'Version: 2.4.120' \
-            'Libs: -L${libdir} -ldrm' \
-            'Cflags: -I${includedir}' \
-            > /opt/rk/usr/lib/pkgconfig/libdrm.pc
-          echo "== probe libdrm via pkg-config =="
-          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm || echo "PROBE_FAILED"
-          echo "== ls the pkgconfig dir =="
-          ls -la /opt/rk/usr/lib/pkgconfig/
+          # Ubuntu ships no libdrm-dev:arm64, but ffmpeg's configure does a
+          # real cross link test against -ldrm, so the aarch64 shared objects
+          # have to exist. Pull them from Debian's arm64 archive instead of
+          # synthesizing metadata only.
+          mkdir -p /opt/rk/dl/libdrm && cd /opt/rk/dl/libdrm
+          LIBM_VER=2.4.123-1~bpo12+1
+          wget -q "http://ftp.debian.org/debian/pool/main/libd/libdrm/libdrm-dev_${LIBM_VER}_arm64.deb"
+          wget -q "http://ftp.debian.org/debian/pool/main/libd/libdrm/libdrm2_${LIBM_VER}_arm64.deb"
+          ls -la
+          mkdir -p /opt/rk/dl/x && cd /opt/rk/dl/x
+          for d in /opt/rk/dl/libdrm/*.deb; do
+            ar x "$d" && tar xf data.tar.*
+          done
+          echo "== extracted contents =="
+          find . -name "*.so*" | head -8
+          echo "== copy into the rk prefix =="
+          cp -a usr/lib/aarch64-linux-gnu/*.so* /opt/rk/usr/lib/ 2>/dev/null || true
+          cp -a usr/include/* /opt/rk/usr/include/ 2>/dev/null || true
+          cp -a usr/lib/aarch64-linux-gnu/pkgconfig/*.pc /opt/rk/usr/lib/pkgconfig/ 2>/dev/null || true
+          ls /opt/rk/usr/lib/ | head
+          echo "== probe with the real arm64 library =="
+          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --modversion libdrm || echo "PROBE FAILED"
+          PKG_CONFIG_PATH=/opt/rk/usr/lib/pkgconfig pkg-config --libs libdrm
 
       - name: Checkout jellyfin-ffmpeg (rockchip branch)
         run: |
