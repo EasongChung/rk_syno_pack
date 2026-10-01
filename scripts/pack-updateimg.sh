@@ -422,10 +422,14 @@ patch_kernel_multi_rga()
 		# The defconfig carries this symbol twice; the build warns
 		# "override: reassigning to symbol" and the last occurrence wins,
 		# so every line has to be neutralized, not just the first one.
-		perl -0pi -e 's/^CONFIG_VIDEO_ROCKCHIP_RGA=y$/# CONFIG_VIDEO_ROCKCHIP_RGA is not set/gm' "$defconfig"
+		# Tolerate CRLF: match the optional \r before end-of-line so the
+		# replacement works on a Windows-checkout kernel tree too.
+		perl -0pi -e 's/^CONFIG_VIDEO_ROCKCHIP_RGA=y\r?$/# CONFIG_VIDEO_ROCKCHIP_RGA is not set/gm' "$defconfig"
 		printf '\n# rk3566-oec-box: multi_rga for userspace librga /dev/rga\nCONFIG_ROCKCHIP_MULTI_RGA=y\nCONFIG_ROCKCHIP_RGA_ASYNC=y\n' >> "$defconfig"
 		grep -q '^CONFIG_ROCKCHIP_MULTI_RGA=y' "$defconfig" || die "$defconfig: failed to enable CONFIG_ROCKCHIP_MULTI_RGA"
-		grep -q '^CONFIG_VIDEO_ROCKCHIP_RGA=y' "$defconfig" && die "$defconfig: CONFIG_VIDEO_ROCKCHIP_RGA still enabled"
+		if grep -qE '^CONFIG_VIDEO_ROCKCHIP_RGA=y\r?$' "$defconfig"; then
+			die "$defconfig: CONFIG_VIDEO_ROCKCHIP_RGA still enabled"
+		fi
 	fi
 
 	if grep -q '^# CONFIG_VIDEO_ROCKCHIP_RGA is not set' "$defconfig"; then
@@ -607,9 +611,13 @@ if [ "$PACK_ONLY" -eq 0 ]; then
 
 	ensure_cross_compile
 
+	# Config patches must run BEFORE configure_kernel_if_needed: that helper
+	# reruns "make <defconfig>" whenever the defconfig file is newer than the
+	# generated .config (which editing it always makes true), and that rerun
+	# would drop anything appended after the fact.
+	patch_kernel_multi_rga
 	configure_kernel_if_needed
 	patch_kernel_disk_led
-	patch_kernel_multi_rga
 	log "building kernel Image and dtb"
 	make -C "$KERNEL_SRC" O="$KERNEL_BUILD" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" -j"$JOBS" Image Image.gz dtbs
 	log "building all kernel modules"
