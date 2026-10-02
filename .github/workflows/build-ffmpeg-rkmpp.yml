@@ -87,11 +87,11 @@ jobs:
           # "rkmpp", then for "rockchip_mpp >= 1.3.8". The cmake install only
           # ships rockchip_mpp.pc, so create the rkmpp alias, and add
           # librockchip_vpu to the link line (mpp_create's own object needs it).
-          if [ ! -e "$PREFIX/lib/pkgconfig/rkmpp.pc" ]; then
-            cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc" "$PREFIX/lib/pkgconfig/rkmpp.pc"
+          if sudo test ! -e "$PREFIX/lib/pkgconfig/rkmpp.pc"; then
+            sudo cp -f "$PREFIX/lib/pkgconfig/rockchip_mpp.pc" "$PREFIX/lib/pkgconfig/rkmpp.pc"
           fi
           for pc in "$PREFIX/lib/pkgconfig/rockchip_mpp.pc" "$PREFIX/lib/pkgconfig/rkmpp.pc"; do
-            grep -q '^Libs.private' "$pc" || echo 'Libs.private: -L${libdir} -lrockchip_mpp -lrockchip_vpu' >> "$pc"
+            sudo grep -q '^Libs.private' "$pc" || echo 'Libs.private: -L${libdir} -lrockchip_mpp -lrockchip_vpu' | sudo tee -a "$pc" >/dev/null
           done
           echo "== librockchip_mpp installed =="
           ls "$PREFIX"/lib/librockchip_mpp.so*
