@@ -69,20 +69,6 @@ jobs:
             ..
           make -j"$(nproc)"
           sudo make install
-          # The mpp cmake build installs no pkg-config file, which
-          # --enable-rkmpp needs; synthesize one.
-          mkdir -p "$PREFIX/lib/pkgconfig"
-          printf '%s\n' \
-            "prefix=$PREFIX" \
-            'libdir=${prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: rockchip_mpp' \
-            'Description: Rockchip Media Process Platform' \
-            'Version: 1.3.8' \
-            'Libs: -L${libdir} -lrockchip_mpp' \
-            'Cflags: -I${includedir}/rockchip' \
-            > "$PREFIX/lib/pkgconfig/rockchip_mpp.pc"
           # ffmpeg probes this library twice: once for a module named exactly
           # "rkmpp", then for "rockchip_mpp >= 1.3.8". The cmake install only
           # ships rockchip_mpp.pc, so create the rkmpp alias, and add
