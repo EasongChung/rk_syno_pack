@@ -34,7 +34,7 @@
 #include <drm/drm_print.h>
 #include <drm/drm_prime.h>
 
-#define DRIVER_NAME	"rga-dumb"
+#define DRIVER_NAME	"rkrga-dumb"
 #define DRIVER_DESC	"CMA dumb buffer device for librga"
 #define DRIVER_DATE	"20261001"
 
