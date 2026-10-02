@@ -51,7 +51,7 @@ static const struct file_operations rga_dumb_fops = {
 };
 
 static struct drm_driver rga_dumb_driver = {
-	.driver_features	= DRIVER_GEM | DRIVER_RENDER,
+	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_RENDER,
 	.fops			= &rga_dumb_fops,
 	.name			= DRIVER_NAME,
 	.desc			= DRIVER_DESC,
