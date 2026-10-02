@@ -68,7 +68,7 @@ jobs:
             -DHAVE_DRM=ON \
             ..
           make -j"$(nproc)"
-          make install
+          sudo make install
           # The mpp cmake build installs no pkg-config file, which
           # --enable-rkmpp needs; synthesize one.
           mkdir -p "$PREFIX/lib/pkgconfig"
@@ -117,7 +117,7 @@ jobs:
             -Dlibdrm=false \
             -Dlibrga_demo=false
           ninja -C build
-          meson install -C build
+          sudo meson install -C build
           echo "== librga installed =="
           ls "$PREFIX"/lib/librga.so*
 
@@ -156,7 +156,8 @@ jobs:
           set -eu
           PREFIX=/usr/local
           cd ffmpeg
-          make install
+          sudo make install
+          sudo ldconfig
           echo "== installed ffmpeg =="
           ls -la "$PREFIX"/bin/ffmpeg
           echo "== rkmpp decoders compiled in =="
