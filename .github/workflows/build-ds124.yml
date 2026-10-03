@@ -42,6 +42,16 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Brick-flag guard (fail fast before wasting a build)
+        run: |
+          if grep -n "DRIVER_MODESET" patches-vpu/rga-dumb-drv.c; then
+            echo "ERROR: DRIVER_MODESET in rga-dumb-drv.c hard-bricks the box at boot."
+            echo "Incidents: 2026-10-02 boot-ms.img and 2026-10-03 CI build (docs/08 §三.13)."
+            echo "DRM_CAP_DUMB_BUFFER reporting is permanently dropped - userspace must use dma_heap."
+            exit 1
+          fi
+          echo "OK: rga-dumb-drv.c carries no DRIVER_MODESET"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
