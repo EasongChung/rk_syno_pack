@@ -1,0 +1,84 @@
+name: DRM cap tester (arm64 static)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Build static DRM probe tester
+        run: |
+          set -eu
+          mkdir -p /tmp/out
+          cat > /tmp/t.c <<'EOF'
+          #include <stdio.h>
+          #include <fcntl.h>
+          #include <unistd.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+
+          struct drm_version {
+            int version_major, version_minor, version_patchlevel;
+            uint64_t name_len; char *name;
+            uint64_t date_len; char *date;
+            uint64_t desc_len; char *desc;
+          };
+          struct drm_get_cap { uint64_t capability; uint64_t value; };
+          struct drm_mode_create_dumb {
+            uint32_t height, width, bpp, flags;
+            uint32_t handle, pitch; uint64_t size;
+          };
+          struct drm_mode_destroy_dumb { uint32_t handle; };
+
+          #define DRM_IOCTL_VERSION   _IOWR('d', 0x00, struct drm_version)
+          #define DRM_IOCTL_GET_CAP   _IOWR('d', 0x09, struct drm_get_cap)
+          #define DRM_IOCTL_MODE_CREATE_DUMB _IOWR('d', 0xc2, struct drm_mode_create_dumb)
+          #define DRM_IOCTL_MODE_DESTROY_DUMB _IOWR('d', 0xc4, struct drm_mode_destroy_dumb)
+
+          int main(void) {
+            for (int n = 0; n < 4; n++) {
+              char p[64];
+              snprintf(p, sizeof p, "/dev/dri/card%d", n);
+              int fd = open(p, O_RDWR);
+              if (fd < 0) { printf("%s: open failed\n", p); continue; }
+
+              struct drm_version v; memset(&v, 0, sizeof v);
+              char name[128] = {0};
+              v.name = name; v.name_len = sizeof name - 1;
+              int rv = ioctl(fd, DRM_IOCTL_VERSION, &v);
+              printf("%s: ioctl(VERSION)=%d driver=%s\n", p, rv, name);
+
+              struct drm_get_cap c; memset(&c, 0, sizeof c);
+              c.capability = 0x5; /* DRM_CAP_DUMB_BUFFER */
+              int rc = ioctl(fd, DRM_IOCTL_GET_CAP, &c);
+              printf("  GET_CAP(DUMB) rc=%d value=%llu\n", rc, (unsigned long long)c.value);
+
+              struct drm_mode_create_dumb cb; memset(&cb, 0, sizeof cb);
+              cb.width = 320; cb.height = 240; cb.bpp = 32;
+              int r2 = ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &cb);
+              printf("  CREATE_DUMB rc=%d handle=%u pitch=%u size=%llu\n",
+                     r2, cb.handle, cb.pitch, (unsigned long long)cb.size);
+              if (r2 == 0) {
+                struct drm_mode_destroy_dumb d = { .handle = cb.handle };
+                ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);
+                printf("  (destroyed)\n");
+              }
+              close(fd);
+            }
+            return 0;
+          }
+          EOF
+          # strip the 10-space YAML indent from every line of the heredoc copy
+          sed 's/^          //' /tmp/t.c > /tmp/t2.c
+          gcc -static -O2 -o /tmp/out/drmcap /tmp/t2.c
+          ls -la /tmp/out/drmcap
+          file /tmp/out/drmcap
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: drmcap
+          path: /tmp/out/drmcap
+          if-no-files-found: error
