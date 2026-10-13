@@ -153,6 +153,119 @@ EOF
 	chmod 0755 "$linuxrc"
 }
 
+install_cpufreq_dvfs_hook()
+{
+	root="$1"
+	soc="${2:-${SOC:-}}"
+	linuxrc="$root/linuxrc.syno.impl"
+	hook_script="$root/usr/syno/sbin/rk3566_cpufreq_dvfs.sh"
+	rcd_script="$root/usr/syno/sbin/rk3566_cpufreq_rcd.sh"
+	hook='/bin/sh /usr/syno/sbin/rk3566_cpufreq_dvfs.sh "$Mnt"'
+
+	# OEC (RK3566/DS124) CPU dynamic frequency, verified on hardware 2026-10-13.
+	#
+	# 1800 MHz is a bad bin on this board: >=2 cores under load at 1800 MHz
+	# hard-hangs the box (reproduced with 12V2A and 12V5A supplies, no thermal
+	# involvement: peak 56C vs 75C trip). 1608 MHz is stable with 4 cores and
+	# gives ~2x the stock 816 MHz. schedutil + cap 1608 verified: idle drops to
+	# 600-1416, 4-core load pins 1608, 0 Oops.
+	#
+	# The initrd hook runs from linuxrc.syno.impl right after the existing
+	# model.dtb sync hook, i.e. once the real rootfs is mounted at $Mnt. It
+	# applies the governor for this boot AND lands an rc.d script into the real
+	# rootfs so the setting survives DSM upgrade/reinstall (which never touch
+	# the eMMC boot partition this initrd lives in).
+	case "$soc" in
+		rk3566) ;;
+		*) return 0 ;;
+	esac
+
+	need_file "$linuxrc"
+	mkdir -p "$(dirname "$hook_script")"
+
+	cat >"$rcd_script" <<'EOF'
+#!/bin/sh
+# Z99zz_cpugovernor.sh - landed by the uInitrd hook; re-applied every boot.
+# 1800 MHz is a bad bin on this board; 1608 MHz is the verified stable cap.
+POL=/sys/devices/system/cpu/cpufreq/policy0
+LOG=/volume1/npulib/cpugovernor.log
+CAP=1608000
+GOV=schedutil
+apply() {
+	[ -d "$POL" ] || return 1
+	echo "$CAP" > "$POL/scaling_max_freq" 2>/dev/null
+	[ "$(cat $POL/scaling_governor 2>/dev/null)" = "$GOV" ] || \
+		echo "$GOV" > "$POL/scaling_governor" 2>/dev/null
+	echo "$(date '+%F %T') applied gov=$(cat $POL/scaling_governor 2>/dev/null) max=$(cat $POL/scaling_max_freq 2>/dev/null)" >> "$LOG" 2>/dev/null
+}
+apply
+(
+	i=0
+	while [ $i -lt 8 ]; do
+		sleep 10
+		apply
+		i=$((i+1))
+	done
+) >/dev/null 2>&1 &
+exit 0
+EOF
+	chmod 0755 "$rcd_script"
+
+	cat >"$hook_script" <<'EOF'
+#!/bin/sh
+# OEC (RK3566/DS124) CPU dynamic frequency - uInitrd hook.
+# Called from linuxrc.syno.impl when the real rootfs is mounted at $1.
+# 1800 MHz is a bad bin on this board; 1608 MHz is the verified stable cap.
+LOG=/tmp/rk3566_cpufreq_dvfs.log
+POL=/sys/devices/system/cpu/cpufreq/policy0
+CAP=1608000
+GOV=schedutil
+ROOT="${1:-/tmpRoot}"
+{
+	echo "=== $(date) start root=$ROOT ==="
+	if [ -d "$ROOT/usr/local/etc/rc.d" ]; then
+		cp -f /usr/syno/sbin/rk3566_cpufreq_rcd.sh \
+			"$ROOT/usr/local/etc/rc.d/Z99zz_cpugovernor.sh" 2>/dev/null \
+			&& chmod 0755 "$ROOT/usr/local/etc/rc.d/Z99zz_cpugovernor.sh" \
+			&& echo "landed rc.d into rootfs"
+	else
+		echo "WARN: $ROOT/usr/local/etc/rc.d missing, skipped landing"
+	fi
+	if [ -d "$POL" ]; then
+		echo "$CAP" > "$POL/scaling_max_freq" 2>/dev/null
+		echo "$GOV" > "$POL/scaling_governor" 2>/dev/null
+		echo "applied gov=$(cat $POL/scaling_governor 2>/dev/null) max=$(cat $POL/scaling_max_freq 2>/dev/null)"
+	else
+		echo "SKIP apply: cpufreq not registered yet"
+	fi
+} >>"$LOG" 2>&1
+exit 0
+EOF
+	chmod 0755 "$hook_script"
+
+	if grep -Fq "$hook" "$linuxrc"; then
+		log "cpufreq dvfs hook already installed"
+		return 0
+	fi
+
+	log "installing cpufreq dvfs hook"
+	awk -v hook="$hook" '
+		!done && $0 == "/bin/sh /usr/syno/sbin/rk3399_sync_model_dtb.sh \"$Mnt\"" {
+			print
+			print hook
+			done = 1
+			next
+		}
+		{ print }
+		END {
+			if (!done)
+				exit 1
+		}
+	' "$linuxrc" >"$linuxrc.rk3566"
+	mv -f "$linuxrc.rk3566" "$linuxrc"
+	chmod 0755 "$linuxrc"
+}
+
 fix_webman_reboot()
 {
 	root="$1"
@@ -190,6 +303,7 @@ main()
 			;;
 	esac
 	install_model_sync_hook "$root"
+	install_cpufreq_dvfs_hook "$root" "$soc"
 	fix_webman_reboot "$root"
 }
 

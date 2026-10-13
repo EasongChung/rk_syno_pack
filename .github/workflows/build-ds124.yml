@@ -111,8 +111,25 @@ jobs:
           echo "== DRM dumb device in DTB"
           fdtget -t s "$DTB" /oec-rga-dumb compatible
           echo "== bootargs"
-          grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*' \
+          grep -o 'root=[^ ]*\|sn=[^ ]*\|custom_sn=[^ ]*\|mac1=[^ ]*\|vender_format_version=[^ ]*\|syno_hw_version=[^ ]*\|cma=[^ ]*' \
             output/dsm/boot-root/boot/extlinux/extlinux.conf
+          grep -q 'cma=256M' output/dsm/boot-root/boot/extlinux/extlinux.conf || { echo "ERROR: cma=256M missing from bootargs (VPU DMA-heap path needs it)"; exit 1; }
+
+      - name: Verify CPU DVFS hook landed in uInitrd
+        run: |
+          set -eu
+          BOOT=output/dsm/boot-root/boot
+          echo "== uInitrd must carry the CPU DVFS hook (1608 MHz cap + schedutil)"
+          rm -rf /tmp/rdcheck && mkdir -p /tmp/rdcheck
+          ( cd /tmp/rdcheck && lzma -dc < "$BOOT/uInitrd" | cpio -idm --quiet )
+          test -f /tmp/rdcheck/linuxrc.syno.impl || { echo "ERROR: linuxrc.syno.impl missing from uInitrd"; exit 1; }
+          test -f /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_dvfs.sh || { echo "ERROR: rk3566_cpufreq_dvfs.sh missing from uInitrd (cpufreq hook not installed)"; exit 1; }
+          test -f /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_rcd.sh || { echo "ERROR: rk3566_cpufreq_rcd.sh missing from uInitrd"; exit 1; }
+          grep -Fq '/bin/sh /usr/syno/sbin/rk3566_cpufreq_dvfs.sh "$Mnt"' /tmp/rdcheck/linuxrc.syno.impl || { echo "ERROR: cpufreq hook call missing from linuxrc.syno.impl"; exit 1; }
+          grep -Fq '/bin/sh /usr/syno/sbin/rk3399_sync_model_dtb.sh "$Mnt"' /tmp/rdcheck/linuxrc.syno.impl || { echo "ERROR: model.dtb sync hook vanished from linuxrc.syno.impl"; exit 1; }
+          grep -q 'CAP=1608000' /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_dvfs.sh || { echo "ERROR: 1608 MHz cap is not baked into the hook"; exit 1; }
+          grep -q 'CAP=1608000' /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_rcd.sh || { echo "ERROR: 1608 MHz cap is not baked into the rc.d payload"; exit 1; }
+          echo "OK: DVFS hook + 1608 MHz cap present in uInitrd"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

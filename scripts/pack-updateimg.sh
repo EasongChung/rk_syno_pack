@@ -596,6 +596,14 @@ SYNO_FW_VERSION="${SYNO_FW_VERSION:-M.115}"
 SYNO_BOOT_LOGO="${SYNO_BOOT_LOGO:-$PROJECT_DIR/assets/boot-logo/logo.bmp}"
 SWIOTLB="${SWIOTLB:-32768}"
 COHERENT_POOL="${COHERENT_POOL:-4M}"
+# CPU CMA reservation. RK3566/DS124 needs cma=256M for the DMA-heap VPU path
+# (docs/08 §三.12): 260915 Jellyfin relies on /dev/dma_heap/*_cma, which only
+# appears with a large CMA pool. Keep it a bootarg so it can be overridden per
+# build; empty string disables it (e.g. the historical no-cma comparison image).
+case "$SOC" in
+	rk3566) CMA_SIZE="${CMA_SIZE:-256M}" ;;
+	*)      CMA_SIZE="${CMA_SIZE:-}" ;;
+esac
 RAW_INITRD="$OUT_DIR/uInitrd.raw"
 LZMA_INITRD="$OUT_DIR/uInitrd.lzma"
 KERNEL_IMAGE="$KERNEL_BUILD/arch/arm64/boot/Image"
@@ -779,6 +787,12 @@ if [ -n "$SYNO_SN" ]; then
 fi
 if [ -n "$SYNO_CUSTOM_SN" ]; then
 	BOOTARGS+=(custom_sn="$SYNO_CUSTOM_SN")
+fi
+# cma must land after custom_sn to byte-match the verified on-device extlinux
+# template (fw_public/extlinux.conf.cma256), so a CI-built boot.img and the
+# hand-verified recovery image stay diff-clean.
+if [ -n "$CMA_SIZE" ]; then
+	BOOTARGS+=(cma="$CMA_SIZE")
 fi
 if [ -n "${DEBUG_BOOTARGS:-}" ]; then
 	# Space-separated extra kernel arguments for one-off boot diagnostics.
