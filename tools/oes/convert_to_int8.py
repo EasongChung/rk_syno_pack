@@ -275,6 +275,110 @@ def rewrite_nchw_slice_detour(onnx_path, rewritten_path):
     return rewritten_path
 
 
+def rewrite_slice_to_split(onnx_path, rewritten_path):
+    """把静态 Slice 改写为 Split+取段（onnx2tf 的 Slice 轴重映射会推出 0 通道）。
+
+    实测：Slice(axes=[0,2,3,1], starts=[0,0,0,122], ends=[1,50,50,244])
+    作用于静态 [1,244,50,50]，onnx2tf 推出下游 [1,50,50,0]。
+    等价改写：Split(sizes=[122,122], axis=1) 取第 2 段（[122:244]），
+    或取第 1 段（[0:122]）。纯机械等价（同张量、同轴、同区间），
+    Split 的静态 shape 对 onnx2tf 毫无推理压力。改完 ORT 余弦必须为 1。
+    仅改：starts/ends 全非负、被切轴静态已知、单轴非常值步长（无 steps 输入
+    或 steps 全 1）的 Slice；其余不动。
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper, shape_inference
+    m = onnx.load(onnx_path)
+    try:
+        m = shape_inference.infer_shapes(m)
+    except Exception as e:
+        print('shape inference warn: %s' % e, flush=True)
+    inits = {i.name: i for i in m.graph.initializer}
+
+    def tshape(tname):
+        for v in list(m.graph.input) + list(m.graph.value_info) + \
+                list(m.graph.output):
+            if v.name == tname and v.type.tensor_type.HasField('shape'):
+                return [d.dim_value for d in v.type.tensor_type.shape.dim]
+        return None
+
+    def const_vals(name):
+        init = inits.get(name)
+        if init is None:
+            return None
+        return numpy_helper.to_array(init).tolist()
+
+    rewritten = 0
+    for n in list(m.graph.node):
+        if n.op_type != 'Slice':
+            continue
+        if len(n.input) == 5:
+            steps = const_vals(n.input[4])
+            if steps is None or any(s != 1 for s in steps):
+                continue
+        elif len(n.input) != 4:
+            continue
+        starts, ends, axes = (const_vals(n.input[1]), const_vals(n.input[2]),
+                              const_vals(n.input[3]))
+        if starts is None or ends is None or axes is None:
+            continue
+        if any(v < 0 for v in starts + ends):
+            continue
+        dims = tshape(n.input[0])
+        if dims is None:
+            continue
+        # 仅处理"恰切一个轴的连续区间"（本图全部 26 个 Slice 皆属此类）
+        if len(axes) != len(set(axes)):
+            continue
+        # 要求非切轴的 starts/ends 取全量（即只实质切一个轴）
+        cut = None
+        ok = True
+        for s, e, a in zip(starts, ends, axes):
+            d = dims[a] if a < len(dims) else 0
+            if d <= 0 or e <= 0:
+                ok = False
+                break
+            if s == 0 and e >= d:
+                continue  # 该轴取全量，非实质切割
+            if cut is not None:
+                ok = False
+                break
+            cut = (a, s, min(e, d), d)
+        if not ok or cut is None:
+            continue
+        a, s, e, d = cut
+        segs, take = [], None
+        if s > 0:
+            segs.append(s)
+        segs.append(e - s)
+        take = len(segs) - 1
+        if e < d:
+            segs.append(d - e)
+        if any(x <= 0 for x in segs):
+            continue
+        sp = onnx.helper.make_node(
+            'Split', [n.input[0]], ['%s_split_%d' % (n.output[0], i)
+                                    for i in range(len(segs))],
+            name='%s_as_split' % n.name, axis=a, split=segs)
+        # 找到 Slice 在 node 列表中的位置，替换为 Split + Identity(改名直通)
+        idx = list(m.graph.node).index(n)
+        m.graph.node.remove(n)
+        m.graph.node.insert(idx, sp)
+        # 把原 Slice 输出名赋给被取段：改名该段输出为原输出名
+        sp.output[take] = n.output[0]
+        rewritten += 1
+        print('slice->split %s axis=%d [%d:%d] of %d' % (n.name, a, s, e, d),
+              flush=True)
+    if rewritten == 0:
+        print('no static Slice rewritten', flush=True)
+        return onnx_path
+    onnx.save(m, rewritten_path)
+    _validate_onnx_pair(onnx_path, rewritten_path)
+    print('slice->split rewritten=%d' % rewritten, flush=True)
+    return rewritten_path
+
+
 def repair_reshape_minus_one(onnx_path, repaired_path):
     """修 tf2onnx 的 Reshape[*, -1, ...]：-1 本应由下游 Slice 的 ends 反推。
 
@@ -385,6 +489,8 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     onnx_path = rewrite_nchw_slice_detour(onnx_path, detour_path)
     repaired = os.path.join(os.path.dirname(onnx_path), 'concept_fix.onnx')
     graph_path = repair_reshape_minus_one(onnx_path, repaired)
+    split_path = os.path.join(os.path.dirname(onnx_path), 'concept_split.onnx')
+    graph_path = rewrite_slice_to_split(graph_path, split_path)
     variants = [
         ['-kt', 'inputs_0'],
         ['-b', '1', '-kt', 'inputs_0'],
