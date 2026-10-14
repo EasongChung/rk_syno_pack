@@ -128,6 +128,121 @@ def diagnose_zero_channel(onnx_path):
                           flush=True)
 
 
+def rewrite_nchw_slice_detour(onnx_path, rewritten_path):
+    """消掉 NHWC→NCHW→Reshape(-1)→Slice→NHWC 迂回（TFLite 血统典型产物）。
+
+    实测链：Transpose[0,3,1,2] → Reshape[1,-1,H,W] → Slice(axes NCHW 序)
+             → Transpose[0,2,3,1] → Conv(NHWC)。
+    等价改写：在首个 Transpose 的输入（NHWC）上直接 Slice（轴重映射
+    NCHW a -> NHWC [0,2,3,1][a]），删掉 2 Transpose + Reshape。
+    仅当 perm 对恰为 NHWC<->NCHW 逆对时改写；改完 ORT 新旧图余弦必须为 1。
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper
+    m = onnx.load(onnx_path)
+    consumers = {}
+    for n in m.graph.node:
+        for i in n.input:
+            consumers.setdefault(i, []).append(n)
+    inits = {i.name: i for i in m.graph.initializer}
+    NCHW2NHWC = [0, 2, 3, 1]
+    NHWC2NCHW = [0, 3, 1, 2]
+
+    def perm_of(node):
+        for a in node.attribute:
+            if a.name == 'perm':
+                return list(a.ints)
+        return None
+
+    def const_vals(name):
+        init = inits.get(name)
+        if init is None:
+            return None
+        return numpy_helper.to_array(init).tolist()
+
+    removed = 0
+    for t1 in list(m.graph.node):
+        if t1.op_type != 'Transpose' or perm_of(t1) != NHWC2NCHW:
+            continue
+        t1_out = t1.output[0]
+        r_users = consumers.get(t1_out, [])
+        if len(r_users) != 1 or r_users[0].op_type != 'Reshape':
+            continue
+        r = r_users[0]
+        if len(r.input) < 2:
+            continue
+        shape = const_vals(r.input[1])
+        if not shape or shape.count(-1) != 1 or shape[0] != 1:
+            continue
+        r_out = r.output[0]
+        s_users = consumers.get(r_out, [])
+        if len(s_users) != 1 or s_users[0].op_type != 'Slice':
+            continue
+        s = s_users[0]
+        if len(s.input) != 4:  # 只要无 steps 的标准 Slice，语义才可直搬
+            continue
+        starts, ends, axes = (const_vals(s.input[1]), const_vals(s.input[2]),
+                              const_vals(s.input[3]))
+        if starts is None or ends is None or axes is None:
+            continue
+        if any(v < 0 for v in starts + ends):
+            continue  # 负索引需结合维度解释，不碰
+        s_out = s.output[0]
+        t_users = consumers.get(s_out, [])
+        if len(t_users) != 1 or t_users[0].op_type != 'Transpose':
+            continue
+        t2 = t_users[0]
+        if perm_of(t2) != NCHW2NHWC:
+            continue
+        # 轴重映射到 NHWC
+        nstarts = [0, 0, 0, 0]
+        nends = [0, 0, 0, 0]
+        naxes = [0, 1, 2, 3]
+        for st, e, a in zip(starts, ends, axes):
+            na = NCHW2NHWC[a]
+            nstarts[na] = st
+            nends[na] = e
+        # 改 Slice 输入为 t1 的输入（NHWC），参数换 NHWC 序：新建 const 挂载
+        # （以前缀 s_out 保证唯一，避免多次改写重名）
+        new_names = []
+        for tag, vals in (('starts', nstarts), ('ends', nends),
+                          ('axes', naxes)):
+            nm = '%s_nhwc_%s' % (s_out, tag)
+            ni = numpy_helper.from_array(np.array(vals, dtype=np.int64),
+                                         name=nm)
+            m.graph.initializer.append(ni)
+            new_names.append(nm)
+        del s.input[:]
+        s.input.extend([t1.input[0]] + new_names)
+        # t2 输出改接 Slice 输出（删 t2），t1/r 悬空后由清理 pass 去掉
+        t2_out = t2.output[0]
+        for n2 in m.graph.node:
+            for ii, inp in enumerate(n2.input):
+                if inp == t2_out:
+                    n2.input[ii] = s_out
+        # 从图中移除 t1/r/t2（悬空 Reshape shape const 随 initializer 保留，无害）
+        for dead in (t1, r, t2):
+            m.graph.node.remove(dead)
+        # consumers 映射已失效，重建
+        consumers = {}
+        for n2 in m.graph.node:
+            for i2 in n2.input:
+                consumers.setdefault(i2, []).append(n2)
+        removed += 1
+        print('rewrote detour at %s (nhwc slice %s:%s)' % (s.name, nstarts,
+                                                           nends),
+              flush=True)
+    if removed == 0:
+        print('no NHWC/NCHW slice detour found', flush=True)
+        return onnx_path
+    # 清理悬空节点（输入含不存在张量的非输入节点不处理，仅去孤立 Transpose）
+    onnx.save(m, rewritten_path)
+    _validate_onnx_pair(onnx_path, rewritten_path)
+    print('detour rewrite: removed=%d' % removed, flush=True)
+    return rewritten_path
+
+
 def repair_reshape_minus_one(onnx_path, repaired_path):
     """修 tf2onnx 的 Reshape[*, -1, ...]：-1 本应由下游 Slice 的 ends 反推。
 
@@ -234,6 +349,8 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     # （本图首撞：Conv2D input [1,50,50,0]，-b/-ois 证实非动态 batch 问题）。
     # 依次尝试：静态 shape 钉死 → -kt 保 NHWC → onnxsim 化简 → onnx-tf 换后端。
     diagnose_zero_channel(onnx_path)
+    detour_path = os.path.join(os.path.dirname(onnx_path), 'concept_detour.onnx')
+    onnx_path = rewrite_nchw_slice_detour(onnx_path, detour_path)
     repaired = os.path.join(os.path.dirname(onnx_path), 'concept_fix.onnx')
     graph_path = repair_reshape_minus_one(onnx_path, repaired)
     variants = [
