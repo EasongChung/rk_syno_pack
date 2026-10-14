@@ -22,10 +22,17 @@ SCALE = 0.00784313725
 
 
 def load_interp(path):
-    import tensorflow as tf
-    it = tf.lite.Interpreter(model_path=path)
-    it.allocate_tensors()
-    return it
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from convert_to_int8 import make_interpreter
+        return make_interpreter(path)['interp']
+    except ImportError:
+        import tensorflow as tf
+        it = tf.lite.Interpreter(model_path=path)
+        it.allocate_tensors()
+        return it
 
 
 def run_once(interp, image_bytes):

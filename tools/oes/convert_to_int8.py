@@ -686,15 +686,96 @@ def stage_quant(sm_dir, out_path, calib_dir, num_calib, float_io):
         f.write(model)
     print('WROTE %s %d bytes (float_io=%s)' % (out_path, len(model), float_io),
           flush=True)
-    # 产物自检：输入 NHWC + 输出 335
-    interp = tf.lite.Interpreter(model_path=out_path)
-    interp.allocate_tensors()
-    ide = interp.get_input_details()[0]
-    ode = interp.get_output_details()[0]
+    # 产物自检：输入 NHWC + 输出 335（不做 invoke，见 diagnose 注释）
+    interp = make_interpreter(out_path, invoke=False)
+    ide = interp['input']
+    ode = interp['output']
     print('quant model in shape=%s dtype=%s / out shape=%s dtype=%s' % (
         ide['shape'], ide['dtype'], ode['shape'], ode['dtype']), flush=True)
     assert list(ide['shape']) == [1, 395, 395, 3], 'input must stay NHWC'
     assert list(ode['shape']) == [1, 335], 'output must be 335'
+    diagnose_quant_model(out_path)
+
+
+def tflite_op_name(code):
+    return {2: 'CONCATENATION', 3: 'CONV_2D', 4: 'DEPTHWISE_CONV_2D',
+            5: 'DEPTH_TO_SPACE', 6: 'DEQUANTIZE', 9: 'FULLY_CONNECTED',
+            14: 'LOGISTIC', 17: 'MAX_POOL_2D', 22: 'RESHAPE', 28: 'TANH',
+            34: 'PAD', 39: 'TRANSPOSE', 40: 'MEAN', 45: 'STRIDED_SLICE',
+            49: 'SPLIT', 65: 'SLICE', 79: 'ARG_MIN', 114: 'QUANTIZE',
+            133: 'BROADCAST_TO'}.get(code, 'OP_%d' % code)
+
+
+def diagnose_quant_model(path):
+    """量化产物结构诊断：op 直方图 + 输入输出量化参数（纯静态，需 tflite 包）。"""
+    try:
+        import tflite
+    except ImportError:
+        print('diagnose skipped (no tflite pkg)', flush=True)
+        return
+    raw = open(path, 'rb').read()
+    model = tflite.Model.GetRootAsModel(raw, 0)
+    g = model.Subgraphs(0)
+    hist = {}
+    for i in range(g.OperatorsLength()):
+        op = g.Operators(i)
+        c = model.OperatorCodes(op.OpcodeIndex()).BuiltinCode()
+        hist[c] = hist.get(c, 0) + 1
+    print('quant graph: %s' % {tflite_op_name(k): v
+                               for k, v in sorted(hist.items())}, flush=True)
+    tname = {0: 'FLOAT32', 3: 'UINT8', 9: 'INT8', 2: 'INT32'}
+    for li, getter, n in (('in', g.Inputs, g.InputsLength()),
+                          ('out', g.Outputs, g.OutputsLength())):
+        for k in range(n):
+            t = g.Tensors(getter(k))
+            q = t.Quantization()
+            print('  %s tensor=%r type=%s shape=%s q_n=%d' % (
+                li, t.Name(), tname.get(t.Type(), t.Type()),
+                [t.Shape(j) for j in range(t.ShapeLength())],
+                q.ScaleLength() if q else 0), flush=True)
+
+
+def make_interpreter(path, invoke=True):
+    """建 TFLite 解释器：默认（XNNPACK）→ 去 delegate 重试序列。
+
+    背景：量化产物中个别算子（如 Split 系）可能让 XNNPACK prepare 失败；
+    验证机只需 CPU ref 核跑通做数值回归，逐级降级并如实记录。
+    返回 {'interp','input','output','delegate'}。
+    """
+    import numpy as np
+    import tensorflow as tf
+    attempts = [('default', {})]
+    try:
+        members = [(m, getattr(tf.lite.experimental.OpResolverType, m))
+                   for m in dir(tf.lite.experimental.OpResolverType)
+                   if not m.startswith('_')]
+        print('OpResolverType members=%s' % [m for m, _ in members],
+              flush=True)
+        for m, v in members:
+            attempts.append((m, {'experimental_op_resolver_type': v}))
+    except Exception as e:
+        print('resolver enum unavailable: %s' % e, flush=True)
+    last = None
+    for tag, kw in attempts:
+        try:
+            it = tf.lite.Interpreter(model_path=path, **kw)
+            it.allocate_tensors()
+            if invoke:
+                ide = it.get_input_details()[0]
+                shp = [int(x) for x in ide['shape']]
+                dt = ide['dtype']
+                dummy = (np.zeros(shp, dtype=dt) if dt == np.uint8
+                         else np.zeros(shp, dtype=np.float32))
+                it.set_tensor(ide['index'], dummy)
+                it.invoke()
+            print('interpreter OK via %s' % tag, flush=True)
+            return {'interp': it, 'input': it.get_input_details()[0],
+                    'output': it.get_output_details()[0], 'delegate': tag}
+        except Exception as e:
+            last = e
+            print('interpreter via %s FAILED: %s' % (tag, str(e)[:300]),
+                  flush=True)
+    raise RuntimeError('no interpreter backend works; last=%s' % last)
 
 
 def main():

@@ -31,6 +31,7 @@ jobs:
           pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
           pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
           pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
+          pip install --quiet tflite
           python -c "import onnx2tf; print('onnx2tf', onnx2tf.__version__)"
           pip install --quiet onnxsim "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
           python -c "import tensorflow as tf; print('tf', tf.__version__)"
