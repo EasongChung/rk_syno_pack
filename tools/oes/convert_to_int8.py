@@ -69,16 +69,41 @@ def stage_smoke(onnx_path):
     del sess
 
 
+def diagnose_zero_channel(onnx_path):
+    """打印导致 [*,*,*,0] 的上游节点链（纯诊断，不改图）。"""
+    import onnx
+    m = onnx.load(onnx_path)
+    out2node = {}
+    for n in m.graph.node:
+        for o in n.output:
+            out2node[o] = n
+    for n in m.graph.node:
+        if 'convolution_4' in n.name and n.op_type in ('Conv',):
+            print('suspect node: %s op=%s inputs=%s' % (
+                n.name, n.op_type, list(n.input)), flush=True)
+            for inp in n.input[1:2]:
+                p = out2node.get(inp)
+                if p is not None:
+                    print('  parent: %s op=%s inputs=%s' % (
+                        p.name, p.op_type, list(p.input)), flush=True)
+                    for inp2 in p.input:
+                        p2 = out2node.get(inp2)
+                        if p2 is not None:
+                            print('    grandparent: %s op=%s' % (
+                                p2.name, p2.op_type), flush=True)
+
+
 def stage_onnx_to_savedmodel(onnx_path, sm_dir):
-    # onnx2tf 对 TFLite 血统图的动态 shape（含 Depthwise 分支）常把某通道推成 0
-    # （本图首撞：Conv2D input [1,50,50,0]）。按 onnx2tf 自身提示，用 -b/-ois
-    # 把 batch 与输入钉死为静态；依次尝试，记录胜出者，不静默跳过。
+    # onnx2tf 对 TFLite 血统图的 Depthwise/Slice 分支常推出 0 通道
+    # （本图首撞：Conv2D input [1,50,50,0]，-b/-ois 证实非动态 batch 问题）。
+    # 依次尝试：静态 shape 钉死 → -kt 保 NHWC → onnxsim 化简 → onnx-tf 换后端。
+    diagnose_zero_channel(onnx_path)
     variants = [
         ['-b', '1'],
         ['-ois', 'inputs_0:1,395,395,3'],
         ['-b', '1', '-ois', 'inputs_0:1,395,395,3'],
-        ['-kt'],
-        ['-b', '1', '-kt'],
+        ['-kt', 'inputs_0'],
+        ['-b', '1', '-kt', 'inputs_0'],
     ]
     last_err = ''
     for i, extra in enumerate(variants):
@@ -95,7 +120,67 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
         last_err = (r.stdout[-800:] + r.stderr[-800:]).replace('\n', ' | ')
         print('onnx2tf flags=%s FAILED: %s' % (extra, last_err[-500:]),
               flush=True)
-    raise SystemExit('onnx2tf all variants failed; last=%s' % last_err[-500:])
+    # 后备 A：onnxsim 化简后再转（常量折叠常能消掉产出 0 通道的 Slice/Reshape）
+    try:
+        import onnxsim
+        sim_path = onnx_path.replace('.onnx', '.sim.onnx')
+        print('trying onnxsim simplify ...', flush=True)
+        model_opt, ok = onnxsim.simplify(onnx_path)
+        if ok:
+            import onnx
+            onnx.save(model_opt, sim_path)
+            print('onnxsim OK -> %s' % sim_path, flush=True)
+            r = subprocess.run(
+                [sys.executable, '-m', 'onnx2tf', '-i', sim_path, '-o', sm_dir,
+                 '--non_verbose', '-b', '1'], capture_output=True, text=True)
+            if r.returncode == 0 and os.path.isdir(sm_dir):
+                print('onnx2tf OK via onnxsim simplified graph', flush=True)
+                with open(sm_dir + '.flags.txt', 'w') as f:
+                    f.write('onnxsim+-b 1\n')
+                return
+            print('onnx2tf on simplified graph FAILED', flush=True)
+        else:
+            print('onnxsim simplify check failed', flush=True)
+    except Exception as e:
+        print('onnxsim path unavailable: %s' % e, flush=True)
+    # 后备 B：换 onnx-tf 后端（与 onnx2tf 不同代码库），并做数值交叉验证
+    try:
+        print('trying onnx-tf backend ...', flush=True)
+        import onnx
+        from onnx_tf.backend import prepare
+        m = onnx.load(onnx_path)
+        rep = prepare(m)
+        rep.export_graph(sm_dir)
+        assert os.path.isdir(sm_dir), 'onnx-tf produced no SavedModel'
+        _validate_savedmodel(sm_dir, onnx_path)
+        print('onnx-tf backend OK (numerically validated)', flush=True)
+        with open(sm_dir + '.flags.txt', 'w') as f:
+            f.write('onnx-tf\n')
+        return
+    except Exception as e:
+        print('onnx-tf path failed: %s' % e, flush=True)
+    raise SystemExit('onnx->SavedModel all paths failed; last=%s' % last_err[-500:])
+
+
+def _validate_savedmodel(sm_dir, onnx_path):
+    """SavedModel vs ONNX 同输入输出余弦（防换后端静默错图）。"""
+    import numpy as np
+    import onnxruntime as ort
+    import tensorflow as tf
+    rng = np.random.default_rng(11)
+    dummy = rng.random((1, 395, 395, 3), dtype=np.float32)
+    sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+    ref = sess.run(None, {sess.get_inputs()[0].name: dummy})[0].flatten()
+    del sess
+    mod = tf.saved_model.load(sm_dir)
+    fn = mod.signatures['serving_default']
+    key = list(fn.structured_input_signature[1].keys())[0]
+    got = fn(**{key: tf.constant(dummy)})
+    got = list(got.values())[0].numpy().flatten()
+    denom = (np.linalg.norm(ref) * np.linalg.norm(got)) + 1e-9
+    c = float(np.dot(ref, got) / denom)
+    print('savedmodel-vs-onnx cosine=%.5f' % c, flush=True)
+    assert c > 0.999, 'backend mismatch, cosine=%.5f' % c
 
 
 def representative_dataset(calib_dir, num, float_io):
