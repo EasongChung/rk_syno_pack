@@ -357,16 +357,22 @@ def rewrite_slice_to_split(onnx_path, rewritten_path):
             segs.append(d - e)
         if any(x <= 0 for x in segs):
             continue
+        # 输出名先在普通 list 里定好（不依赖 protobuf 容器的 __setitem__）：
+        # 被取段直接沿用原 Slice 输出名，下游 Conv/Concat 无需任何改动
+        out_names = ['%s_split_%d' % (n.output[0], i)
+                     for i in range(len(segs))]
+        out_names[take] = n.output[0]
+        # Split-13 起 split 走输入（attribute 形式已非法），挂初始化器
+        split_nm = '%s_split_sizes' % n.output[0]
+        m.graph.initializer.append(numpy_helper.from_array(
+            np.array(segs, dtype=np.int64), name=split_nm))
         sp = onnx.helper.make_node(
-            'Split', [n.input[0]], ['%s_split_%d' % (n.output[0], i)
-                                    for i in range(len(segs))],
-            name='%s_as_split' % n.name, axis=a, split=segs)
-        # 找到 Slice 在 node 列表中的位置，替换为 Split + Identity(改名直通)
+            'Split', [n.input[0], split_nm], out_names,
+            name='%s_as_split' % n.name, axis=a)
+        # 用 Split 原位替换 Slice
         idx = list(m.graph.node).index(n)
         m.graph.node.remove(n)
         m.graph.node.insert(idx, sp)
-        # 把原 Slice 输出名赋给被取段：改名该段输出为原输出名
-        sp.output[take] = n.output[0]
         rewritten += 1
         print('slice->split %s axis=%d [%d:%d] of %d' % (n.name, a, s, e, d),
               flush=True)
@@ -464,11 +470,17 @@ def _slice_axis_range(slice_node, inits, axis):
 
 
 def _validate_onnx_pair(a_path, b_path):
-    """新旧 ONNX 同输入余弦（修图必须数值中性）。"""
+    """新旧 ONNX 同输入余弦（修图必须数值中性）。输入形状取自图本身。"""
     import numpy as np
+    import onnx
     import onnxruntime as ort
+    m = onnx.load(a_path)
+    dims = []
+    for d in m.graph.input[0].type.tensor_type.shape.dim:
+        v = d.dim_value if d.dim_value > 0 else 4
+        dims.append(v)
     rng = np.random.default_rng(11)
-    dummy = rng.random((1, 395, 395, 3), dtype=np.float32)
+    dummy = rng.random(tuple(dims), dtype=np.float32)
     outs = []
     for p in (a_path, b_path):
         sess = ort.InferenceSession(p, providers=['CPUExecutionProvider'])
