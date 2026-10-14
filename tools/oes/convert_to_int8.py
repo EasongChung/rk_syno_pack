@@ -239,15 +239,18 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     variants = [
         ['-kt', 'inputs_0'],
         ['-b', '1', '-kt', 'inputs_0'],
+        ['-kt', 'inputs_0', '--disable_group_convolution'],
         ['-b', '1'],
         ['-ois', 'inputs_0:1,395,395,3'],
         ['-b', '1', '-ois', 'inputs_0:1,395,395,3'],
     ]
     last_err = ''
+    runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'run_onnx2tf.py')
     for i, extra in enumerate(variants):
         trial = '%s.try%d' % (sm_dir, i)
         r = subprocess.run(
-            [sys.executable, '-m', 'onnx2tf', '-i', graph_path, '-o', trial,
+            [sys.executable, runner, '-i', graph_path, '-o', trial,
              '--non_verbose'] + extra, capture_output=True, text=True)
         sm_pb = os.path.join(trial, 'saved_model.pb')
         # onnx2tf 先落盘 SavedModel、再跑精度复核；复核在 numpy>=1.24 下会因
@@ -278,8 +281,10 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
             import onnx
             onnx.save(model_opt, sim_path)
             print('onnxsim OK -> %s' % sim_path, flush=True)
+            runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'run_onnx2tf.py')
             r = subprocess.run(
-                [sys.executable, '-m', 'onnx2tf', '-i', sim_path, '-o', sm_dir,
+                [sys.executable, runner, '-i', sim_path, '-o', sm_dir,
                  '--non_verbose', '-b', '1'], capture_output=True, text=True)
             if os.path.exists(os.path.join(sm_dir, 'saved_model.pb')):
                 try:
