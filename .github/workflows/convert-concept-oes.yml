@@ -83,4 +83,5 @@ jobs:
             out/concept_int8_floatio.tflite
             report.json
             SHA256SUMS
-          if-no-files-found: error
+            work/graph_dump.txt
+          if-no-files-found: warn

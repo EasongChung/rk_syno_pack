@@ -35,6 +35,36 @@ def sh(cmd):
     return r
 
 
+def dump_graph(onnx_path, dump_path):
+    """转储 ONNX 全图节点（名/op/关键属性/常量），供离线精确分析改写规则。"""
+    import onnx
+    from onnx import numpy_helper
+    m = onnx.load(onnx_path)
+    inits = {i.name: i for i in m.graph.initializer}
+    lines = ['graph=%s nodes=%d inits=%d' % (
+        m.graph.name, len(m.graph.node), len(m.graph.initializer))]
+    for n in m.graph.node:
+        parts = ['NODE %s op=%s' % (n.name, n.op_type)]
+        parts.append('in=%s' % ','.join(n.input))
+        parts.append('out=%s' % ','.join(n.output))
+        for a in n.attribute:
+            if a.name == 'perm':
+                parts.append('perm=%s' % list(a.ints))
+            elif a.name in ('axis', 'axes'):
+                parts.append('%s=%s' % (a.name, list(a.ints)))
+        for inp in n.input:
+            if inp in inits:
+                arr = numpy_helper.to_array(inits[inp]).flatten()
+                v = arr[:12].tolist()
+                parts.append('const[%s]=%s%s' % (
+                    inp, v, '...' if len(arr) > 12 else ''))
+        lines.append(' | '.join(parts))
+    with open(dump_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print('graph dump: %d nodes -> %s' % (len(m.graph.node), dump_path),
+          flush=True)
+
+
 def stage_tflite_to_onnx(src, onnx_path):
     sh([sys.executable, '-m', 'tf2onnx.convert', '--tflite', src,
         '--output', onnx_path, '--opset', '13'])
@@ -52,6 +82,8 @@ def stage_tflite_to_onnx(src, onnx_path):
     n_transpose = sum(1 for n in g.node if n.op_type == 'Transpose')
     print('onnx nodes=%d transpose_in_graph=%d (model-native, kept)' % (
         len(g.node), n_transpose), flush=True)
+    dump_graph(onnx_path, os.path.join(os.path.dirname(onnx_path),
+                                       'graph_dump.txt'))
     return onnx_path
 
 
