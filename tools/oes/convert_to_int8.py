@@ -128,11 +128,103 @@ def diagnose_zero_channel(onnx_path):
                           flush=True)
 
 
+def repair_reshape_minus_one(onnx_path, repaired_path):
+    """修 tf2onnx 的 Reshape[*, -1, ...]：-1 本应由下游 Slice 的 ends 反推。
+
+    实测：Reshape shape=[1,-1,50,50]，下游 Slice axes=[0,2,3,1]
+    starts=[0,0,0,122] ends=[1,50,50,244] → 通道维实为 244，
+    切片得 122 通道，正好对上 Conv filter 的输入通道 122。
+    规则：每个含 -1 的 Reshape，对其直接下游 Slice 在同一轴上的 ends 取 max
+    回填；无 Slice 佐证的不碰。修完用 onnxruntime 新旧图余弦验证数值中性。
+    """
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper
+    m = onnx.load(onnx_path)
+    out2node = {}
+    for n in m.graph.node:
+        for o in n.output:
+            out2node[o] = n
+    inits = {i.name: i for i in m.graph.initializer}
+    patched = 0
+    for n in m.graph.node:
+        if n.op_type != 'Reshape' or len(n.input) < 2:
+            continue
+        shp_init = inits.get(n.input[1])
+        if shp_init is None:
+            continue
+        shape = numpy_helper.to_array(shp_init).tolist()
+        if shape.count(-1) != 1:
+            continue
+        k = shape.index(-1)
+        need = 0
+        for consumer in [out2node[o] for o in n.output]:
+            if consumer is None or consumer.op_type != 'Slice':
+                continue
+            d = _slice_axis_range(consumer, inits, k)
+            if d is not None:
+                need = max(need, d)
+        if need > 0:
+            shape[k] = need
+            shp_init.CopyFrom(numpy_helper.from_array(
+                np.array(shape, dtype=np.int64), name=shp_init.name))
+            patched += 1
+            print('patched Reshape %s: -1@axis%d -> %d' % (n.name, k, need),
+                  flush=True)
+    if patched == 0:
+        print('no Reshape(-1) with Slice evidence, graph unchanged',
+              flush=True)
+        return onnx_path
+    onnx.save(m, repaired_path)
+    _validate_onnx_pair(onnx_path, repaired_path)
+    return repaired_path
+
+
+def _slice_axis_range(slice_node, inits, axis):
+    """Slice 在某轴上的 ends（正数才可信），无则 None。"""
+    import onnx
+    from onnx import numpy_helper
+    inp = {i: n for n, i in enumerate(
+        ['x', 'starts', 'ends', 'axes', 'steps'])}
+    try:
+        starts = numpy_helper.to_array(
+            inits[slice_node.input[inp['starts']]]).tolist()
+        ends = numpy_helper.to_array(
+            inits[slice_node.input[inp['ends']]]).tolist()
+        axes = numpy_helper.to_array(
+            inits[slice_node.input[inp['axes']]]).tolist()
+    except (KeyError, IndexError):
+        return None
+    for s, e, a in zip(starts, ends, axes):
+        if a == axis and isinstance(e, int) and e > 0:
+            return e
+    return None
+
+
+def _validate_onnx_pair(a_path, b_path):
+    """新旧 ONNX 同输入余弦（修图必须数值中性）。"""
+    import numpy as np
+    import onnxruntime as ort
+    rng = np.random.default_rng(11)
+    dummy = rng.random((1, 395, 395, 3), dtype=np.float32)
+    outs = []
+    for p in (a_path, b_path):
+        sess = ort.InferenceSession(p, providers=['CPUExecutionProvider'])
+        outs.append(sess.run(None, {sess.get_inputs()[0].name: dummy})[0])
+        del sess
+    fa, fb = outs[0].flatten(), outs[1].flatten()
+    c = float(np.dot(fa, fb) / (np.linalg.norm(fa) * np.linalg.norm(fb) + 1e-9))
+    print('onnx-vs-repaired cosine=%.6f' % c, flush=True)
+    assert c > 0.9999, 'repair changed numerics, cosine=%.6f' % c
+
+
 def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     # onnx2tf 对 TFLite 血统图的 Depthwise/Slice 分支常推出 0 通道
     # （本图首撞：Conv2D input [1,50,50,0]，-b/-ois 证实非动态 batch 问题）。
     # 依次尝试：静态 shape 钉死 → -kt 保 NHWC → onnxsim 化简 → onnx-tf 换后端。
     diagnose_zero_channel(onnx_path)
+    repaired = os.path.join(os.path.dirname(onnx_path), 'concept_fix.onnx')
+    graph_path = repair_reshape_minus_one(onnx_path, repaired)
     variants = [
         ['-b', '1'],
         ['-ois', 'inputs_0:1,395,395,3'],
@@ -144,7 +236,7 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     for i, extra in enumerate(variants):
         trial = '%s.try%d' % (sm_dir, i)
         r = subprocess.run(
-            [sys.executable, '-m', 'onnx2tf', '-i', onnx_path, '-o', trial,
+            [sys.executable, '-m', 'onnx2tf', '-i', graph_path, '-o', trial,
              '--non_verbose'] + extra, capture_output=True, text=True)
         if r.returncode == 0 and os.path.isdir(trial):
             os.rename(trial, sm_dir)
@@ -158,9 +250,9 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     # 后备 A：onnxsim 化简后再转（常量折叠常能消掉产出 0 通道的 Slice/Reshape）
     try:
         import onnxsim
-        sim_path = onnx_path.replace('.onnx', '.sim.onnx')
+        sim_path = graph_path.replace('.onnx', '.sim.onnx')
         print('trying onnxsim simplify ...', flush=True)
-        model_opt, ok = onnxsim.simplify(onnx_path)
+        model_opt, ok = onnxsim.simplify(graph_path)
         if ok:
             import onnx
             onnx.save(model_opt, sim_path)
@@ -203,11 +295,11 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
             onnx.mapping = mt
             print('onnx.mapping shim injected', flush=True)
         from onnx_tf.backend import prepare
-        m = onnx.load(onnx_path)
+        m = onnx.load(graph_path)
         rep = prepare(m)
         rep.export_graph(sm_dir)
         assert os.path.isdir(sm_dir), 'onnx-tf produced no SavedModel'
-        _validate_savedmodel(sm_dir, onnx_path)
+        _validate_savedmodel(sm_dir, graph_path)
         print('onnx-tf backend OK (numerically validated)', flush=True)
         with open(sm_dir + '.flags.txt', 'w') as f:
             f.write('onnx-tf\n')
