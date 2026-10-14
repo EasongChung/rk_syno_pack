@@ -504,6 +504,8 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     split_path = os.path.join(os.path.dirname(onnx_path), 'concept_split.onnx')
     graph_path = rewrite_slice_to_split(graph_path, split_path)
     variants = [
+        ['-kt', 'inputs_0', '-osd'],
+        ['-b', '1', '-kt', 'inputs_0', '-osd'],
         ['-kt', 'inputs_0'],
         ['-b', '1', '-kt', 'inputs_0'],
         ['-kt', 'inputs_0', '--disable_group_convolution'],
