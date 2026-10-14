@@ -385,6 +385,72 @@ def rewrite_slice_to_split(onnx_path, rewritten_path):
     return rewritten_path
 
 
+def sanitize_names(onnx_path, sanitized_path):
+    """把图中一切名字里的 ';' 换成 '_'（onnx2tf 导出 SavedModel 的正侧。
+
+    实测：plain -kt 整图转换本可成功，仅导出时被
+    `model/.../convolution;.../Add/y/kernel` 之类 tf2onnx 融合名（含 ;）拦下。
+    本改写纯机械（节点名/张量名/初始化器名/图出入名全量替换），改完 ORT
+    新旧图余弦必须为 1；若替换后重名则放弃改写。
+    """
+    import onnx
+    m = onnx.load(onnx_path)
+    all_names = []
+
+    def coll(lst):
+        for v in lst:
+            if v.name:
+                all_names.append(v.name)
+
+    coll(m.graph.input)
+    coll(m.graph.output)
+    coll(m.graph.value_info)
+    for n in m.graph.node:
+        if n.name:
+            all_names.append(n.name)
+        all_names.extend([i for i in n.input if i])
+        all_names.extend([o for o in n.output if o])
+    for init in m.graph.initializer:
+        all_names.append(init.name)
+    if not any(';' in x for x in all_names):
+        print('no semicolon names, sanitize skipped', flush=True)
+        return onnx_path
+    mapped = {x: x.replace(';', '_') for x in set(all_names) if ';' in x}
+    if len(set(mapped.values())) != len(mapped):
+        print('semicolon rename collides, sanitize aborted', flush=True)
+        return onnx_path
+
+    def fix(name):
+        return mapped.get(name, name)
+
+    for v in list(m.graph.input) + list(m.graph.output) + \
+            list(m.graph.value_info):
+        if v.name in mapped:
+            v.name = mapped[v.name]
+    for n in m.graph.node:
+        if n.name in mapped:
+            n.name = mapped[n.name]
+        for i, inp in enumerate(n.input):
+            if inp in mapped:
+                n.input[i] = mapped[inp]
+        for i, out in enumerate(n.output):
+            if out in mapped:
+                n.output[i] = mapped[out]
+    for init in m.graph.initializer:
+        if init.name in mapped:
+            init.name = mapped[init.name]
+    for sp in m.graph.sparse_initializer:
+        if sp.values.name in mapped:
+            sp.values.name = mapped[sp.values.name]
+        if sp.indices.name in mapped:
+            sp.indices.name = mapped[sp.indices.name]
+    onnx.save(m, sanitized_path)
+    _validate_onnx_pair(onnx_path, sanitized_path)
+    n_hit = len(mapped)
+    print('sanitized %d semicolon names' % n_hit, flush=True)
+    return sanitized_path
+
+
 def repair_reshape_minus_one(onnx_path, repaired_path):
     """修 tf2onnx 的 Reshape[*, -1, ...]：-1 本应由下游 Slice 的 ends 反推。
 
@@ -497,6 +563,8 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     # （本图首撞：Conv2D input [1,50,50,0]，-b/-ois 证实非动态 batch 问题）。
     # 依次尝试：静态 shape 钉死 → -kt 保 NHWC → onnxsim 化简 → onnx-tf 换后端。
     diagnose_zero_channel(onnx_path)
+    san_path = os.path.join(os.path.dirname(onnx_path), 'concept_san.onnx')
+    onnx_path = sanitize_names(onnx_path, san_path)
     detour_path = os.path.join(os.path.dirname(onnx_path), 'concept_detour.onnx')
     onnx_path = rewrite_nchw_slice_detour(onnx_path, detour_path)
     repaired = os.path.join(os.path.dirname(onnx_path), 'concept_fix.onnx')
