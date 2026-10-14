@@ -147,13 +147,22 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
             out2node[o] = n
     inits = {i.name: i for i in m.graph.initializer}
     patched = 0
+    n_reshape = 0
     for n in m.graph.node:
         if n.op_type != 'Reshape' or len(n.input) < 2:
             continue
+        n_reshape += 1
         shp_init = inits.get(n.input[1])
         if shp_init is None:
+            print('reshape %s: shape input not const' % n.name, flush=True)
             continue
         shape = numpy_helper.to_array(shp_init).tolist()
+        consumers = [out2node.get(o) for o in n.output]
+        cdesc = [(c.name, c.op_type) if c is not None else None
+                 for c in consumers]
+        if -1 in shape:
+            print('reshape %s shape=%s consumers=%s' % (n.name, shape, cdesc),
+                  flush=True)
         if shape.count(-1) != 1:
             continue
         k = shape.index(-1)
@@ -171,6 +180,8 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
             patched += 1
             print('patched Reshape %s: -1@axis%d -> %d' % (n.name, k, need),
                   flush=True)
+    print('reshape_total=%d patched=%d' % (n_reshape, patched), flush=True)
+    if patched == 0:
     if patched == 0:
         print('no Reshape(-1) with Slice evidence, graph unchanged',
               flush=True)
