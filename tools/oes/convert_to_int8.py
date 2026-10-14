@@ -742,6 +742,34 @@ def representative_dataset(calib_dir, num, float_io):
     return gen
 
 
+def stage_quant_legacy(sm_dir, out_path, calib_dir, num_calib):
+    """诊断/备选：旧量化器（experimental_new_quantizer=False）全整型。
+
+    背景（实测）：MLIR 新量化器对 0 值 Pad 常量产出退化 scale 1.33e36
+    （pseudo_qconst112 单值 128/zp127 → 反量化 1e36，本应为 0），
+    毒化整网。若旧量化器对退化张量处理不同，本产物即为可交付 INT8。
+    """
+    import tensorflow as tf
+    conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = representative_dataset(
+        calib_dir, num_calib, False)
+    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    conv.inference_input_type = tf.uint8
+    conv.inference_output_type = tf.uint8
+    try:
+        conv.experimental_new_quantizer = False
+    except AttributeError as e:
+        print('legacy quantizer flag gone: %s' % e, flush=True)
+        return None
+    model = conv.convert()
+    with open(out_path, 'wb') as f:
+        f.write(model)
+    print('WROTE %s %d bytes (legacy quantizer)' % (out_path, len(model)),
+          flush=True)
+    return out_path
+
+
 def stage_quant_dynamic(sm_dir, out_path):
     """诊断用：动态范围量化（仅权重量化，激活保持 float）。
 
@@ -899,7 +927,9 @@ def main():
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
                 args.calib_dir, args.num_calib, float_io=True)
     stage_quant_dynamic(sm_dir, os.path.join(args.outdir, 'concept_dyn.tflite'))
-    print('CONVERT DONE', flush=True)
+    leg = stage_quant_legacy(sm_dir, os.path.join(args.outdir, 'concept_legacy.tflite'),
+                             args.calib_dir, args.num_calib)
+    print('CONVERT DONE legacy=%s' % leg, flush=True)
 
 
 if __name__ == '__main__':

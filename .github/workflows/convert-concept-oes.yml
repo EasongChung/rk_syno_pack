@@ -76,6 +76,10 @@ jobs:
             --quant out/concept_int8_floatio.tflite --eval-dir eval --topk 1,5 --out report_floatio.json || echo "INT8-FLOATIO GATE: exit=$?"
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
             --quant out/concept_dyn.tflite --eval-dir eval --topk 1,5 --out report_dyn.json || echo "DYN GATE: exit=$?"
+          if [ -f out/concept_legacy.tflite ]; then
+            python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+              --quant out/concept_legacy.tflite --eval-dir eval --topk 1,5 --out report_legacy.json || echo "LEGACY GATE: exit=$?"
+          fi
           sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite out/concept_dyn.tflite \
             tools/oes/models/model_float16.tflite report.json report_floatio.json report_dyn.json | tee SHA256SUMS
           echo "=== report.json ==="; cat report.json | head -30
@@ -91,10 +95,12 @@ jobs:
             out/concept_int8.tflite
             out/concept_int8_floatio.tflite
             out/concept_dyn.tflite
+            out/concept_legacy.tflite
             out/compare.json
             report.json
             report_floatio.json
             report_dyn.json
+            report_legacy.json
             SHA256SUMS
             work/graph_dump.txt
             work/concept_float_sd.try*.log
