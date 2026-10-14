@@ -70,9 +70,32 @@ def stage_smoke(onnx_path):
 
 
 def stage_onnx_to_savedmodel(onnx_path, sm_dir):
-    sh([sys.executable, '-m', 'onnx2tf', '-i', onnx_path, '-o', sm_dir,
-        '--non_verbose'])
-    assert os.path.isdir(sm_dir), 'onnx2tf produced no SavedModel'
+    # onnx2tf 对 TFLite 血统图的动态 shape（含 Depthwise 分支）常把某通道推成 0
+    # （本图首撞：Conv2D input [1,50,50,0]）。按 onnx2tf 自身提示，用 -b/-ois
+    # 把 batch 与输入钉死为静态；依次尝试，记录胜出者，不静默跳过。
+    variants = [
+        ['-b', '1'],
+        ['-ois', 'inputs_0:1,395,395,3'],
+        ['-b', '1', '-ois', 'inputs_0:1,395,395,3'],
+        ['-kt'],
+        ['-b', '1', '-kt'],
+    ]
+    last_err = ''
+    for i, extra in enumerate(variants):
+        trial = '%s.try%d' % (sm_dir, i)
+        r = subprocess.run(
+            [sys.executable, '-m', 'onnx2tf', '-i', onnx_path, '-o', trial,
+             '--non_verbose'] + extra, capture_output=True, text=True)
+        if r.returncode == 0 and os.path.isdir(trial):
+            os.rename(trial, sm_dir)
+            print('onnx2tf OK with flags=%s' % extra, flush=True)
+            with open(sm_dir + '.flags.txt', 'w') as f:
+                f.write(' '.join(extra) + '\n')
+            return
+        last_err = (r.stdout[-800:] + r.stderr[-800:]).replace('\n', ' | ')
+        print('onnx2tf flags=%s FAILED: %s' % (extra, last_err[-500:]),
+              flush=True)
+    raise SystemExit('onnx2tf all variants failed; last=%s' % last_err[-500:])
 
 
 def representative_dataset(calib_dir, num, float_io):
