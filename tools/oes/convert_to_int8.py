@@ -669,6 +669,24 @@ def representative_dataset(calib_dir, num, float_io):
     return gen
 
 
+def stage_quant_dynamic(sm_dir, out_path):
+    """诊断用：动态范围量化（仅权重量化，激活保持 float）。
+
+    目的：隔离故障——若 dyn 版回归正常而全整型崩，则故障在 activation
+    校准传播（高度怀疑对象：--disable_group_convolution 拆出的 ~730 个
+    碎 conv + transpose 边界）；若 dyn 版同样崩，则故障在权重量化。
+    产物 Teflon 不可用，仅作诊断。
+    """
+    import tensorflow as tf
+    conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    model = conv.convert()
+    with open(out_path, 'wb') as f:
+        f.write(model)
+    print('WROTE %s %d bytes (dynamic-range, diagnostic only)' % (
+        out_path, len(model)), flush=True)
+
+
 def stage_quant(sm_dir, out_path, calib_dir, num_calib, float_io):
     import tensorflow as tf
     conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
@@ -807,6 +825,7 @@ def main():
                 args.calib_dir, args.num_calib, float_io=False)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
                 args.calib_dir, args.num_calib, float_io=True)
+    stage_quant_dynamic(sm_dir, os.path.join(args.outdir, 'concept_dyn.tflite'))
     print('CONVERT DONE', flush=True)
 
 
