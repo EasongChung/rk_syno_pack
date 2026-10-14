@@ -63,7 +63,8 @@ jobs:
         run: |
           set -euo pipefail
           python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
-            --workdir work --outdir out --calib-dir calib --num-calib 300
+            --workdir work --outdir out --calib-dir calib --num-calib 300 \
+            --eval-dir eval --frontend-num 50
           ls -la out/
 
       - name: Regression (quant vs float, both variants)
@@ -86,6 +87,7 @@ jobs:
           path: |
             out/concept_int8.tflite
             out/concept_int8_floatio.tflite
+            out/compare.json
             report.json
             report_floatio.json
             SHA256SUMS

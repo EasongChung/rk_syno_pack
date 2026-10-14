@@ -786,6 +786,9 @@ def main():
     ap.add_argument('--outdir', default='out')
     ap.add_argument('--calib-dir', default='calib')
     ap.add_argument('--num-calib', type=int, default=300)
+    ap.add_argument('--eval-dir', default='eval')
+    ap.add_argument('--frontend-num', type=int, default=50)
+    ap.add_argument('--skip-frontend-check', action='store_true')
     args = ap.parse_args()
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
@@ -793,6 +796,12 @@ def main():
     sm_dir = os.path.join(args.workdir, 'concept_float_sd')
     stage_tflite_to_onnx(args.src, onnx_path)
     stage_smoke(onnx_path)
+    if not args.skip_frontend_check:
+        import compare_tflite_onnx as cmp
+        ok = cmp.run(args.src, onnx_path, args.eval_dir, args.frontend_num,
+                     os.path.join(args.outdir, 'compare.json'))
+        if not ok:
+            raise SystemExit(3)
     stage_onnx_to_savedmodel(onnx_path, sm_dir)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8.tflite'),
                 args.calib_dir, args.num_calib, float_io=False)
