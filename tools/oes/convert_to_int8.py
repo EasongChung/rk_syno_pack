@@ -320,4 +320,11 @@ def main():
     stage_smoke(onnx_path)
     stage_onnx_to_savedmodel(onnx_path, sm_dir)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8.tflite'),
-                ar
+                args.calib_dir, args.num_calib, float_io=False)
+    stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
+                args.calib_dir, args.num_calib, float_io=True)
+    print('CONVERT DONE', flush=True)
+
+
+if __name__ == '__main__':
+    main()
