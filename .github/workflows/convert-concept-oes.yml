@@ -71,10 +71,10 @@ jobs:
         run: |
           set -euo pipefail
           python tools/oes/dump_regions.py --model tools/oes/models/model_float16.tflite \
-            --calib-dir calib --num 3 --out profile_float.json --float-input || echo "PROF-FLOAT: exit=$?"
+            --calib-dir calib --num 3 --out profile_float.json --float-input --preserve || echo "PROF-FLOAT: exit=$?"
           if [ -f out/concept_int8_fixed.tflite ]; then
             python tools/oes/dump_regions.py --model out/concept_int8_fixed.tflite \
-              --calib-dir calib --num 3 --out profile_fixed.json || echo "PROF-FIXED: exit=$?"
+              --calib-dir calib --num 3 --out profile_fixed.json --preserve || echo "PROF-FIXED: exit=$?"
           fi
 
       - name: Regression (quant vs float, all variants)

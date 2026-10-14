@@ -41,8 +41,9 @@ def main():
     ap.add_argument('--num', type=int, default=3)
     ap.add_argument('--out', required=True)
     ap.add_argument('--float-input', action='store_true')
+    ap.add_argument('--preserve', action='store_true')
     args = ap.parse_args()
-    it = make_interpreter(args.model)['interp']
+    it = make_interpreter(args.model, preserve=args.preserve)['interp']
     ide = it.get_input_details()[0]
     infos = it.get_tensor_details()
     prof = {'model': args.model, 'tensors': []}

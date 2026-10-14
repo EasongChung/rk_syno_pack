@@ -855,11 +855,12 @@ def diagnose_quant_model(path):
                 q.ScaleLength() if q else 0), flush=True)
 
 
-def make_interpreter(path, invoke=True):
+def make_interpreter(path, invoke=True, preserve=False):
     """建 TFLite 解释器：默认（XNNPACK）→ 去 delegate 重试序列。
 
     背景：量化产物中个别算子（如 Split 系）可能让 XNNPACK prepare 失败；
     验证机只需 CPU ref 核跑通做数值回归，逐级降级并如实记录。
+    preserve=True 时透出全部中间张量（剖面用）。
     返回 {'interp','input','output','delegate'}。
     """
     import numpy as np
@@ -878,7 +879,8 @@ def make_interpreter(path, invoke=True):
     last = None
     for tag, kw in attempts:
         try:
-            it = tf.lite.Interpreter(model_path=path, **kw)
+            it = tf.lite.Interpreter(model_path=path, **kw,
+                                     experimental_preserve_all_tensors=preserve)
             it.allocate_tensors()
             if invoke:
                 ide = it.get_input_details()[0]
