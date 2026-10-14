@@ -22,7 +22,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install deps (OEC-verified pins)
         run: |
@@ -30,7 +30,7 @@ jobs:
           pip install --quiet "numpy==1.26.4" pillow
           pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
           pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
-          pip install --quiet onnx2tf==2.6.9 onnx-graphsurgeon
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
           python -c "import onnx2tf; print('onnx2tf', onnx2tf.__version__)"
           pip install --quiet onnxsim "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
           python -c "import tensorflow as tf; print('tf', tf.__version__)"
@@ -50,6 +50,13 @@ jobs:
           set -euo pipefail
           python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
           python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 200 --min-ok 50
+
+      - name: Preseed onnx2tf check images (no download)
+        run: |
+          set -euo pipefail
+          python tools/oes/make_seed_npy.py --calib-dir calib \
+            --out calibration_image_sample_data_20x128x128x3_float32.npy
+          ls -la *.npy
 
       - name: Convert TFLite -> ONNX -> INT8 (NHWC kept)
         run: |
