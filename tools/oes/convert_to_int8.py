@@ -182,7 +182,6 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
                   flush=True)
     print('reshape_total=%d patched=%d' % (n_reshape, patched), flush=True)
     if patched == 0:
-    if patched == 0:
         print('no Reshape(-1) with Slice evidence, graph unchanged',
               flush=True)
         return onnx_path
