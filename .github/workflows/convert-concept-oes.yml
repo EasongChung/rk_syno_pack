@@ -1,0 +1,77 @@
+name: Convert Concept TFLite to INT8 (OES Teflon)
+
+# OES(A311D) 路线：concept float16.tflite -> INT8 TFLite（Teflon 只吃 INT8）。
+# 与 OEC 的 convert-concept.yml（RKNN 后端）并存；本文件只做 TFLite/Teflon，不动原有 4 个 workflow。
+# 关键差异（理由见 tools/oes/README_oes.md）：全程保持 NHWC，不插 NCHW-Transpose；禁用 tflite2onnx。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/**
+      - .github/workflows/convert-concept-oes.yml
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps (OEC-verified pins)
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
+          pip install --quiet onnx2tf onnx-graphsurgeon
+          python -c "import tensorflow as tf; print('tf', tf.__version__)"
+          python -c "import tf2onnx; print('tf2onnx', tf2onnx.__version__)"
+          python -c "import onnxruntime as ort; print('ort', ort.__version__)"
+
+      - name: Fingerprint input model
+        run: |
+          set -euo pipefail
+          ls -la tools/oes/models/
+          test "$(stat -c%s tools/oes/models/model_float16.tflite)" = "12094724"
+          xxd -l 16 tools/oes/models/model_float16.tflite | grep -i TFL3
+          wc -l tools/oes/models/labels.txt tools/oes/models/thresholds.txt
+
+      - name: Fetch photo sets (calib + eval)
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
+          python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 200 --min-ok 50
+
+      - name: Convert TFLite -> ONNX -> INT8 (NHWC kept)
+        run: |
+          set -euo pipefail
+          python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
+            --workdir work --outdir out --calib-dir calib --num-calib 300
+          ls -la out/
+
+      - name: Regression (quant vs float)
+        run: |
+          set -euo pipefail
+          python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+            --quant out/concept_int8.tflite --eval-dir eval --topk 1,5 --out report.json
+          sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite \
+            tools/oes/models/model_float16.tflite report.json | tee SHA256SUMS
+
+      - name: Upload INT8 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concept-int8-oes
+          path: |
+            out/concept_int8.tflite
+            out/concept_int8_floatio.tflite
+            report.json
+            SHA256SUMS
+          if-no-files-found: error
