@@ -930,6 +930,19 @@ def main():
     leg = stage_quant_legacy(sm_dir, os.path.join(args.outdir, 'concept_legacy.tflite'),
                              args.calib_dir, args.num_calib)
     print('CONVERT DONE legacy=%s' % leg, flush=True)
+    try:
+        import transplant as tp
+        tp_targets = tp.find_float_targets(args.src)
+        tp_ranges = tp.measure_ranges(args.src, args.calib_dir, 50, tp_targets)
+        tp_qidx = tp.find_quant_targets(
+            os.path.join(args.outdir, 'concept_int8.tflite'))
+        tp.patch_quant(os.path.join(args.outdir, 'concept_int8.tflite'),
+                       os.path.join(args.outdir, 'concept_int8_fixed.tflite'),
+                       tp_qidx, tp_ranges)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print('TRANSPLANT SKIPPED: %s' % e, flush=True)
 
 
 if __name__ == '__main__':

@@ -80,8 +80,15 @@ jobs:
             python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
               --quant out/concept_legacy.tflite --eval-dir eval --topk 1,5 --out report_legacy.json || echo "LEGACY GATE: exit=$?"
           fi
+          if [ -f out/concept_int8_fixed.tflite ]; then
+            python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+              --quant out/concept_int8_fixed.tflite --eval-dir eval --topk 1,5 --out report_fixed.json || echo "FIXED GATE: exit=$?"
+          fi
           sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite out/concept_dyn.tflite \
             tools/oes/models/model_float16.tflite report.json report_floatio.json report_dyn.json | tee SHA256SUMS
+          for f in out/concept_legacy.tflite out/concept_int8_fixed.tflite report_legacy.json report_fixed.json; do
+            [ -f "$f" ] && sha256sum "$f" | tee -a SHA256SUMS || true
+          done
           echo "=== report.json ==="; cat report.json | head -30
           echo "=== report_floatio.json ==="; cat report_floatio.json | head -30
           echo "=== report_dyn.json ==="; cat report_dyn.json | head -30
@@ -96,11 +103,13 @@ jobs:
             out/concept_int8_floatio.tflite
             out/concept_dyn.tflite
             out/concept_legacy.tflite
+            out/concept_int8_fixed.tflite
             out/compare.json
             report.json
             report_floatio.json
             report_dyn.json
             report_legacy.json
+            report_fixed.json
             SHA256SUMS
             work/graph_dump.txt
             work/concept_float_sd.try*.log
