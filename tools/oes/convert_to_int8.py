@@ -69,6 +69,16 @@ def stage_smoke(onnx_path):
     del sess
 
 
+def _const_values(m, name, limit=16):
+    import onnx
+    from onnx import numpy_helper
+    for init in m.graph.initializer:
+        if init.name == name:
+            arr = numpy_helper.to_array(init).flatten()
+            return arr[:limit].tolist()
+    return None
+
+
 def diagnose_zero_channel(onnx_path):
     """打印导致 [*,*,*,0] 的上游节点链 + Slice 参数（纯诊断，不改图）。"""
     import onnx
@@ -97,21 +107,22 @@ def diagnose_zero_channel(onnx_path):
                     print('  parent: %s op=%s inputs=%s' % (
                         p.name, p.op_type, list(p.input)), flush=True)
                     if p.op_type == 'Slice':
-                        for a in p.attribute:
-                            import numpy as np
-                            vals = list(onnx.numpy_helper.to_array(a.t)) \
-                                if a.type == onnx.AttributeProto.TENSORS else \
-                                list(a.ints)
-                            print('    slice attr %s = %s' % (a.name, vals),
-                                  flush=True)
                         for inp2 in p.input:
                             if inp2 in consts:
-                                print('    slice input const %s dims=%s' % (
-                                    inp2, consts[inp2]), flush=True)
+                                v = _const_values(m, inp2)
+                                print('    slice input const %s dims=%s vals=%s' % (
+                                    inp2, consts[inp2], v), flush=True)
                             p2 = out2node.get(inp2)
                             if p2 is not None:
                                 print('    slice input node %s op=%s' % (
                                     p2.name, p2.op_type), flush=True)
+                                if p2.op_type == 'Reshape':
+                                    for inp3 in p2.input[1:]:
+                                        if inp3 in consts:
+                                            print('    reshape shape const %s dims=%s vals=%s' % (
+                                                inp3, consts[inp3],
+                                                _const_values(m, inp3)),
+                                                flush=True)
                 elif inp in consts:
                     print('  const input %s dims=%s' % (inp, consts[inp]),
                           flush=True)
@@ -309,11 +320,4 @@ def main():
     stage_smoke(onnx_path)
     stage_onnx_to_savedmodel(onnx_path, sm_dir)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8.tflite'),
-                args.calib_dir, args.num_calib, float_io=False)
-    stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
-                args.calib_dir, args.num_calib, float_io=True)
-    print('CONVERT DONE', flush=True)
-
-
-if __name__ == '__main__':
-    main()
+                ar
