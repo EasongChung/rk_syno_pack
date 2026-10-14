@@ -141,10 +141,10 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
     import onnx
     from onnx import numpy_helper
     m = onnx.load(onnx_path)
-    out2node = {}
+    consumers_map = {}
     for n in m.graph.node:
-        for o in n.output:
-            out2node[o] = n
+        for i in n.input:
+            consumers_map.setdefault(i, []).append(n)
     inits = {i.name: i for i in m.graph.initializer}
     patched = 0
     n_reshape = 0
@@ -157,9 +157,10 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
             print('reshape %s: shape input not const' % n.name, flush=True)
             continue
         shape = numpy_helper.to_array(shp_init).tolist()
-        consumers = [out2node.get(o) for o in n.output]
-        cdesc = [(c.name, c.op_type) if c is not None else None
-                 for c in consumers]
+        consumers = []
+        for o in n.output:
+            consumers.extend(consumers_map.get(o, []))
+        cdesc = [(c.name, c.op_type) for c in consumers]
         if -1 in shape:
             print('reshape %s shape=%s consumers=%s' % (n.name, shape, cdesc),
                   flush=True)
@@ -167,7 +168,7 @@ def repair_reshape_minus_one(onnx_path, repaired_path):
             continue
         k = shape.index(-1)
         need = 0
-        for consumer in [out2node[o] for o in n.output]:
+        for consumer in consumers:
             if consumer is None or consumer.op_type != 'Slice':
                 continue
             d = _slice_axis_range(consumer, inits, k)
