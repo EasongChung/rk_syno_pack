@@ -97,4 +97,5 @@ jobs:
             report_dyn.json
             SHA256SUMS
             work/graph_dump.txt
+            work/concept_float_sd.try*.log
           if-no-files-found: warn

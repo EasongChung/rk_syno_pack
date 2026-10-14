@@ -536,8 +536,11 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
                 f.write(' '.join(extra) + '\n')
             return
         last_err = (r.stdout[-800:] + r.stderr[-800:]).replace('\n', ' | ')
-        print('onnx2tf flags=%s FAILED: %s' % (extra, last_err[-500:]),
-              flush=True)
+        errlines = [l.strip()[:300] for l in (r.stdout + r.stderr).splitlines()
+                    if 'error' in l.lower() and 'computation_placer' not in l
+                    and 'cuda' not in l.lower()][:6]
+        print('onnx2tf flags=%s FAILED: %s || %s' % (
+            extra, last_err[-300:], ' // '.join(errlines)), flush=True)
     # 后备 A：onnxsim 化简后再转（常量折叠常能消掉产出 0 通道的 Slice/Reshape）
     try:
         import onnxsim
