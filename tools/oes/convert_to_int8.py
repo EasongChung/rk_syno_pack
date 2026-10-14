@@ -632,6 +632,9 @@ def _validate_savedmodel(sm_dir, onnx_path):
 
 
 def representative_dataset(calib_dir, num, float_io):
+    # ★ 校准分布必须与服务端真实输入一致：归一化 float32 NHWC [-1,1]。
+    # （float_io 只决定模型 I/O 的 dtype，不改变校准分布；此前 full-int 路
+    # 误喂 0~255 原始值，导致 activation 量化尺度全错，回归 top1=0.01。）
     from PIL import Image
     import numpy as np
     files = sorted(glob.glob(os.path.join(calib_dir, '*')))
@@ -651,16 +654,14 @@ def representative_dataset(calib_dir, num, float_io):
                 print('skip bad image %s: %s' % (f, e), flush=True)
                 continue
             arr = np.frombuffer(img.tobytes(), dtype=np.uint8).astype(np.float32)
-            if float_io:
-                arr = (arr - MEAN) * SCALE
+            arr = (arr - MEAN) * SCALE  # 与服务端/回归输入严格一致
             yield [arr.reshape(1, NET, NET, 3)]
             n += 1
             if n >= num:
                 return
         while n < num:  # 合成兜底（报告中注明 synthetic_fill=N）
             base = rng.normal(117.0, 60.0, size=(NET, NET, 3)).clip(0, 255)
-            if float_io:
-                base = (base - MEAN) * SCALE
+            base = (base - MEAN) * SCALE
             yield [base.astype(np.float32).reshape(1, NET, NET, 3)]
             n += 1
         print('representative_dataset: real=%d synthetic_fill=%d' % (

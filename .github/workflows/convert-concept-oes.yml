@@ -66,13 +66,17 @@ jobs:
             --workdir work --outdir out --calib-dir calib --num-calib 300
           ls -la out/
 
-      - name: Regression (quant vs float)
+      - name: Regression (quant vs float, both variants)
         run: |
           set -euo pipefail
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
-            --quant out/concept_int8.tflite --eval-dir eval --topk 1,5 --out report.json
+            --quant out/concept_int8.tflite --eval-dir eval --topk 1,5 --out report.json || echo "INT8-UINT8 GATE: exit=$?"
+          python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+            --quant out/concept_int8_floatio.tflite --eval-dir eval --topk 1,5 --out report_floatio.json || echo "INT8-FLOATIO GATE: exit=$?"
           sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite \
-            tools/oes/models/model_float16.tflite report.json | tee SHA256SUMS
+            tools/oes/models/model_float16.tflite report.json report_floatio.json | tee SHA256SUMS
+          echo "=== report.json ==="; cat report.json | head -30
+          echo "=== report_floatio.json ==="; cat report_floatio.json | head -30
 
       - name: Upload INT8 artifacts
         if: always()
@@ -83,6 +87,7 @@ jobs:
             out/concept_int8.tflite
             out/concept_int8_floatio.tflite
             report.json
+            report_floatio.json
             SHA256SUMS
             work/graph_dump.txt
           if-no-files-found: warn
