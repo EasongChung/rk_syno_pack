@@ -67,7 +67,17 @@ jobs:
             --eval-dir eval --frontend-num 50
           ls -la out/
 
-      - name: Regression (quant vs float, both variants)
+      - name: Tensor profiles (float vs fixed, divergence hunt)
+        run: |
+          set -euo pipefail
+          python tools/oes/dump_regions.py --model tools/oes/models/model_float16.tflite \
+            --calib-dir calib --num 3 --out profile_float.json --float-input || echo "PROF-FLOAT: exit=$?"
+          if [ -f out/concept_int8_fixed.tflite ]; then
+            python tools/oes/dump_regions.py --model out/concept_int8_fixed.tflite \
+              --calib-dir calib --num 3 --out profile_fixed.json || echo "PROF-FIXED: exit=$?"
+          fi
+
+      - name: Regression (quant vs float, all variants)
         run: |
           set -euo pipefail
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
@@ -110,6 +120,8 @@ jobs:
             report_dyn.json
             report_legacy.json
             report_fixed.json
+            profile_float.json
+            profile_fixed.json
             SHA256SUMS
             work/graph_dump.txt
             work/concept_float_sd.try*.log
