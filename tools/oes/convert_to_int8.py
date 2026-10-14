@@ -945,6 +945,20 @@ def main():
         import traceback
         traceback.print_exc()
         print('TRANSPLANT SKIPPED: %s' % e, flush=True)
+    try:
+        import repair_bias as rb
+        import sys as _sys
+        _sys.argv = ['repair_bias',
+                     '--dyn', os.path.join(args.outdir, 'concept_dyn.tflite'),
+                     '--fixed', os.path.join(args.outdir, 'concept_int8_fixed.tflite'),
+                     '--out', os.path.join(args.outdir, 'concept_int8_fixed2.tflite')]
+        rb.main()
+    except SystemExit as e:
+        print('REBIAS exit=%s' % e, flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print('REBIAS SKIPPED: %s' % e, flush=True)
 
 
 if __name__ == '__main__':
