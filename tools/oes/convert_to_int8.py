@@ -70,27 +70,51 @@ def stage_smoke(onnx_path):
 
 
 def diagnose_zero_channel(onnx_path):
-    """打印导致 [*,*,*,0] 的上游节点链（纯诊断，不改图）。"""
+    """打印导致 [*,*,*,0] 的上游节点链 + Slice 参数（纯诊断，不改图）。"""
     import onnx
-    m = onnx.load(onnx_path)
+    from onnx import shape_inference
+    try:
+        inferred = shape_inference.infer_shapes_path(onnx_path) \
+            if hasattr(shape_inference, 'infer_shapes_path') else None
+        m = onnx.load(onnx_path)
+    except Exception as e:
+        print('shape inference failed: %s' % e, flush=True)
+        m = onnx.load(onnx_path)
     out2node = {}
     for n in m.graph.node:
         for o in n.output:
             out2node[o] = n
+    consts = {}
+    for init in m.graph.initializer:
+        consts[init.name] = list(init.dims)
     for n in m.graph.node:
         if 'convolution_4' in n.name and n.op_type in ('Conv',):
             print('suspect node: %s op=%s inputs=%s' % (
                 n.name, n.op_type, list(n.input)), flush=True)
-            for inp in n.input[1:2]:
+            for inp in n.input:
                 p = out2node.get(inp)
                 if p is not None:
                     print('  parent: %s op=%s inputs=%s' % (
                         p.name, p.op_type, list(p.input)), flush=True)
-                    for inp2 in p.input:
-                        p2 = out2node.get(inp2)
-                        if p2 is not None:
-                            print('    grandparent: %s op=%s' % (
-                                p2.name, p2.op_type), flush=True)
+                    if p.op_type == 'Slice':
+                        for a in p.attribute:
+                            import numpy as np
+                            vals = list(onnx.numpy_helper.to_array(a.t)) \
+                                if a.type == onnx.AttributeProto.TENSORS else \
+                                list(a.ints)
+                            print('    slice attr %s = %s' % (a.name, vals),
+                                  flush=True)
+                        for inp2 in p.input:
+                            if inp2 in consts:
+                                print('    slice input const %s dims=%s' % (
+                                    inp2, consts[inp2]), flush=True)
+                            p2 = out2node.get(inp2)
+                            if p2 is not None:
+                                print('    slice input node %s op=%s' % (
+                                    p2.name, p2.op_type), flush=True)
+                elif inp in consts:
+                    print('  const input %s dims=%s' % (inp, consts[inp]),
+                          flush=True)
 
 
 def stage_onnx_to_savedmodel(onnx_path, sm_dir):
@@ -146,7 +170,27 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     # 后备 B：换 onnx-tf 后端（与 onnx2tf 不同代码库），并做数值交叉验证
     try:
         print('trying onnx-tf backend ...', flush=True)
+        import types
+        import numpy as np
         import onnx
+        # OEC 同款 shim：onnx>=1.14 移除了 onnx.mapping，老后端（onnx-tf/rknn）
+        # 引用的符号需补回（见 OEC convert-concept.yml apply_mapping_shim）
+        if not hasattr(onnx, 'mapping'):
+            mt = types.SimpleNamespace()
+            mt.TENSOR_TYPE_TO_NP_TYPE = {
+                1: np.dtype('float32'), 2: np.dtype('uint8'),
+                3: np.dtype('int8'), 4: np.dtype('uint16'),
+                5: np.dtype('int16'), 6: np.dtype('int32'),
+                7: np.dtype('int64'), 9: np.dtype('bool'),
+                10: np.dtype('float16'), 11: np.dtype('float64'),
+                12: np.dtype('uint32'), 13: np.dtype('uint64'),
+                14: np.dtype('complex64'), 15: np.dtype('complex128'),
+            }
+            mt.NP_TYPE_TO_TENSOR_TYPE = {
+                v: k for k, v in mt.TENSOR_TYPE_TO_NP_TYPE.items()}
+            mt.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE = mt.TENSOR_TYPE_TO_NP_TYPE
+            onnx.mapping = mt
+            print('onnx.mapping shim injected', flush=True)
         from onnx_tf.backend import prepare
         m = onnx.load(onnx_path)
         rep = prepare(m)
