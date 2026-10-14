@@ -237,11 +237,11 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     repaired = os.path.join(os.path.dirname(onnx_path), 'concept_fix.onnx')
     graph_path = repair_reshape_minus_one(onnx_path, repaired)
     variants = [
+        ['-kt', 'inputs_0'],
+        ['-b', '1', '-kt', 'inputs_0'],
         ['-b', '1'],
         ['-ois', 'inputs_0:1,395,395,3'],
         ['-b', '1', '-ois', 'inputs_0:1,395,395,3'],
-        ['-kt', 'inputs_0'],
-        ['-b', '1', '-kt', 'inputs_0'],
     ]
     last_err = ''
     for i, extra in enumerate(variants):
@@ -249,9 +249,19 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
         r = subprocess.run(
             [sys.executable, '-m', 'onnx2tf', '-i', graph_path, '-o', trial,
              '--non_verbose'] + extra, capture_output=True, text=True)
-        if r.returncode == 0 and os.path.isdir(trial):
+        sm_pb = os.path.join(trial, 'saved_model.pb')
+        # onnx2tf 先落盘 SavedModel、再跑精度复核；复核在 numpy>=1.24 下会因
+        # np.load(pickle) 自爆而 exit!=0。只要 pb 已落盘，就用自有校验裁决。
+        if os.path.exists(sm_pb):
+            try:
+                _validate_savedmodel(trial, graph_path)
+            except Exception as e:
+                print('onnx2tf flags=%s SAVED BUT NUMERIC CHECK FAILED: %s' % (
+                    extra, e), flush=True)
+                continue
             os.rename(trial, sm_dir)
-            print('onnx2tf OK with flags=%s' % extra, flush=True)
+            print('onnx2tf OK with flags=%s (rc=%d, numerically validated)' % (
+                extra, r.returncode), flush=True)
             with open(sm_dir + '.flags.txt', 'w') as f:
                 f.write(' '.join(extra) + '\n')
             return
@@ -271,12 +281,20 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
             r = subprocess.run(
                 [sys.executable, '-m', 'onnx2tf', '-i', sim_path, '-o', sm_dir,
                  '--non_verbose', '-b', '1'], capture_output=True, text=True)
-            if r.returncode == 0 and os.path.isdir(sm_dir):
-                print('onnx2tf OK via onnxsim simplified graph', flush=True)
-                with open(sm_dir + '.flags.txt', 'w') as f:
-                    f.write('onnxsim+-b 1\n')
-                return
-            print('onnx2tf on simplified graph FAILED', flush=True)
+            if os.path.exists(os.path.join(sm_dir, 'saved_model.pb')):
+                try:
+                    _validate_savedmodel(sm_dir, sim_path)
+                except Exception as e:
+                    print('sim graph SAVED BUT NUMERIC CHECK FAILED: %s' % e,
+                          flush=True)
+                    import shutil
+                    shutil.rmtree(sm_dir, ignore_errors=True)
+                else:
+                    print('onnx2tf OK via onnxsim simplified graph', flush=True)
+                    with open(sm_dir + '.flags.txt', 'w') as f:
+                        f.write('onnxsim+-b 1\n')
+                    return
+                print('onnx2tf on simplified graph FAILED', flush=True)
         else:
             print('onnxsim simplify check failed', flush=True)
     except Exception as e:
