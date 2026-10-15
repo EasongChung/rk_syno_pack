@@ -1,0 +1,201 @@
+name: build-teflon
+
+# 交叉编译 Mesa Teflon → libteflon.so (aarch64 / glibc)
+# 目标设备：Amlogic A311D (G12B) + DSM 7.4.1-90080
+#
+# 本 workflow 不写任何仓库内容、不部署到设备，只产出构建产物。
+
+# ⚠️ 部署要求（DSM 7.4.1 实测结论）：
+#   1) 设备系统级**完全没有 libdrm**（find / -name 'libdrm*' 全空）
+#      → artifact 里的 libteflon.so 与 libdrm.so.2 **必须放同一目录**
+#   2) libteflon.so 带 RUNPATH=$ORIGIN，同目录即可自动找到 libdrm.so.2
+#   3) 设备 glibc = 2.36，产物的 glibc 符号版本不得高于 2.36
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_tag:
+        description: 'Mesa tag（需已 vendored TFLite 头，最低 24.1.0）'
+        required: false
+        default: 'mesa-24.3.0'
+  push:
+    # 仅当构建相关文件变更时触发，避免无关提交空跑
+    paths:
+      - '.github/workflows/build-teflon.yml'
+      - 'oes-teflon/build-recipe/build-teflon.sh'
+      - 'oes-teflon/verify/teflon_dlopen.c'
+    branches: [ main ]
+
+jobs:
+  build:
+    name: build libteflon.so (aarch64-glibc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 工具链选择：用 Ubuntu 官方 gcc-aarch64-linux-gnu，
+      # 不用 Linaro / ARM GNU toolchain。理由：
+      #  1) ubuntu-latest 自带，零额外下载，版本随 runner 稳定更新
+      #  2) 默认就是 glibc 目标；sysroot 由 apt 的 arm64 包自动填充到
+      #     /usr/aarch64-linux-gnu，不需要手工下载 .deb 拼 sysroot
+      #  3) 与 Ubuntu 的 meson/ninja 版本矩阵兼容性最好
+      # 若要换 Linaro，只需改本步 + 调整 PKG_CONFIG_PATH。
+      # ---------------------------------------------------------------
+      - name: Add arm64 architecture
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+
+      - name: Install cross toolchain and build deps
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            pkg-config \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross \
+            libdrm-dev:arm64 \
+            zlib1g-dev:arm64 \
+            python3 python3-pip \
+            python3-mako python3-yaml \
+            bison flex \
+            patchelf \
+            ca-certificates curl wget git binutils
+
+      # Mesa 的 etnaviv hwdb 生成器需要 pycparser >= 2.20
+      # （apt 无对应 arm64-independent 包名差异，直接用 pip 最稳）
+      - name: Install pycparser
+        run: python3 -m pip install --break-system-packages "pycparser>=2.20"
+
+      - name: Verify toolchain
+        run: |
+          set -eux
+          aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-gcc -dumpmachine
+          meson --version || pip install --break-system-packages meson && meson --version
+          ninja --version || pip install --break-system-packages ninja && ninja --version
+          python3 -c "import mako, yaml, pycparser; print('python deps OK')"
+
+      - name: Inspect cross sysroot
+        run: |
+          set -eu
+          SR="/usr/aarch64-linux-gnu"
+          echo "=== cross sysroot: $SR ==="
+          ls "$SR" 2>&1 | head
+          echo
+          # Ubuntu 上有两套布局，这里全部打印出来便于排查：
+          echo "=== A) cross 包 (libc6-dev-arm64-cross 等) ==="
+          ls "$SR/lib/pkgconfig" 2>&1 | head || echo "  (无)"
+          echo "=== B) foreign-arch 包 (libdrm-dev:arm64 等) ==="
+          ls /usr/lib/aarch64-linux-gnu/pkgconfig 2>&1 | head || echo "  (无)"
+          echo
+          echo "=== 依赖定位（用于诊断，不因缺失而中断构建）==="
+          export PKG_CONFIG_PATH="$SR/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig"
+          export PKG_CONFIG_SYSROOT_DIR="$SR"
+          for p in libdrm zlib; do
+            v=$(pkg-config --modversion "$p" 2>/dev/null || echo "NOT FOUND")
+            echo "  $p = $v"
+          done
+          echo
+          echo "=== 头文件位置 ==="
+          ls /usr/include/aarch64-linux-gnu/libdrm/ 2>/dev/null | head -3 || echo "  libdrm 头未找到"
+          ls "$SR/include/stdio.h" 2>/dev/null && echo "  libc 头 OK"
+          echo
+          echo "=== libdrm.so.2（需随包部署到设备）==="
+          ls -la /usr/lib/aarch64-linux-gnu/libdrm.so.2.* 2>/dev/null | head -2 \
+            || ls -la "$SR"/lib/libdrm.so.2* 2>/dev/null | head -2 \
+            || echo "  ERROR: 未找到 libdrm.so.2 —— DSM 无 libdrm，产物无法加载"
+
+      - name: Build libteflon.so
+        env:
+          MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-24.3.0' }}
+        run: |
+          set -eux
+          chmod +x oes-teflon/build-recipe/build-teflon.sh
+          # CI 默认路径：apt 提供的 cross sysroot（脚本内部 SYSROOT_MODE=apt）
+          ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build"
+
+      - name: Verify artifact
+        run: |
+          set -eux
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          test -f "$SO"
+          echo "=== ELF header ==="
+          readelf -h "$SO" | grep -E 'Class|Type|Machine'
+          echo "=== NEEDED（必须无 musl）==="
+          readelf -d "$SO" | grep NEEDED
+          ! readelf -d "$SO" | grep -q musl
+          echo "=== delegate ABI ==="
+          readelf -sW "$SO" | grep -E 'tflite_plugin_(create|destroy)_delegate'
+          echo "=== glibc symbol versions ==="
+          readelf -V "$SO" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tr '\n' ' '; echo
+          echo "=== NPU symbols ==="
+          readelf -sW "$SO" | grep -oE 'etna_ml_get_core_info|etna_gpu_get_core_info' | sort -u
+          echo "=== size ==="
+          ls -l "$SO"
+
+      # 交叉编译上机测试程序：设备（DSM）没有 gcc，
+      # 必须在 CI 里编好，宿主直接 scp 上去就能跑。
+      - name: Build device-side dlopen tester
+        run: |
+          set -eux
+          SR="/usr/aarch64-linux-gnu"
+          aarch64-linux-gnu-gcc -O2 --sysroot="$SR" \
+            -isystem "$SR/include" \
+            -B "$SR/lib/" -L "$SR/lib" \
+            -o "$RUNNER_TEMP/teflon_dlopen" \
+            oes-teflon/verify/teflon_dlopen.c -ldl
+          readelf -h "$RUNNER_TEMP/teflon_dlopen" | grep Machine
+
+      - name: Collect artifact
+        run: |
+          set -eux
+          OUT="$RUNNER_TEMP/teflon-build/out"
+          mkdir -p artifact
+          cp "$OUT/libteflon.so" artifact/
+          # DSM 7.4.1 实测系统级无任何 libdrm，必须随包部署。
+          # libteflon.so 带 RUNPATH=$ORIGIN，同目录即可自动解析。
+          [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
+            || { echo "ERROR: 缺少 libdrm.so.2，产物在 DSM 上无法 dlopen"; exit 1; }
+          cp "$RUNNER_TEMP/teflon_dlopen" artifact/
+          {
+            echo "mesa_tag=${MESA_TAG:-mesa-24.3.0}"
+            echo "target=aarch64 / glibc (sysroot: apt aarch64-linux-gnu)"
+            echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
+            echo "gcc=$(aarch64-linux-gnu-gcc --version | head -1)"
+            echo "meson=$(meson --version)"
+            echo "runner_image=ubuntu-latest"
+            echo "device=Synology DSM 7.4.1-90080 / glibc 2.36 / A311D NPU"
+            echo "deploy=libteflon.so + libdrm.so.2 必须放同一目录（RUNPATH=\$ORIGIN）"
+            echo "build_date=$(date -u +%FT%TZ)"
+          } > artifact/BUILD-INFO.txt
+          cat artifact/BUILD-INFO.txt
+          ( cd artifact && sha256sum libteflon.so libdrm.so.2 teflon_dlopen > SHA256SUMS )
+          cat artifact/SHA256SUMS
+
+      - name: Final sanity check
+        run: |
+          set -eux
+          # 设备侧 glibc 2.36 —— 产物的符号版本必须不高于它
+          MAXGLIBC=$(readelf -V artifact/libteflon.so | grep -oE 'GLIBC_2\.[0-9]+' \
+                     | sort -uV | tail -1)
+          echo "libteflon.so 最高 glibc 符号: $MAXGLIBC  (设备 2.36)"
+          MAXGLIBC_LIB=$(readelf -V artifact/libdrm.so.2 | grep -oE 'GLIBC_2\.[0-9]+' \
+                     | sort -uV | tail -1)
+          echo "libdrm.so.2 最高 glibc 符号: $MAXGLIBC_LIB  (设备 2.36)"
+          echo "=== 依赖清单（libdrm.so.2 须随包）==="
+          readelf -d artifact/libteflon.so | grep NEEDED
+          readelf -d artifact/libteflon.so | grep -E 'RUNPATH|RPATH'
+          ls -la artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libteflon-aarch64-glibc
+          path: artifact/
+          retention-days: 30
+          if-no-files-found: error
