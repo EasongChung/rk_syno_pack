@@ -12,14 +12,19 @@ import os
 import numpy as np
 
 
-def build_float(sm_dir, explicit_scalar):
+def build_float(sm_dir, mode):
     import tensorflow as tf
 
     class M(tf.Module):
         @tf.function(input_signature=[
             tf.TensorSpec([1, 4, 4, 2], tf.float32)])
         def __call__(self, x):
-            c = tf.constant(0.0, dtype=tf.float32) if explicit_scalar else 0.0
+            if mode == 'implicit':
+                c = 0.0
+            elif mode == 'explicit_zero':
+                c = tf.constant(0.0, dtype=tf.float32)
+            else:  # nonzero: forces 3-input Pad through the converter
+                c = tf.constant(1.5, dtype=tf.float32)
             return tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]],
                           constant_values=c)
 
@@ -103,15 +108,18 @@ def main():
     rep = {'variants': {}}
     rng = np.random.default_rng(3)
     x = (rng.random((1, 4, 4, 2)).astype(np.float32) * 2 - 1)
-    ref = tf.pad(tf.constant(x), [[0, 0], [1, 1], [1, 1], [0, 0]],
-                 constant_values=0.0).numpy()
-    for tag, explicit in (('implicit', False), ('explicit_scalar', True)):
+    for tag, mode in (('implicit', 'implicit'),
+                        ('explicit_zero', 'explicit_zero'),
+                        ('nonzero', 'nonzero')):
         work = 'minipad_' + tag
         os.makedirs(work, exist_ok=True)
         sm = os.path.join(work, 'sm')
         base = os.path.join(work, 'pad_int8.tflite')
-        build_float(sm, explicit)
+        build_float(sm, mode)
         quantize(sm, base)
+        cval = 1.5 if mode == 'nonzero' else 0.0
+        ref = tf.pad(tf.constant(x), [[0, 0], [1, 1], [1, 1], [0, 0]],
+                     constant_values=cval).numpy()
         rep['variants'][tag] = describe(base, x, ref)
     os.makedirs('minipad', exist_ok=True)
     json.dump(rep, open('minipad/minipad_report.json', 'w'), indent=2)
