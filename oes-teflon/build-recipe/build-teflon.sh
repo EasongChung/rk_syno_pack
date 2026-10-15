@@ -61,7 +61,13 @@ echo "=============================================="
 #                       填到 /usr/aarch64-linux-gnu，无需手工下载
 #   SYSROOT_MODE=deb    （musl 宿主）从 Debian 池下载 .deb 自行拼 sysroot
 # ---------------------------------------------------------------- #
-SR_MODE="${SYSROOT_MODE:-apt}"
+# 默认用 deb 模式（从 Debian 池装 glibc 2.31 sysroot），而不是 apt 的
+# aarch64 交叉包。原因：Ubuntu 24.04 的 libc6-dev-arm64-cross 是 glibc 2.39，
+# 而设备只有 2.36；glibc ≥2.38 的 stdlib.h 会把 strtol/strtoll 重定向到
+# __isoc23_*（GLIBC_2.38 版本节点），设备 2.36 无此符号 → dlopen 必失败。
+# deb 模式 sysroot 固定在 2.31，产物最高 GLIBC_2.29，安全。
+# 若确实要用 apt sysroot，需显式 SYSROOT_MODE=apt，并自行确认版本 ≤ 2.36。
+SR_MODE="${SYSROOT_MODE:-deb}"
 mkdir -p "$BUILD_DIR/sysroot"
 
 if [ "$SR_MODE" = "apt" ]; then
@@ -203,6 +209,12 @@ rm -rf "$BUILD_DIR/_x"
 # 会退化为 "Package zlib was not found" 并在链接期报 cannot find -lz。
 export PKG_CONFIG_SYSROOT_DIR="$SR"
 export PKG_CONFIG_PATH="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+# PKG_CONFIG_LIBDIR 会**替换**默认搜索路径，比 PKG_CONFIG_PATH 更严格。
+# 交叉编译时必须用它：否则若 runner 上装了 libdrm-dev:arm64 /
+# zlib1g-dev:arm64（Ubuntu 24.04 的 glibc 2.39），pkg-config 会优先命中
+# /usr/lib/aarch64-linux-gnu/pkgconfig 里的 .pc，导致链接到 2.39 的库，
+# 产物就会带上设备（glibc 2.36）不存在的符号。
+export PKG_CONFIG_LIBDIR="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig"
 for pc in libdrm zlib; do
 	f="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig/$pc.pc"
 	[ -f "$f" ] && sed -i "s#^prefix=/usr#prefix=$SR/usr#" "$f"
