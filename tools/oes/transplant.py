@@ -162,7 +162,10 @@ def patch_quant(quant_path, out_path, qidx, ranges):
     def tensor(ti):
         return g.Tensors(ti)
 
-    # 1) t133 单字节 128 -> zp(127)，读回校验
+    # 1) t133 单字节 128 -> zp(127) + scale 修正常态。
+    #    字节修的是反量化值（恰为真值 0.0）；scale 必须同步修——量化 Pad 核
+    #    在 setup 期用该 scale 算定点乘数，1e36 会使其溢出/跳过，
+    #    输出保持全零（实测 141 全零字节）。取与 Pad I/O 一致的 scale。
     t = tensor(qidx['t133'])
     b = model.Buffers(t.Buffer())
     doff = vec_data(b._tab, 4)
@@ -173,6 +176,7 @@ def patch_quant(quant_path, out_path, qidx, ranges):
           flush=True)
 
     # 2) t140/141/142 scale/zp 移植
+    new_sc = {}
     for key, ti in (('t140', qidx['t140']), ('t141', qidx['t141']),
                     ('t142', qidx['t142'])):
         lo, hi = ranges[key]
@@ -208,6 +212,21 @@ def patch_quant(quant_path, out_path, qidx, ranges):
             assert struct.unpack_from('<i', raw, zoff)[0] == zp
         print('patched %s scale %.6g->%.6g zp->%d (range [%.6g,%.6g])' % (
             key, old_sc, sc, zp, lo, hi), flush=True)
+        new_sc[key] = sc
+
+    # 3) t133 scale 同步为 Pad I/O scale（核 setup 数学需要正常量级）。
+    #    值已是 zp（反量化恒 0），scale 取 t141 移植值。
+    t = tensor(qidx['t133'])
+    q = t.Quantization()
+    old_sc = q.Scale(0)
+    assert old_sc >= DEGEN, old_sc
+    soff = vec_data(q._tab, 8)
+    assert struct.unpack_from('<f', raw, soff)[0] == old_sc
+    struct.pack_into('<f', raw, soff, float(new_sc['t141']))
+    assert struct.unpack_from('<f', raw, soff)[0] == \
+        np.float32(new_sc['t141'])
+    print('patched t133 scale %.6g->%.6g (value stays zp=exact 0.0)' % (
+        old_sc, new_sc['t141']), flush=True)
 
     open(out_path, 'wb').write(raw)
     # 重解析全验证
