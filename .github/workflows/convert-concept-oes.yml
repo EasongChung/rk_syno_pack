@@ -72,6 +72,13 @@ jobs:
             --eval-dir eval --frontend-num 50
           ls -la out/
 
+      - name: ORT QDQ pre-quantization (bypass MLIR PTQ)
+        run: |
+          set -euo pipefail
+          python tools/oes/ort_quant.py --calib-dir calib --num-calib 300 \
+            --eval-dir eval --eval-num 50 --workdir work --outdir out \
+            || echo "ORTQ: exit=$?"
+
       - name: Tensor profiles (float vs fixed, divergence hunt)
         run: |
           set -euo pipefail
@@ -117,11 +124,15 @@ jobs:
             python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
               --quant out/concept_oiqt.tflite --eval-dir eval --topk 1,5 --out report_oiqt.json || echo "OIQT GATE: exit=$?"
           fi
+          if [ -f out/concept_ortq.tflite ]; then
+            python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+              --quant out/concept_ortq.tflite --eval-dir eval --topk 1,5 --out report_ortq.json || echo "ORTQ GATE: exit=$?"
+          fi
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
             --quant out/concept_mixed.tflite --eval-dir eval --topk 1,5 --out report_mixed.json || echo "MIXED GATE: exit=$?"
           sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite out/concept_dyn.tflite \
             tools/oes/models/model_float16.tflite report.json report_floatio.json report_dyn.json | tee SHA256SUMS
-          for f in out/concept_legacy.tflite out/concept_int8_fixed.tflite out/concept_int8_fixed2.tflite out/concept_mixed.tflite out/concept_nodepad.tflite out/concept_oiqt.tflite report_legacy.json report_fixed.json report_fixed2.json report_mixed.json report_nodepad.json report_oiqt.json; do
+          for f in out/concept_legacy.tflite out/concept_int8_fixed.tflite out/concept_int8_fixed2.tflite out/concept_mixed.tflite out/concept_nodepad.tflite out/concept_oiqt.tflite out/concept_ortq.tflite report_legacy.json report_fixed.json report_fixed2.json report_mixed.json report_nodepad.json report_oiqt.json report_ortq.json; do
             [ -f "$f" ] && sha256sum "$f" | tee -a SHA256SUMS || true
           done
           echo "=== report.json ==="; cat report.json | head -30
@@ -142,6 +153,7 @@ jobs:
             out/concept_int8_fixed2.tflite
             out/concept_nodepad.tflite
             out/concept_oiqt.tflite
+            out/concept_ortq.tflite
             out/concept_mixed.tflite
             out/compare.json
             report.json
@@ -153,6 +165,7 @@ jobs:
             report_mixed.json
             report_nodepad.json
             report_oiqt.json
+            report_ortq.json
             profile_float.json
             profile_fixed.json
             profile_dyn.json
