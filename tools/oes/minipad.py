@@ -14,10 +14,15 @@ import numpy as np
 
 def build_float(sm_dir):
     import tensorflow as tf
-    inp = tf.keras.Input(shape=(4, 4, 2), batch_size=1, dtype=tf.float32)
-    out = tf.pad(inp, [[0, 0], [1, 1], [1, 1], [0, 0]], constant_values=0.0)
-    model = tf.keras.Model(inp, out)
-    tf.saved_model.save(model, sm_dir)
+
+    class M(tf.Module):
+        @tf.function(input_signature=[
+            tf.TensorSpec([1, 4, 4, 2], tf.float32)])
+        def __call__(self, x):
+            return tf.pad(x, [[0, 0], [1, 1], [1, 1], [0, 0]],
+                          constant_values=0.0)
+
+    tf.saved_model.save(M(), sm_dir)
     return sm_dir
 
 

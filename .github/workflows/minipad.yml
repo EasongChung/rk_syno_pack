@@ -1,0 +1,45 @@
+name: Mini Pad kernel experiment (OES)
+
+# 独立轻量任务：隔离量化 PadV2 在退化 scale 下的行为（2~3 分钟出结果，
+# 不必等主转换管线）。只装 TF + tflite 解析包。
+# 背景：concept INT8 的 Pad 三元组（scalar 1e36 退化）疑致 Pad 核输出全零。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/minipad.py
+      - .github/workflows/minipad.yml
+
+jobs:
+  minipad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "tensorflow-cpu==2.15.1" "protobuf==4.25.4"
+          pip install --quiet tflite
+
+      - name: Run mini Pad experiment
+        run: |
+          set -euo pipefail
+          python tools/oes/minipad.py || echo "MINIPAD: exit=$?"
+
+      - name: Upload minipad report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minipad-oes
+          path: minipad/minipad_report.json
+          if-no-files-found: warn
