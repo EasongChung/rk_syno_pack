@@ -59,6 +59,11 @@ jobs:
             --out calibration_image_sample_data_20x128x128x3_float32.npy
           ls -la *.npy
 
+      - name: Mini Pad kernel experiment (degenerate scales)
+        run: |
+          set -euo pipefail
+          python tools/oes/minipad.py || echo "MINIPAD: exit=$?"
+
       - name: Convert TFLite -> ONNX -> INT8 (NHWC kept)
         run: |
           set -euo pipefail
@@ -138,4 +143,5 @@ jobs:
             SHA256SUMS
             work/graph_dump.txt
             work/concept_float_sd.try*.log
+            minipad/minipad_report.json
           if-no-files-found: warn
