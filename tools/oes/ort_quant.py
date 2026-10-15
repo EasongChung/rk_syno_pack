@@ -61,10 +61,14 @@ class Reader:
         return len(self.data)
 
 
-def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib):
-    from onnxruntime.quantization import (QuantFormat, QuantType,
-                                          quantize_static)
+def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib,
+                    calib_method='minmax'):
+    from onnxruntime.quantization import (CalibrationMethod, QuantFormat,
+                                          QuantType, quantize_static)
     import onnxruntime as ort
+    method = {'minmax': CalibrationMethod.MinMax,
+              'entropy': CalibrationMethod.Entropy,
+              'percentile': CalibrationMethod.Percentile}[calib_method]
     sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     iname = sess.get_inputs()[0].name
     del sess
@@ -78,9 +82,10 @@ def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib):
         per_channel=True,
         reduce_range=False,
         nodes_to_exclude=[],
+        calibrate_method=method,
     )
     assert os.path.exists(qdq_path), 'ort quant produced nothing'
-    print('ORT QDQ OK -> %s' % qdq_path, flush=True)
+    print('ORT QDQ OK [%s] -> %s' % (calib_method, qdq_path), flush=True)
 
 
 def stage_validate_qdq(ref_onnx, qdq_onnx, eval_dir, num):
@@ -156,17 +161,23 @@ def main():
     ap.add_argument('--eval-num', type=int, default=50)
     ap.add_argument('--workdir', default='work')
     ap.add_argument('--outdir', default='out')
+    ap.add_argument('--calib-method', default='minmax',
+                    choices=['minmax', 'entropy', 'percentile'])
+    ap.add_argument('--tag', default='',
+                    help="产物后缀：''=concept_ortq.tflite；'pre'=concept_ortq_pre.tflite 等")
     args = ap.parse_args()
     onnx_path = args.onnx or open(args.graph_file).read().strip()
     assert os.path.exists(onnx_path), onnx_path
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
-    qdq_path = os.path.join(args.workdir, 'concept_ort_qdq.onnx')
-    stage_ort_quant(onnx_path, qdq_path, args.calib_dir, args.num_calib)
+    suf = ('_' + args.tag) if args.tag else ''
+    qdq_path = os.path.join(args.workdir, 'concept_ort_qdq%s.onnx' % suf)
+    tflite_name = 'concept_ortq%s.tflite' % suf
+    stage_ort_quant(onnx_path, qdq_path, args.calib_dir, args.num_calib,
+                    args.calib_method)
     stage_validate_qdq(onnx_path, qdq_path, args.eval_dir, args.eval_num)
-    stage_qdq_to_tflite(qdq_path,
-                        os.path.join(args.outdir, 'concept_ortq.tflite'))
-    print('ORTQ DONE', flush=True)
+    stage_qdq_to_tflite(qdq_path, os.path.join(args.outdir, tflite_name))
+    print('ORTQ DONE [%s]' % (args.tag or 'default'), flush=True)
 
 
 if __name__ == '__main__':
