@@ -770,6 +770,38 @@ def stage_quant_legacy(sm_dir, out_path, calib_dir, num_calib):
     return out_path
 
 
+def stage_quant_mixed(sm_dir, out_path, calib_dir, num_calib):
+    """混合量化：INT8 为主，个别算子允许回落 float。
+
+    背景：全整型在 Pad 标量退化上传染整网；混合模式让转换器把
+    不宜量化的算子留在 float（CPU 核跑），其余仍走 INT8。
+    若门限通过，即为可交付 v1（后台识别任务对延迟不敏感），
+    并用 diagnose_quant_model 公布回落算子清单。
+    """
+    import tensorflow as tf
+    conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = representative_dataset(
+        calib_dir, num_calib, False)
+    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+                                      tf.lite.OpsSet.TFLITE_BUILTINS]
+    conv.inference_input_type = tf.uint8
+    conv.inference_output_type = tf.uint8
+    model = conv.convert()
+    with open(out_path, 'wb') as f:
+        f.write(model)
+    print('WROTE %s %d bytes (mixed int8+float fallback)' % (
+        out_path, len(model)), flush=True)
+    interp = make_interpreter(out_path, invoke=False)
+    ide = interp['input']
+    ode = interp['output']
+    print('mixed model in shape=%s dtype=%s / out shape=%s dtype=%s' % (
+        ide['shape'], ide['dtype'], ode['shape'], ode['dtype']), flush=True)
+    assert list(ide['shape']) == [1, 395, 395, 3], 'input must stay NHWC'
+    assert list(ode['shape']) == [1, 335], 'output must be 335'
+    diagnose_quant_model(out_path)
+
+
 def stage_quant_dynamic(sm_dir, out_path):
     """诊断用：动态范围量化（仅权重量化，激活保持 float）。
 
@@ -929,6 +961,8 @@ def main():
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
                 args.calib_dir, args.num_calib, float_io=True)
     stage_quant_dynamic(sm_dir, os.path.join(args.outdir, 'concept_dyn.tflite'))
+    stage_quant_mixed(sm_dir, os.path.join(args.outdir, 'concept_mixed.tflite'),
+                      args.calib_dir, args.num_calib)
     leg = stage_quant_legacy(sm_dir, os.path.join(args.outdir, 'concept_legacy.tflite'),
                              args.calib_dir, args.num_calib)
     print('CONVERT DONE legacy=%s' % leg, flush=True)
@@ -959,6 +993,7 @@ def main():
         import traceback
         traceback.print_exc()
         print('REBIAS SKIPPED: %s' % e, flush=True)
+    print('CONVERT DONE', flush=True)
 
 
 if __name__ == '__main__':
