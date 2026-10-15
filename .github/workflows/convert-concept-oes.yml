@@ -126,7 +126,7 @@ jobs:
           fi
           if [ -f out/concept_ortq.tflite ]; then
             python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
-              --quant out/concept_ortq.tflite --eval-dir eval --topk 1,5 --out report_ortq.json || echo "ORTQ GATE: exit=$?"
+              --quant out/concept_ortq.tflite --eval-dir eval --topk 1,5 --out report_ortq.json --require-int8 || echo "ORTQ GATE: exit=$?"
           fi
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
             --quant out/concept_mixed.tflite --eval-dir eval --topk 1,5 --out report_mixed.json || echo "MIXED GATE: exit=$?"

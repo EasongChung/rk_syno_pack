@@ -71,6 +71,34 @@ def topk(v, k):
     return sorted(range(len(v)), key=lambda i: -v[i])[:k]
 
 
+def assert_int8(path):
+    """断言模型确为 INT8 量化（HOST-VERDICT §1 教训：-oiqt 曾产出 float 冒充过门）。
+
+    条件：输入 dtype 为 uint8/int8，且带量化参数的张量数 > 0。
+    不满足则 sys.exit(4)（区别于门限未命中的 exit 3）。
+    """
+    import sys
+    import numpy as np
+    import tflite
+    raw = open(path, 'rb').read()
+    model = tflite.Model.GetRootAsModel(raw, 0)
+    g = model.Subgraphs(0)
+    tin = g.Tensors(g.Inputs(0))
+    in_ok = tin.Type() in (3, 9)  # UINT8 / INT8
+    nq = 0
+    for i in range(g.TensorsLength()):
+        q = g.Tensors(i).Quantization()
+        if q is not None and q.ScaleLength() > 0:
+            nq += 1
+    print('int8-guard: %s in_type=%d quantized_tensors=%d' % (
+        path, tin.Type(), nq), flush=True)
+    if not in_ok or nq == 0:
+        print('NOT-INT8: %s is NOT a quantized model '
+              '(in_type=%d, quantized=%d). Refusing to score it as INT8.' % (
+                  path, tin.Type(), nq), flush=True)
+        sys.exit(4)
+
+
 def main():
     import numpy as np
     ap = argparse.ArgumentParser()
@@ -79,7 +107,12 @@ def main():
     ap.add_argument('--eval-dir', required=True)
     ap.add_argument('--topk', default='1,5')
     ap.add_argument('--out', default='report.json')
+    ap.add_argument('--require-int8', action='store_true',
+                    help='quant 侧必须是真 INT8（输入 uint8/int8 且量化张量数>0），'
+                         '否则 exit 4。防 float 模型冒充 INT8 过绿门。')
     args = ap.parse_args()
+    if args.require_int8:
+        assert_int8(args.quant)
     ks = [int(x) for x in args.topk.split(',')]
     files = sorted(glob.glob(os.path.join(args.eval_dir, '*')))
     files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
@@ -136,4 +169,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main() 

@@ -44,14 +44,21 @@ class Reader:
             arr = np.frombuffer(img.tobytes(), dtype=np.uint8).astype(np.float32)
             arr = ((arr - MEAN) * SCALE).reshape(1, NET, NET, 3)
             self.data.append({input_name: arr})
+        self.i = 0
         print('ort calib: %d images for %s' % (len(self.data), input_name),
               flush=True)
 
     def get_next(self):
-        for d in self.data:
-            yield d
-        # onnxruntime 新版要求 get_next() 返回 None 结束
-        return None
+        # 注意：必须直接返回 dict/None，不能 yield（否则变成 generator 函数，
+        # onnxruntime 内部对返回值调 .keys() 会 AttributeError）。
+        if self.i >= len(self.data):
+            return None
+        d = self.data[self.i]
+        self.i += 1
+        return d
+
+    def __len__(self):
+        return len(self.data)
 
 
 def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib):
@@ -122,7 +129,20 @@ def stage_qdq_to_tflite(qdq_path, out_path):
     outs = gb.glob(os.path.join(out_path + '.qd', '*.tflite'))
     assert outs, 'qdq->tflite produced nothing'
     import shutil
-    shutil.copy(outs[0], out_path)
+    # 防 -oiqt 式假阳性：落盘前先验确为量化模型（量化张量数>0 且输入为整型）
+    cand = sorted(outs, key=os.path.getsize, reverse=True)[0]
+    import tflite
+    _m = tflite.Model.GetRootAsModel(open(cand, 'rb').read(), 0)
+    _g = _m.Subgraphs(0)
+    _nq = sum(1 for _i in range(_g.TensorsLength())
+              if (_q := _g.Tensors(_i).Quantization()) is not None
+              and _q.ScaleLength() > 0)
+    _tin = _g.Tensors(_g.Inputs(0))
+    print('qdq-tflite check: %s in_type=%d quantized=%d' % (
+        cand, _tin.Type(), _nq), flush=True)
+    assert _nq > 0 and _tin.Type() in (3, 9), \
+        'qdq->tflite is NOT quantized (float false positive)!'
+    shutil.copy(cand, out_path)
     print('WROTE %s (ort-qdq via onnx2tf)' % out_path, flush=True)
 
 

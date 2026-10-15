@@ -806,29 +806,11 @@ def stage_quant_mixed(sm_dir, out_path, calib_dir, num_calib):
 
 
 def stage_quant_oiqt(onnx_path, out_path, calib_dir):
-    """onnx2tf 直出 INT8（-oiqt）：换一条量化器，绕开 TFLiteConverter MLIR PTQ。
-
-    背景：MLIR PTQ 在本图上系统性崩坏（原因未完全定位；退化标量仅为冰山一角，
-    transplant+rebias+depad 后仍红）。-oiqt 让 onnx2tf 在转换期直接做 INT8，
-    若门限通过即为可交付候选。校准依赖 onnx2tf 内置机制（测试图种子已预置）。
-    """
-    import subprocess
-    import sys
-    r = subprocess.run(
-        [sys.executable,
-         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      'run_onnx2tf.py'),
-         '-i', onnx_path, '-o', out_path + '.oiqt', '--non_verbose',
-         '-kt', 'inputs_0', '-oiqt'],
-        capture_output=True, text=True)
-    print(r.stdout[-1500:], flush=True)
-    print(r.stderr[-1500:], file=sys.stderr, flush=True)
-    import glob
-    outs = glob.glob(os.path.join(out_path + '.oiqt', '*.tflite'))
-    assert outs, 'oiqt produced no tflite'
-    import shutil
-    shutil.copy(outs[0], out_path)
-    print('WROTE %s (oiqt)' % out_path, flush=True)
+    """已判死（HOST-VERDICT §1）：onnx2tf 1.29.24 的 -oiqt 在此依赖组合下
+    直接产出 FLOAT 模型（316 F32 + 114 F16，0/450 量化），cos=1.0 系 float
+    自比较假阳性。保留函数体作罢，防止后人重蹈；调用方直接跳过。"""
+    print('OIQT SKIP: route dead per HOST-VERDICT §1 (emits float)', flush=True)
+    return None
 
 
 def stage_quant_dynamic(sm_dir, out_path):
