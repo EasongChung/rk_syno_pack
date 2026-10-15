@@ -1,0 +1,91 @@
+name: QDQ divergence localization (OES)
+
+# 独立轻任务：只回答“发散从哪一层开始”。不跑 PTQ 变体，不跑回归。
+# 链路：tf2onnx -> ONNX 修理 -> ORT QDQ（断言必崩，留文件）-> diverge 比对。
+# 前置结论：Split 改写无罪（PRE 对照双份复制 cos=0.0000）。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/diverge.py
+      - tools/oes/ort_quant.py
+      - .github/workflows/diverge.yml
+
+jobs:
+  diverge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
+          pip install --quiet onnxsim
+          python -c "import tensorflow as tf; print('tf', tf.__version__)"
+          python -c "import onnxruntime as ort; print('ort', ort.__version__)"
+
+      - name: Fingerprint input model
+        run: |
+          set -euo pipefail
+          test "$(stat -c%s tools/oes/models/model_float16.tflite)" = "12094724"
+
+      - name: Fetch photo sets
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
+          python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 200 --min-ok 50
+
+      - name: Preseed onnx2tf check images
+        run: |
+          set -euo pipefail
+          python tools/oes/make_seed_npy.py --calib-dir calib \
+            --out calibration_image_sample_data_20x128x128x3_float32.npy
+
+      - name: Convert to repaired ONNX (skip quant)
+        run: |
+          set -euo pipefail
+          python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
+            --workdir work --outdir out --calib-dir calib --num-calib 300 \
+            --eval-dir eval --frontend-num 50 --skip-quant
+          ls -la work/
+
+      - name: ORT QDQ (expected to fail validation, keep file)
+        run: |
+          set -euo pipefail
+          python tools/oes/ort_quant.py --calib-dir calib --num-calib 300 \
+            --eval-dir eval --eval-num 50 --workdir work --outdir out \
+            || echo "ORTQ: exit=$? (file kept for diverge)"
+          ls -la work/*.onnx
+
+      - name: First-divergence localization
+        run: |
+          set -euo pipefail
+          REF=work/concept_split.onnx
+          [ -f "$REF" ] || REF=work/concept_mid.onnx
+          ls -la work/*.onnx
+          python tools/oes/diverge.py --ref "$REF" \
+            --quant work/concept_ort_qdq.onnx --eval-dir eval --num 10 \
+            --out diverge.json || echo "DIVERGE: exit=$?"
+
+      - name: Upload divergence report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diverge-oes
+          path: |
+            diverge.json
+            work/concept_split.onnx
+            work/concept_ort_qdq.onnx
+          if-no-files-found: warn

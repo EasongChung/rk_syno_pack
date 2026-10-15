@@ -953,6 +953,8 @@ def main():
     ap.add_argument('--eval-dir', default='eval')
     ap.add_argument('--frontend-num', type=int, default=50)
     ap.add_argument('--skip-frontend-check', action='store_true')
+    ap.add_argument('--skip-quant', action='store_true',
+                    help='只跑到 SavedModel 为止（供 diverge 等只需 ONNX 的流程）')
     args = ap.parse_args()
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
@@ -967,6 +969,9 @@ def main():
         if not ok:
             raise SystemExit(3)
     stage_onnx_to_savedmodel(onnx_path, sm_dir)
+    if args.skip_quant:
+        print('SKIP-QUANT: stop after SavedModel (graph_path kept)', flush=True)
+        return
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8.tflite'),
                 args.calib_dir, args.num_calib, float_io=False)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
