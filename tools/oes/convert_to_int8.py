@@ -993,6 +993,19 @@ def main():
         import traceback
         traceback.print_exc()
         print('REBIAS SKIPPED: %s' % e, flush=True)
+    try:
+        import depad as dp
+        import sys as _sys2
+        _sys2.argv = ['depad',
+                      '--model', os.path.join(args.outdir, 'concept_int8_fixed2.tflite'),
+                      '--out', os.path.join(args.outdir, 'concept_nodepad.tflite')]
+        dp.main()
+    except SystemExit as e:
+        print('DEPAD exit=%s' % e, flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print('DEPAD SKIPPED: %s' % e, flush=True)
     print('CONVERT DONE', flush=True)
 
 

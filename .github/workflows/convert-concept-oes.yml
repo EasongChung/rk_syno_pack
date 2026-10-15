@@ -83,6 +83,10 @@ jobs:
           fi
           python tools/oes/dump_regions.py --model out/concept_dyn.tflite \
             --calib-dir calib --num 3 --out profile_dyn.json --float-input --preserve || echo "PROF-DYN: exit=$?"
+          if [ -f out/concept_int8_fixed2.tflite ]; then
+            python tools/oes/dump_regions.py --model out/concept_int8_fixed2.tflite \
+              --calib-dir calib --num 3 --out profile_fixed2.json --preserve || echo "PROF-FIXED2: exit=$?"
+          fi
 
       - name: Regression (quant vs float, all variants)
         run: |
@@ -105,11 +109,15 @@ jobs:
             python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
               --quant out/concept_int8_fixed2.tflite --eval-dir eval --topk 1,5 --out report_fixed2.json || echo "FIXED2 GATE: exit=$?"
           fi
+          if [ -f out/concept_nodepad.tflite ]; then
+            python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
+              --quant out/concept_nodepad.tflite --eval-dir eval --topk 1,5 --out report_nodepad.json || echo "NODEPAD GATE: exit=$?"
+          fi
           python tools/oes/regress.py --ref tools/oes/models/model_float16.tflite \
             --quant out/concept_mixed.tflite --eval-dir eval --topk 1,5 --out report_mixed.json || echo "MIXED GATE: exit=$?"
           sha256sum out/concept_int8.tflite out/concept_int8_floatio.tflite out/concept_dyn.tflite \
             tools/oes/models/model_float16.tflite report.json report_floatio.json report_dyn.json | tee SHA256SUMS
-          for f in out/concept_legacy.tflite out/concept_int8_fixed.tflite out/concept_int8_fixed2.tflite out/concept_mixed.tflite report_legacy.json report_fixed.json report_fixed2.json report_mixed.json; do
+          for f in out/concept_legacy.tflite out/concept_int8_fixed.tflite out/concept_int8_fixed2.tflite out/concept_mixed.tflite out/concept_nodepad.tflite report_legacy.json report_fixed.json report_fixed2.json report_mixed.json report_nodepad.json; do
             [ -f "$f" ] && sha256sum "$f" | tee -a SHA256SUMS || true
           done
           echo "=== report.json ==="; cat report.json | head -30
@@ -128,6 +136,7 @@ jobs:
             out/concept_legacy.tflite
             out/concept_int8_fixed.tflite
             out/concept_int8_fixed2.tflite
+            out/concept_nodepad.tflite
             out/concept_mixed.tflite
             out/compare.json
             report.json
@@ -137,9 +146,11 @@ jobs:
             report_fixed.json
             report_fixed2.json
             report_mixed.json
+            report_nodepad.json
             profile_float.json
             profile_fixed.json
             profile_dyn.json
+            profile_fixed2.json
             SHA256SUMS
             work/graph_dump.txt
             work/concept_float_sd.try*.log
