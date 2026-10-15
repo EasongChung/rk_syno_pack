@@ -571,6 +571,9 @@ def stage_onnx_to_savedmodel(onnx_path, sm_dir):
     graph_path = repair_reshape_minus_one(onnx_path, repaired)
     split_path = os.path.join(os.path.dirname(onnx_path), 'concept_split.onnx')
     graph_path = rewrite_slice_to_split(graph_path, split_path)
+    with open(os.path.join(os.path.dirname(onnx_path),
+                           'graph_path.txt'), 'w') as f:
+        f.write(graph_path + '\n')
     variants = [
         ['-kt', 'inputs_0', '-osd'],
         ['-b', '1', '-kt', 'inputs_0', '-osd'],
@@ -802,6 +805,32 @@ def stage_quant_mixed(sm_dir, out_path, calib_dir, num_calib):
     diagnose_quant_model(out_path)
 
 
+def stage_quant_oiqt(onnx_path, out_path, calib_dir):
+    """onnx2tf 直出 INT8（-oiqt）：换一条量化器，绕开 TFLiteConverter MLIR PTQ。
+
+    背景：MLIR PTQ 在本图上系统性崩坏（原因未完全定位；退化标量仅为冰山一角，
+    transplant+rebias+depad 后仍红）。-oiqt 让 onnx2tf 在转换期直接做 INT8，
+    若门限通过即为可交付候选。校准依赖 onnx2tf 内置机制（测试图种子已预置）。
+    """
+    import subprocess
+    import sys
+    r = subprocess.run(
+        [sys.executable,
+         os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      'run_onnx2tf.py'),
+         '-i', onnx_path, '-o', out_path + '.oiqt', '--non_verbose',
+         '-kt', 'inputs_0', '-oiqt'],
+        capture_output=True, text=True)
+    print(r.stdout[-1500:], flush=True)
+    print(r.stderr[-1500:], file=sys.stderr, flush=True)
+    import glob
+    outs = glob.glob(os.path.join(out_path + '.oiqt', '*.tflite'))
+    assert outs, 'oiqt produced no tflite'
+    import shutil
+    shutil.copy(outs[0], out_path)
+    print('WROTE %s (oiqt)' % out_path, flush=True)
+
+
 def stage_quant_dynamic(sm_dir, out_path):
     """诊断用：动态范围量化（仅权重量化，激活保持 float）。
 
@@ -961,6 +990,14 @@ def main():
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
                 args.calib_dir, args.num_calib, float_io=True)
     stage_quant_dynamic(sm_dir, os.path.join(args.outdir, 'concept_dyn.tflite'))
+    try:
+        gp = open(os.path.join(args.workdir, 'graph_path.txt')).read().strip()
+        stage_quant_oiqt(gp, os.path.join(args.outdir, 'concept_oiqt.tflite'),
+                         args.calib_dir)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print('OIQT SKIPPED: %s' % e, flush=True)
     stage_quant_mixed(sm_dir, os.path.join(args.outdir, 'concept_mixed.tflite'),
                       args.calib_dir, args.num_calib)
     leg = stage_quant_legacy(sm_dir, os.path.join(args.outdir, 'concept_legacy.tflite'),
