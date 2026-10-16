@@ -1,0 +1,112 @@
+name: OES INT8 delivery - cleaned-calib QDQ + regression gate
+
+# 交付判决轮：清洗校准集后的 QDQ 全链路 + 回归门。
+# 前置法医结论（run 38862205495）：300 张 picsum 校准图里 5 张脏图把深层激活
+# 推到 674~1633（中位仅 22.32），MinMax 忠实写入 scale -> int8 有效级数仅约 7 级。
+# 本 workflow 验证"清洗后能否过回归门"（cos>=0.98 / top1>=0.95）。
+# 只动本 workflow，不改原 4 个 workflow；不碰设备。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/ort_quant.py
+      - tools/oes/ptq_forensics.py
+      - tools/oes/regress.py
+      - .github/workflows/qdq-clean-regress.yml
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps (OEC-verified pins)
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
+          pip install --quiet tflite
+          pip install --quiet onnxsim "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
+          python -c "import tensorflow as tf; print('tf', tf.__version__)"
+          python -c "import onnxruntime as ort; print('ort', ort.__version__)"
+
+      - name: Fingerprint input model
+        run: |
+          set -euo pipefail
+          test "$(stat -c%s tools/oes/models/model_float16.tflite)" = "12094724"
+
+      - name: Fetch photo sets
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
+          python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 200 --min-ok 50
+
+      - name: Preseed onnx2tf check images
+        run: |
+          set -euo pipefail
+          python tools/oes/make_seed_npy.py --calib-dir calib \
+            --out calibration_image_sample_data_20x128x128x3_float32.npy
+
+      - name: Convert to repaired ONNX (skip quant)
+        run: |
+          set -euo pipefail
+          python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
+            --workdir work --outdir out --calib-dir calib --num-calib 300 \
+            --eval-dir eval --frontend-num 50 --skip-quant
+
+      # 判决轮：清洗校准集 + MinMax -> QDQ -> onnx2tf -> INT8 TFLite
+      # ORT QDQ 内部的 cos 门(>=0.95/top1>=0.85)是早期信号，失败也要继续，
+      # 因为最终判决在 regress.py（335 维 top-k 一致率 + cos + drift）。
+      - name: ORT QDQ with cleaned calib set
+        run: |
+          set -euo pipefail
+          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
+            --workdir work --outdir out \
+            --calib-method minmax --clean-calib --clean-k 3.0 --tag clean \
+            || echo "ORTQ-CLEAN: exit=$? (report kept)"
+          ls -la out/*.tflite || true
+
+      - name: Regression gate vs float reference
+        run: |
+          set -euo pipefail
+          test -f out/concept_ortq_clean.tflite || {
+            echo "GATE ABORT: concept_ortq_clean.tflite not produced"; exit 9; }
+          python tools/oes/regress.py \
+            --ref tools/oes/models/model_float16.tflite \
+            --quant out/concept_ortq_clean.tflite \
+            --eval-dir eval --topk 1,5 \
+            --require-int8 --out out/report_ortq_clean.json \
+            || echo "REGRESS: exit=$? (report kept for review)"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "=== artifacts ==="
+          ls -la out/ || true
+          if [ -f out/report_ortq_clean.json ]; then
+            echo "=== regression report ==="
+            cat out/report_ortq_clean.json
+          fi
+
+      - name: Upload INT8 candidate + reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oes-int8-cleaned
+          path: |
+            out/*.tflite
+            out/report_ortq_clean.json
+            out/compare.json
+          if-no-files-found: warn

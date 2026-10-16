@@ -68,7 +68,7 @@ class ListReader:
         self.i = 0
 
     @staticmethod
-    def _load(path, size):
+    def _load(path):
         from PIL import Image
         from ort_quant import MEAN, NET, SCALE
         img = Image.open(path).convert('RGB').resize(
@@ -81,7 +81,7 @@ class ListReader:
         # 必须直接返回 dict/None，不能 yield（ORT 内部对返回值调 .keys()）。
         if self.i >= len(self.files):
             return None
-        d = {self.input_name: self._load(self.files[self.i], self.size)}
+        d = {self.input_name: self._load(self.files[self.i])}
         self.i += 1
         return d
 
@@ -96,6 +96,9 @@ def build_submodel(float_onnx, points, out_path):
     """切子模型（一次多输出），返回图输入名。"""
     import onnx
     from onnx import utils as onnx_utils
+    d = os.path.dirname(out_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     inp = onnx.load(float_onnx).graph.input[0].name
     try:
         onnx_utils.extract_model(float_onnx, out_path, [inp], points)
@@ -127,7 +130,10 @@ def stage1_per_image(float_onnx, files, workdir):
         outs = sess.run(MONITOR, {real_in: x})
         pm = {p: float(np.abs(o).max()) for p, o in zip(MONITOR, outs)}
         per.append({'file': os.path.basename(f),
-                    'mag': max(pm.values()), 'per_point': pm})
+                    'mag': max(pm.values()), 'per_point': pm,
+                    # 判决键的单图幅度：用于算"清洗后该张量真实 max"，
+                    # 避免报告体积膨胀（全 per_point x 300 太大）
+                    'pk': pm[VERDICT_KEY]})
 
     agg = {}
     for p in MONITOR:
@@ -146,7 +152,8 @@ def stage1_per_image(float_onnx, files, workdir):
         'mag_max': float(mag.max()),
         'per_point': agg,
         # 完整逐图记录（清洗需要全量，不能只留 top-N）
-        'per_file': [{'file': per[i]['file'], 'mag': float(mag[i])}
+        'per_file': [{'file': per[i]['file'], 'mag': float(mag[i]),
+                      'pk': per[i]['pk']}
                      for i in range(len(per))],
         'top_outliers': [{'file': per[i]['file'], 'mag': float(mag[i]),
                           'dominant': max(per[i]['per_point'],
@@ -159,6 +166,7 @@ def quantize(float_onnx, out_onnx, files, method):
     from onnxruntime.quantization import (CalibrationMethod, QuantFormat,
                                           QuantType, quantize_static)
     m = {'minmax': CalibrationMethod.MinMax,
+         'percentile': CalibrationMethod.Percentile,
          'entropy': CalibrationMethod.Entropy}[method]
     import onnx
     iname = onnx.load(float_onnx).graph.input[0].name
@@ -212,24 +220,48 @@ def report_stage(tag, scales, per_point=None):
     return rows
 
 
-def verdict(per_stats, scales_minmax):
-    """判决 H1 / H2 / H3。全部依据 float 侧实测与 ORT 校准结果的比值。"""
-    real = per_stats['per_point'].get(VERDICT_KEY, {}).get('max')
+def verdict(per_stats, scales_minmax, outlier_k=OUTLIER_K):
+    """判决 H1 / H2 / H3。
+
+    关键：分母用 per_point 的 **median**，不能用 max。
+    用 max 时 MinMax 的 covered_hi 必然等于 max（校准器忠实反映数据的
+    真实极值），ratio 恒为 1.00x，会把"离群图撑爆"误判成"无异常"。
+    median 才是"典型幅度"，与 covered_hi 之比才有判别力。
+    """
+    real = per_stats['per_point'].get(VERDICT_KEY, {}).get('median')
+    p90 = per_stats['per_point'].get(VERDICT_KEY, {}).get('p90')
     cov = scales_minmax.get(VERDICT_KEY, {}).get('covered_hi')
     if not real or not cov:
         return {'key': VERDICT_KEY, 'verdict': 'INCONCLUSIVE（监控点缺失）'}
     ratio = cov / real
-    if ratio < 2.0:
-        v = ('H3 环境差异：ORT 校准与真实幅度自洽（ratio=%.2fx），'
-             '此前的 46x 在本环境不可复现' % ratio)
-    elif real > 100.0:
-        v = ('H1 校准集含离群图：float 侧实测 max=%.1f 已可复现，'
-             '指名图像见 top_outliers' % real)
+    # 主判据：covered_hi 相对"剔除离群后该张量真实 max"的倍数。
+    # 为什么不用 median/p90：两者都依赖离群占比这个前提（median 在离群
+    # 占比高时失真，p90 在离群占比 ~2% 时才正常），本地 17 张样本里离群占
+    # 35% 时 p90 判据就误判成 H3。而清洗后的 max 是自洽的：
+    #   干净数据 -> 清洗后 max == covered_hi -> ratio=1 -> H3
+    #   脏数据   -> ratio 就是清洗能挽回的分辨率倍数 -> H1
+    thresh = per_stats['mag_median'] * outlier_k
+    clean_pk = [r['pk'] for r in per_stats['per_file'] if r['mag'] <= thresh]
+    clean_max = max(clean_pk) if clean_pk else real
+    ratio_clean = cov / clean_max if clean_max else float('nan')
+    # 每 int8 级对应的真实幅度：covered_hi / 255（zp=-128 时 255 个码）
+    step = cov / 255.0
+    levels = real / step if step > 0 else float('nan')
+    if not (ratio_clean == ratio_clean) or ratio_clean < 3.0:
+        v = ('H3 校准与真实幅度自洽（covered_hi=%.1f vs 清洗后 max=%.1f，'
+             'ratio=%.2fx），每 int8 级步长 %.4f，中位信号占 %.1f 级 '
+             '—— 无离群撑爆' % (cov, clean_max, ratio_clean, step, levels))
     else:
-        v = ('H2 量化器在本图上失效：float 侧正常（max=%.1f），'
-             '但 ORT 校准给出 covered_hi=%.1f（ratio=%.1fx）' % (real, cov, ratio))
-    return {'key': VERDICT_KEY, 'real_max': real, 'covered_hi': cov,
-            'ratio': ratio, 'verdict': v}
+        n_out = sum(1 for r in per_stats['per_file'] if r['mag'] > thresh)
+        v = ('H1 校准集被离群图撑爆：covered_hi=%.1f 是清洗后真实 max=%.1f 的 '
+             '%.1f 倍（median=%.1f）；int8 步长 %.4f 只剩 %.1f 级有效分辨率；'
+             '按 %.1fx median 阈值剔除 %d/%d 张即可恢复' % (
+                 cov, clean_max, ratio_clean, real, step, levels, outlier_k,
+                 n_out, per_stats['n_images']))
+    return {'key': VERDICT_KEY, 'real_median': real, 'real_p90': p90,
+            'covered_hi': cov, 'ratio': ratio, 'ratio_clean': ratio_clean,
+            'clean_max': clean_max, 'int8_step': step,
+            'effective_levels': levels, 'verdict': v}
 
 
 def load_report(path):
@@ -324,12 +356,27 @@ def main():
                                'n_kept': len(keep), 'scales': s_clean}
         save_report(report_path, rep)
 
-    # ---- 判决（任一阶段跑完即可给结论） ----
+    # ---- 判决：第1段定H1/H3；第3段跑完追加"清洗是否够"的对比 ----
     per = rep.get('stage1_per_image')
     s_mm = rep.get('stage1_minmax')
     if per and s_mm:
-        rep['verdict'] = verdict(per, s_mm)
-        print('VERDICT %s' % rep['verdict']['verdict'], flush=True)
+        vd = verdict(per, s_mm, args.outlier_k)
+        cl = rep.get('stage3_clean')
+        if cl and cl.get('scales'):
+            s_cl = cl['scales'].get(VERDICT_KEY)
+            if s_cl:
+                med = per['per_point'][VERDICT_KEY]['median']
+                vd['clean_covered_hi'] = s_cl['covered_hi']
+                vd['clean_ratio'] = s_cl['covered_hi'] / med
+                vd['clean_effective_levels'] = \
+                    med / (s_cl['covered_hi'] / 255.0)
+                vd['verdict'] += (' | 清洗后 covered_hi=%.1f（较 median %.1f 为 '
+                                  '%.2fx，分辨率 %.1f 级）' % (
+                                      s_cl['covered_hi'], med,
+                                      vd['clean_ratio'],
+                                      vd['clean_effective_levels']))
+        rep['verdict'] = vd
+        print('VERDICT %s' % vd['verdict'], flush=True)
         save_report(report_path, rep)
 
 
