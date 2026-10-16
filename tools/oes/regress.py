@@ -42,10 +42,17 @@ def load_interp(path):
         tin = int(g.Tensors(g.Inputs(0)).Type())
         if tin in (3, 9):                       # UINT8 / INT8
             import tensorflow as tf
-            it = tf.lite.Interpreter(model_path=path)
+            # 必须禁用默认 delegate：XNNPACK 对该模型的 prepare 会失败
+            # （CI run 38909737996 实测 "failed to create XNNPACK
+            #  runtimeNode number 202 ... failed to prepare"），
+            # 导致 Interpreter 构造整体失败。
+            it = tf.lite.Interpreter(
+                model_path=path,
+                experimental_op_resolver_type=tf.lite.experimental
+                .OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
             it.allocate_tensors()
-            print('load_interp: int8-IO model (type=%d), plain Interpreter'
-                  % tin, flush=True)
+            print('load_interp: int8-IO model (type=%d), '
+                  'no-delegate Interpreter' % tin, flush=True)
             return it
     except Exception as e:
         print('load_interp probe failed (%s); falling back' % str(e)[:90],
