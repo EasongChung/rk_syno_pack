@@ -73,7 +73,8 @@ jobs:
           python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
             --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
             --workdir work --outdir out \
-            --calib-method minmax --clean-calib --clean-k 3.0 --tag clean \
+            --calib-method minmax --clean-calib --clean-k 3.0 \
+            --exclude-head 6 --tag clean \
             || echo "ORTQ-CLEAN: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
