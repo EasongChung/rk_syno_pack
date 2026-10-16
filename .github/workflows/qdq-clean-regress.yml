@@ -30,10 +30,12 @@ jobs:
       - name: Install deps
         run: |
           set -euo pipefail
+          # 顺序有讲究：onnx2tf 与 onnx==1.16.1 单次安装会解析冲突，
+          # 故先装 onnx2tf 再回钉 onnx/ort（量化器对 ort 版本敏感）。
           pip install --quiet "numpy==1.26.4" pillow
-          pip install --quiet "onnx==1.16.1" \
-            "tensorflow-cpu==2.15.1" "onnx2tf==1.29.24" onnx-graphsurgeon tflite
-          pip install --quiet "onnxruntime==1.16.3"
+          pip install --quiet "tensorflow-cpu==2.15.1"
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon tflite
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3"
           pip install --quiet --no-deps "onnxruntime==1.16.3" "onnx==1.16.1"
       - name: Probe TFLite output routes
         run: |
