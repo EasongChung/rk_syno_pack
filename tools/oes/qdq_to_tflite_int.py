@@ -129,9 +129,32 @@ def main():
     ap.add_argument('--clean-k', type=float, default=3.0,
                     help='校准集离群剔除阈值（mag > k * median）')
     args = ap.parse_args()
+    print('=== STAGE0: args parsed, qdq=%s exists=%s ===' % (
+        args.qdq, os.path.exists(args.qdq)), flush=True)
+    _sys.stdout.flush()
+
+    # 注意：TF import 之前必须先打印，否则 import 失败时 CI 日志一片空白
+    # （上一轮就是这样：子进程 stdout 全空，无法判断死在哪一步）。
+    try:
+        import tensorflow as tf
+        print('=== STAGE1: tensorflow %s ===' % tf.__version__, flush=True)
+        _sys.stdout.flush()
+    except Exception as e:
+        print('=== STAGE1 FAILED: tensorflow import: %s: %s ===' % (
+            type(e).__name__, e), flush=True)
+        _sys.stdout.flush()
+        raise
 
     _patch_for_onnx2tf()
-    from onnx2tf import convert
+    try:
+        from onnx2tf import convert
+        print('=== STAGE2: onnx2tf imported ===', flush=True)
+        _sys.stdout.flush()
+    except Exception as e:
+        print('=== STAGE2 FAILED: onnx2tf import: %s: %s ===' % (
+            type(e).__name__, e), flush=True)
+        _sys.stdout.flush()
+        raise
 
     os.makedirs(args.workdir, exist_ok=True)
     odir = os.path.join(args.workdir, 'o2tf_int')
@@ -214,7 +237,7 @@ def main():
     else:
         print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
               'will likely fail', flush=True)
-    print('=== ROUTE-C STAGE MARK: calling onnx2tf.convert ===', flush=True)
+    print('=== STAGE4: calling onnx2tf.convert ===', flush=True)
     _sys.stdout.flush()
     print('calling onnx2tf.convert with: integer_quantized=%s quant_type=%s '
           'dtype=int8' % (True, args.quant_type), flush=True)
