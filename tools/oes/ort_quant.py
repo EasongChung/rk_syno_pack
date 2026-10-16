@@ -358,22 +358,30 @@ def main():
         # Route C：onnx2tf.convert(output_integer_quantized_tflite=True)。
         # 源码级依据：CLI 无量化参数，但 convert() 签名含该开关；不带它时
         # ops/QuantizeLinear.py 走 fake_quant -> TFLite 量化张量为 0（实测 0/337）。
-        r = subprocess.run(
-            [sys.executable,
-             os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          'qdq_to_tflite_int.py'),
-             '--qdq', qdq_path,
-             '--out', os.path.join(args.outdir, tflite_name),
-             '--workdir', args.workdir,
-             '--calib-dir', args.calib_dir,
-             '--calib-num', str(min(args.num_calib, 50)),
-             '--clean-k', str(args.clean_k)],
-            capture_output=True, text=True)
-        print('=== Route C child stdout (last 6000) ===', flush=True)
-        print(r.stdout[-6000:], flush=True)
+        log_path = os.path.join(args.workdir, 'route_c.log')
+        cmd = [sys.executable,
+               os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'qdq_to_tflite_int.py'),
+               '--qdq', qdq_path,
+               '--out', os.path.join(args.outdir, tflite_name),
+               '--workdir', args.workdir,
+               '--calib-dir', args.calib_dir,
+               '--calib-num', str(min(args.num_calib, 50)),
+               '--clean-k', str(args.clean_k)]
+        # 子进程输出直接重定向到文件并回显，避免 capture_output 在
+        # CI 上因缓冲/截断导致"看起来什么都没发生"。
+        with open(log_path, 'w', encoding='utf-8', errors='replace') as lf:
+            r = subprocess.run(cmd, stdout=lf,
+                               stderr=subprocess.STDOUT, text=True)
+        try:
+            with open(log_path, encoding='utf-8', errors='replace') as lf:
+                body = lf.read()
+        except OSError as e:
+            body = '(cannot read %s: %s)' % (log_path, e)
+        print('=== Route C log (%s, %d bytes) ===' % (log_path, len(body)),
+              flush=True)
+        print(body[-8000:], flush=True)
         if r.returncode:
-            print('--- Route C stderr (last 4000) ---', flush=True)
-            print(r.stderr[-4000:], flush=True)
             raise SystemExit('Route C failed (exit=%d)' % r.returncode)
     elif args.direct_tflite:
         # ORT 1.16/1.31 的 quantize_static 始终写 ONNX（model_output 的后缀
