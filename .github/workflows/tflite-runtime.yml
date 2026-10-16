@@ -1,0 +1,255 @@
+name: tflite-runtime
+
+# 交叉编译 TFLite 运行时 + 上机验证驱动（aarch64 / glibc）
+# 目标设备：Amlogic A311D (G12B) + DSM 7.4.1-90080（glibc 2.36）
+#
+# ## 为什么需要这个 workflow
+#
+# 我们已经验证过「delegate 能加载」（teflon_dlopen → EXIT=0），
+# 但那证明不了「delegate 能接管节点」。
+#
+# Mesa tfl_device.c 的 tflite_plugin_create_delegate()（L1687-1712）
+# 只做两件事：找设备、把 PrepareDelegate 挂到 delegate->base.Prepare。
+# 它从不调用 PrepareDelegate。
+#
+# PrepareDelegate 真正被回调是在 TFLite 解释器 AllocateTensors() 期间
+# （ReplaceNodeSubsetsWithDelegateKernels 那一步）。
+# 所以要看到逐节点接管表，必须有一个真正的 TFLite 解释器。
+#
+# ## 关键版本约束：TFLite 必须是 2.13.0
+#
+# libteflon.so 是 Mesa 24.3.0 按它 vendored 的 **TFLite 2.13.0** 头文件编译的。
+# delegate 通过 TfLiteContext 这个 C 结构体的**函数指针表**访问解释器，
+# 该表在 TFLite 大版本之间会变。若用 2.14+ 的运行时去加载
+# 2.13 头编译的 delegate，函数表布局不匹配 → 静默读到错误的函数指针。
+# 因此这里严格对齐 2.13.0，不接受 "用最新版"。
+#
+# ## sysroot 为什么用 Debian bullseye（glibc 2.31）
+#
+# 设备是 glibc 2.36。Ubuntu 24.04(noble) 的 arm64 交叉包是 glibc 2.39，
+# 而 glibc ≥2.38 在 stdlib.h 里做了
+#     #define strtol __isoc23_strtol      （版本节点 GLIBC_2.38）
+# 设备 2.36 没有这些符号 → 产物在设备上加载即失败。
+# bullseye 2.31 产出最高 GLIBC_2.34，安全低于设备 2.36。
+# 本 job 末尾有 glibc 符号天花板闸门强制校验。
+#
+# ## 与 build-teflon.yml 的关系
+#
+# 独立 workflow，不动主 workflow。
+# 理由：TFLite 编译吃内存较大（历史上 onnx2tf 在 runner 上 OOM 过），
+# 崩了不能连带把 libteflon.so 的产物也带走。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/tflite-runtime.yml'
+      - 'oes-teflon/build-recipe/make-sysroot-cxx.sh'
+      - 'oes-teflon/verify/tf_load_check.cpp'
+    branches: [ main ]
+
+jobs:
+  build:
+    name: build TFLite runtime + tf_load_check (aarch64-glibc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 全部 amd64 原生包；aarch64 sysroot 由 make-sysroot-cxx.sh
+      # 从 Debian 池自行组装，因此不执行 dpkg --add-architecture，
+      # 也就不会向 Ubuntu 源请求 arm64 索引。
+      - name: Install build deps
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            cmake ninja-build pkg-config \
+            python3 wget curl git patchelf binutils \
+            ca-certificates
+
+      - name: Verify toolchain
+        run: |
+          set -eux
+          aarch64-linux-gnu-gcc -dumpmachine
+          aarch64-linux-gnu-g++ -dumpmachine
+          cmake --version | head -1
+          ninja --version
+
+      - name: Build aarch64 C++ sysroot (Debian bullseye, glibc 2.31)
+        run: |
+          set -eux
+          chmod +x oes-teflon/build-recipe/make-sysroot-cxx.sh
+          sh oes-teflon/build-recipe/make-sysroot-cxx.sh "$RUNNER_TEMP/sysroot"
+          SR="$RUNNER_TEMP/sysroot"
+          # 交叉编译器自检：能编能链才继续
+          cat > "$RUNNER_TEMP/probe.cpp" <<'EOF'
+          #include <cstdio>
+          #include <vector>
+          #include <string>
+          int main(){ std::vector<std::string> v{"ok"}; std::printf("%s\n", v[0].c_str()); return 0; }
+          EOF
+          aarch64-linux-gnu-g++ --sysroot="$SR" \
+            -isystem "$SR/usr/include/c++/10" \
+            -isystem "$SR/usr/include/c++/10/aarch64-linux-gnu" \
+            -isystem "$SR/usr/include/aarch64-linux-gnu" \
+            -isystem "$SR/usr/include" \
+            -B "$SR/usr/lib/aarch64-linux-gnu/" \
+            -L "$SR/usr/lib/aarch64-linux-gnu" \
+            -static-libstdc++ -static-libgcc \
+            -o "$RUNNER_TEMP/probe" "$RUNNER_TEMP/probe.cpp"
+          file "$RUNNER_TEMP/probe"
+          readelf -h "$RUNNER_TEMP/probe" | grep Machine
+
+      - name: Fetch TFLite source (2.13.0 — must match Mesa 24.3.0 vendored headers)
+        run: |
+          set -eux
+          SRC="$RUNNER_TEMP/tfsrc"
+          mkdir -p "$SRC"
+          # 注意用 github.com 域（实测可达）；raw.githubusercontent.com 在部分网络不可达
+          wget -q -O "$RUNNER_TEMP/tf.tar.gz" \
+            "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.13.0.tar.gz"
+          tar xzf "$RUNNER_TEMP/tf.tar.gz" -C "$SRC" --strip-components=1
+          test -f "$SRC/tensorflow/lite/CMakeLists.txt"
+          echo "TFLite source ready: $(du -sh "$SRC" | cut -f1)"
+          # 打印版本，供日志留痕
+          grep -m1 -r "TFLITE_VERSION" "$SRC/tensorflow/lite/core/c/common.h" 2>/dev/null || true
+
+      - name: Build TFLite static lib (aarch64)
+        run: |
+          set -eux
+          SRC="$RUNNER_TEMP/tfsrc"
+          SR="$RUNNER_TEMP/sysroot"
+          BUILD="$RUNNER_TEMP/tfbuild"
+
+          cat > "$RUNNER_TEMP/tc.cmake" <<EOF
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
+          set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+          set(CMAKE_SYSROOT      "$SR")
+          set(CMAKE_FIND_ROOT_PATH "$SR")
+          # 交叉编译时不要去找宿主（amd64）的库
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          # TFLite 的 try_compile 会用到这些
+          set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR -isystem $SR/usr/include/c++/10 -isystem $SR/usr/include/c++/10/aarch64-linux-gnu -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR -isystem $SR/usr/include/c++/10 -isystem $SR/usr/include/c++/10/aarch64-linux-gnu -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          EOF
+
+          cmake -S "$SRC/tensorflow/lite" -B "$BUILD" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/tc.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DTFLITE_ENABLE_XNNPACK=OFF \
+            -DTFLITE_ENABLE_GPU=OFF \
+            -DTFLITE_ENABLE_RUY=OFF \
+            -DTFLITE_ENABLE_MMAP=OFF \
+            -DTFLITE_ENABLE_INSTALL=OFF \
+            -DTFLITE_ENABLE_DELEGATE_LIBRARY=OFF \
+            -DBUILD_TESTS=OFF \
+            -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fc"
+
+          cmake --build "$BUILD" --target tensorflow-lite -j"$(nproc)"
+
+          # 静态库位置因 CMake 版本而异，找出来即可
+          find "$BUILD" -name 'libtensorflow-lite.a' -print
+          LIB=$(find "$BUILD" -name 'libtensorflow-lite.a' | head -1)
+          test -n "$LIB"
+          echo "TFLITE_LIB=$LIB" >> "$GITHUB_ENV"
+          ls -la "$LIB"
+
+      - name: Build tf_load_check driver
+        run: |
+          set -eux
+          SRC="$RUNNER_TEMP/tfsrc"
+          SR="$RUNNER_TEMP/sysroot"
+          LIB="$TFLITE_LIB"
+          INC=""
+          for d in "$SRC" "$SRC/tensorflow/lite/tools/make/downloads" \
+                   "$SRC/tensorflow/lite/tools/make/downloads/absl" \
+                   "$SRC/tensorflow/lite/tools/make/downloads/flatbuffers" \
+                   "$SRC/tensorflow/lite/tools/make/downloads/ruy" \
+                   "$SRC/tensorflow/lite/tools/make/downloads/gemmlowp" \
+                   "$SRC/tensorflow/lite/tools/make/downloads/fft2d" ; do
+            [ -d "$d" ] && INC="$INC -I$d"
+          done
+
+          # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
+          aarch64-linux-gnu-g++ -O2 --sysroot="$SR" \
+            -isystem "$SR/usr/include/c++/10" \
+            -isystem "$SR/usr/include/c++/10/aarch64-linux-gnu" \
+            -isystem "$SR/usr/include/aarch64-linux-gnu" \
+            -isystem "$SR/usr/include" \
+            -B "$SR/usr/lib/aarch64-linux-gnu/" \
+            -L "$SR/usr/lib/aarch64-linux-gnu" \
+            -static-libstdc++ -static-libgcc \
+            $INC \
+            -o "$RUNNER_TEMP/tf_load_check" \
+            oes-teflon/verify/tf_load_check.cpp \
+            "$LIB" \
+            -lm -lpthread -ldl
+
+          readelf -h "$RUNNER_TEMP/tf_load_check" | grep Machine
+
+      # 关键安全闸：设备 glibc = 2.36，符号版本不得高于它。
+      # 这条专门拦截 __isoc23_*（GLIBC_2.38）这类「CI 能过但上机失败」的坑。
+      # TFLite 是 C++，最容易在这里踩到（libstdc++ / C++ 标准库符号）。
+      - name: Glibc symbol ceiling check (device = 2.36)
+        run: |
+          set -eu
+          CEIL=36
+          fail=0
+          for f in "$RUNNER_TEMP/tf_load_check"; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            max=$(readelf -V "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' \
+                  | sort -uV | tail -1 | cut -d. -f2)
+            echo "  $name: 最高 GLIBC_2.${max:-?}  (上限 2.$CEIL)"
+            if [ -n "$max" ] && [ "$max" -gt "$CEIL" ]; then
+              echo "  ERROR: $name 使用 GLIBC_2.$max > 设备 2.$CEIL，会在设备上加载失败"
+              fail=1
+            fi
+            if readelf -sW "$f" 2>/dev/null | grep -q "__isoc23"; then
+              echo "  ERROR: $name 引用了 __isoc23_*（需 GLIBC_2.38+），设备 2.36 无此符号"
+              fail=1
+            fi
+            echo "  NEEDED:"; readelf -d "$f" | grep NEEDED | sed 's/^/    /'
+          done
+          [ $fail -eq 0 ] || exit 1
+          echo "OK: 产物符号版本 ≤ 设备 glibc 2.36"
+
+      - name: Collect artifact
+        run: |
+          set -eux
+          mkdir -p artifact
+          cp "$RUNNER_TEMP/tf_load_check" artifact/
+          {
+            echo "tflite_version=2.13.0"
+            echo "tflite_abi_note=必须与 Mesa 24.3.0 vendored 头文件一致（TfLiteContext 函数表跨版本会变）"
+            echo "target=aarch64 / glibc 2.31 sysroot (Debian bullseye)"
+            echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
+            echo "gcc=$(aarch64-linux-gnu-gcc --version | head -1)"
+            echo "cmake=$(cmake --version | head -1)"
+            echo "runner=ubuntu-latest (amd64 packages only, no arm64 apt arch)"
+            echo "device=Synology DSM 7.4.1-90080 / glibc 2.36 / A311D NPU"
+            echo "usage=TEFLON_DEBUG=2 ./tf_load_check model.tflite   # 注意是 2 不是 1"
+            echo "build_date=$(date -u +%FT%TZ)"
+          } > artifact/BUILD-INFO.txt
+          cat artifact/BUILD-INFO.txt
+          ( cd artifact && sha256sum tf_load_check > SHA256SUMS )
+          cat artifact/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tflite-runtime-aarch64-glibc
+          path: artifact/
+          retention-days: 30
+          if-no-files-found: error
