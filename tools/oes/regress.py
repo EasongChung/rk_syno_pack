@@ -22,13 +22,38 @@ SCALE = 0.00784313725
 
 
 def load_interp(path):
+    """加载 TFLite 解释器，兼容全整数量化（int8 I/O）模型。
+
+    注意：不能用 convert_to_int8.make_interpreter 加载 int8 输入的模型
+    —— 它内部用 FLOAT32 试跑 set_tensor，对全整数量化模型会报
+    "Cannot set tensor: Got value of type FLOAT32 but expected type INT8"
+    （CI run 38908301589 实测），且它抛 RuntimeError 而非 ImportError，
+    原 fallback 因此不生效。故先探测输入 dtype，是整型就直接用
+    tf.lite.Interpreter（不做试跑）。
+    """
     import os
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
+        import tflite as _t
+        raw = open(path, 'rb').read()
+        mo = _t.Model.GetRootAsModel(raw, 0)
+        g = mo.Subgraphs(0)
+        tin = int(g.Tensors(g.Inputs(0)).Type())
+        if tin in (3, 9):                       # UINT8 / INT8
+            import tensorflow as tf
+            it = tf.lite.Interpreter(model_path=path)
+            it.allocate_tensors()
+            print('load_interp: int8-IO model (type=%d), plain Interpreter'
+                  % tin, flush=True)
+            return it
+    except Exception as e:
+        print('load_interp probe failed (%s); falling back' % str(e)[:90],
+              flush=True)
+    try:
         from convert_to_int8 import make_interpreter
         return make_interpreter(path)['interp']
-    except ImportError:
+    except Exception:
         import tensorflow as tf
         it = tf.lite.Interpreter(model_path=path)
         it.allocate_tensors()
