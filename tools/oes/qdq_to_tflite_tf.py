@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Route A：QDQ ONNX -> TFLite，不过 onnx2tf（och 止损线第 2 步）。
+
+## 为什么换路
+三条 onnx2tf 路线全部试完（CI runs 38891479973 / 38898318514 / 38899791397
+/ 38900946439），结论一致：`output_integer_quantized_tflite=True` 根本不
+产出 `_full_integer_quant.tflite`。CI 实测产物目录只有三个文件：
+
+    concept_ort_qdq_clean_float32.tflite            (24.1MB, 量化张量 0/336)
+    concept_ort_qdq_clean_float16.tflite
+    concept_ort_qdq_clean_dynamic_range_quant.tflite
+
+三次 flatbuffer_export 分别对应 float32 / float16 / dynamic_range，唯独
+没有全整数量化那一档 —— 它在 onnx2tf 自己的 INT8 校准阶段失败后被跳过。
+源码级原因：onnx2tf 把输入转成 NCHW (1,395,3,395)，其校准分支要求
+`model_input.shape[-1] in [3,4]`；用 keep_nwc_... 修正后不再报该错，
+但 INT8 导出仍然缺失（CI run 38900946439 实测）。
+
+## 本路线做法
+直接用 tf.lite.TFLiteConverter 消费 float ONNX + 我们已经验证达标的
+ORT 量化参数：
+  1. ORT QDQ 已产出 cos=0.9569 / top1=0.8800（清洗校准集 + exclude-head 6）
+  2. 用 TFLiteConverter.from_concrete_functions / from_saved_model 不适用，
+     故用 from_keras 或直接把 ONNX 权重灌进 tf.Module 再 converter.convert()
+  3. representative_dataset 用同一份清洗后校准集
+  4. target_spec = TFLITE_BUILTINS_INT8, inference_input/output_type = int8
+
+关键点：不试图"搬运"ORT 的 QDQ scale（那正是 onnx2tf 失败的地方），
+而是让 TFLiteConverter 用我们的清洗校准集**自己**做一次 INT8 校准。
+清洗是根因修复（covered_hi 812 -> 35），所以这里重算出的 scale 应当同样健康。
+
+用法：
+  python qdq_to_tflite_tf.py --float-onnx work/concept_split.onnx \
+      --calib-dir calib --calib-num 100 --out out/concept_int8_tf.tflite
+"""
+import argparse
+import glob
+import os
+import sys
+import sys as _sys
+
+import numpy as np
+
+TFL_NAME = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8', 4: 'INT64',
+            6: 'BOOL', 7: 'INT16', 9: 'INT8'}
+
+
+def build_calib_npy(calib_dir, num, out_dir, net=395):
+    """生成 (N,395,395,3) float32 校准张量。
+
+    预处理必须与服务端、与 ort_quant 逐位一致：
+    resize(395, BILINEAR) + (v-127.5)/127.5。
+    """
+    from PIL import Image
+    files = sorted(f for f in os.listdir(calib_dir)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png')))[:num]
+    assert files, 'calib dir empty: %s' % calib_dir
+    arr = np.zeros((len(files), net, net, 3), dtype=np.float32)
+    for i, f in enumerate(files):
+        img = Image.open(os.path.join(calib_dir, f)) \
+            .convert('RGB').resize((net, net), Image.BILINEAR)
+        v = np.frombuffer(img.tobytes(), dtype=np.uint8).astype(np.float32)
+        arr[i] = ((v - 127.5) * 0.00784313725).reshape(net, net, 3)
+    os.makedirs(out_dir, exist_ok=True)
+    p = os.path.join(out_dir, 'calib_tf_%d.npy' % len(files))
+    np.save(p, arr)
+    return p
+
+
+def report(cand, tag):
+    import collections
+    import tflite
+    raw = open(cand, 'rb').read()
+    mo = tflite.Model.GetRootAsModel(raw, 0)
+    g = mo.Subgraphs(0)
+    nt = g.TensorsLength()
+    nq = sum(1 for i in range(nt)
+             if (q := g.Tensors(i).Quantization()) is not None
+             and q.ScaleLength() > 0)
+    tin = g.Tensors(g.Inputs(0))
+    dt = collections.Counter(TFL_NAME.get(g.Tensors(i).Type(), '?')
+                             for i in range(nt))
+    codes = {}
+    for i in range(mo.OperatorCodesLength()):
+        oc = mo.OperatorCodes(i)
+        codes[i] = oc.BuiltinCode() if oc.BuiltinCode() < 127 \
+            else oc.DeprecatedBuiltinCode()
+    ops = collections.Counter()
+    for i in range(g.OperatorsLength()):
+        ops[codes.get(g.Operators(i).OpcodeIndex())] += 1
+    print('%s: in_type=%s quantized=%d/%d (%.1f%%) size=%d' % (
+        tag, TFL_NAME.get(tin.Type(), tin.Type()), nq, nt,
+        100.0 * nq / max(nt, 1), len(raw)))
+    print('  dtype: %s' % dict(sorted(dt.items())))
+    print('  ops:   %s' % dict(sorted(ops.items(), key=lambda kv: -kv[1])[:12]))
+    ok = nq > 0 and tin.Type() in (3, 9)
+    print('  -> %s' % ('INT8 OK' if ok else 'FLOAT (FAILED)'))
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--float-onnx', required=True,
+                    help='float ONNX（concept_split.onnx）。注意：TFLiteConverter '
+                         '不能直接吃 QDQ ONNX，故用 float 图 + 自建校准集。')
+    ap.add_argument('--calib-dir', required=True)
+    ap.add_argument('--calib-num', type=int, default=100)
+    ap.add_argument('--workdir', default='work')
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--input-name', default='inputs_0')
+    ap.add_argument('--int16', action='store_true')
+    args = ap.parse_args()
+
+    print('=== TA0: args parsed, onnx exists=%s ==='
+          % os.path.exists(args.float_onnx), flush=True)
+    _sys.stdout.flush()
+
+    try:
+        import tensorflow as tf
+        print('=== TA1: tensorflow %s ===' % tf.__version__, flush=True)
+        _sys.stdout.flush()
+    except Exception as e:
+        print('=== TA1 FAILED: %s ===' % e, flush=True)
+        raise
+
+    npy = build_calib_npy(args.calib_dir, args.calib_num,
+                         os.path.join(args.workdir, 'tf_calib'))
+    calib = np.load(npy)
+    print('=== TA2: calib %s shape=%s range=[%.3f,%.3f] ===' % (
+        npy, calib.shape, calib.min(), calib.max()), flush=True)
+    _sys.stdout.flush()
+
+    # --- ONNX -> tf.Module（保持 NHWC） ---
+    # 用 onnx2tf 只做"ONNX -> Keras/SavedModel"这一步仍会踩它的坑，
+    # 故这里改用最朴素可靠的方式：直接构造 tf.function 并调用 converter。
+    # 路径：onnxruntime 读 float 图的中间结果不可行（ORT 拒取中间名），
+    # 因此用 tf.lite.TFLiteConverter.from_concrete_functions 需要 concrete
+    # function —— 由 tf.Module + tf.function 包装 float ONNX 无法直接得到。
+    # 最终方案：用 onnx2tf 只产出 SavedModel（其已验证 cos=1.0 的强项），
+    # 再由 TFLiteConverter 做 INT8 量化。
+    print('=== TA3: producing SavedModel from float ONNX via onnx2tf ===',
+          flush=True)
+    _sys.stdout.flush()
+
+    import sys as _s2
+    _s2.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import numpy as _np
+    _orig = _np.load
+
+    def _pl(a, **k):
+        k.setdefault('allow_pickle', True)
+        return _orig(a, **k)
+
+    _np.load = _pl
+    try:
+        import importlib
+        _cf = importlib.import_module('onnx2tf.utils.common_functions')
+        if hasattr(_cf, 'download_test_image_data'):
+            _od = _cf.download_test_image_data
+
+            def _safe(*a, **k):
+                try:
+                    return _od(*a, **k)
+                except Exception:
+                    r = _np.random.default_rng(0)
+                    return (r.random((395, 395, 3)) * 255).astype(_np.uint8)
+
+            _cf.download_test_image_data = _safe
+    except Exception:
+        pass
+
+    from onnx2tf import convert
+    # onnx2tf 1.29.24 无 argparse 层（main() 直接调 convert），
+    # 故走 API 直调，参数用真实签名（已 AST 校验）。
+    sm_dir = os.path.join(args.workdir, 'sm_for_tf')
+    os.makedirs(sm_dir, exist_ok=True)
+    print('=== TA3a: onnx2tf.convert -> SavedModel (NHWC kept) ===',
+          flush=True)
+    _sys.stdout.flush()
+    try:
+        convert(input_onnx_file_path=args.float_onnx,
+                output_folder_path=sm_dir,
+                output_signaturedefs=False,
+                non_verbose=True,
+                not_use_onnxsim=False,
+                keep_nwc_or_nhwc_or_ndhwc_input_names=[args.input_name])
+    except BaseException as e:                                # noqa: BLE001
+        print('onnx2tf raised %s: %s' % (type(e).__name__, str(e)[:200]),
+              flush=True)
+        _sys.stdout.flush()
+
+    sm = os.path.join(sm_dir, 'float32')
+    if not os.path.isdir(sm):
+        print('no saved_model dir; listing: %s'
+              % (os.listdir(sm_dir) if os.path.isdir(sm_dir) else 'none'),
+              flush=True)
+        return 5
+
+    print('=== TA4: SavedModel ready, converting to INT8 TFLite ===',
+          flush=True)
+    _sys.stdout.flush()
+
+    def rep_gen():
+        for i in range(calib.shape[0]):
+            yield [calib[i:i + 1]]
+
+    conv = tf.lite.TFLiteConverter.from_saved_model(sm)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = rep_gen
+    if args.int16:
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT16]
+        conv.inference_input_type = tf.int16
+        conv.inference_output_type = tf.int16
+    else:
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        conv.inference_input_type = tf.int8
+        conv.inference_output_type = tf.int8
+
+    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
+    open(args.out, 'wb').write(conv.convert())
+    print('=== TA5: wrote %s (%d bytes) ===' % (
+        args.out, os.path.getsize(args.out)), flush=True)
+    ok = report(args.out, 'tf-converter')
+    return 0 if ok else 4
+
+
+if __name__ == '__main__':
+    sys.exit(main())

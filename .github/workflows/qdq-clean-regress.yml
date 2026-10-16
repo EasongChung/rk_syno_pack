@@ -130,10 +130,22 @@ jobs:
             --eval-dir eval --frontend-num 50 --skip-quant
 
       # 判决轮：清洗校准集 + MinMax -> 量化 -> INT8 TFLite。
-      # A 路：QDQ + onnx2tf（已知丢量化，保留作对照）
-      # C 路（主攻）：QDQ + onnx2tf.convert(output_integer_quantized_tflite=True)
-      #   源码级依据：CLI 无量化开关，但 convert() 签名含该开关；不带它时
-      #   ops/QuantizeLinear.py 走 fake_quant -> TFLite 量化张量 0/337。
+      # 主攻 Route T：绕过 onnx2tf 的 INT8 导出（三条 onnx2tf 路线已证
+      #   都不产出 _full_integer_quant.tflite，CI run 38900946439 实测），
+      #   直接用 tf.lite.TFLiteConverter 对 onnx2tf 的 SavedModel 产物做
+      #   INT8 量化（该步 cos=1.0 已验证）。
+      # 校准集用清洗后的同一批图（清洗是根因修复，covered_hi 812->35）。
+      - name: Route T - TFLiteConverter direct (och stop-loss step 2)
+        run: |
+          set -euo pipefail
+          python tools/oes/qdq_to_tflite_tf.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --calib-num 100 \
+            --workdir work --out out/concept_int8_tf.tflite \
+            --input-name inputs_0 \
+            || echo "ROUTE-T: exit=$? (report kept)"
+          ls -la out/*.tflite || true
+
       - name: Route C - QDQ to int8 TFLite via onnx2tf convert
         run: |
           set -euo pipefail
@@ -157,19 +169,9 @@ jobs:
             --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
             --workdir work --outdir out \
             --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --quant-format qdq --tag clean \
-            || echo "ROUTE-A: exit=$? (report kept)"
-          ls -la out/*.tflite || true
-
-      - name: Route B - QOperator via onnx2tf
-        run: |
-          set -euo pipefail
-          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
-            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
-            --workdir work --outdir out \
-            --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --quant-format qoperator --tag clean \
-            || echo "ROUTE-B: exit=$? (report kept)"
+            --exclude-head 6 --quant-format qdq --int8-tflite --tag clean \
+            --calib-dir calib \
+            || echo "ROUTE-C: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
       # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：

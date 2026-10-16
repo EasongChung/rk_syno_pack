@@ -143,29 +143,58 @@ def main():
             row['q_top5'] = [(i, round(qv[i], 3)) for i in topk(qv, 5)]
             fails.append(row)
     n = len(files)
+    # 双门限（2026-10-16 och 决策）：
+    #   通用门 = 既有约定（top1>=0.95 / top5>=0.99 / cos>=0.98 / drift<=0.03），
+    #             不因单次结果改动，是"能否交付"的最终依据。
+    #   场景门 = 针对 oes-eval（picsum 真实照片，图像多样性高）的实测上限，
+    #             用于区分"未达标"与"该场景下的合理上限"，供产品侧参考。
+    # 两套结论都输出，任何人都不需要再猜"用哪套"。
+    gate_general = {'top1': 0.95, 'top5': 0.99, 'cos_mean': 0.98,
+                    'drift': 0.03}
+    gate_scene = {'top1': 0.90, 'top5': 0.97, 'cos_mean': 0.93,
+                  'drift': 0.06}
     report = {
         'n': n, 'ref': args.ref, 'quant': args.quant,
         'agree': {('top%d' % k): round(agree[k] / n, 4) for k in ks},
         'cos_mean': round(float(np.mean(coss)), 4),
         'cos_p5': round(float(np.percentile(coss, 5)), 4),
         'drift_mean': round(float(np.mean(drifts)), 5),
-        'gate': {'top1': 0.95, 'top5': 0.99, 'cos_mean': 0.98, 'drift': 0.03},
+        'gate_general': gate_general,
+        'gate_scene': gate_scene,
         'fails': sorted(fails, key=lambda r: r['cos'])[:20],
     }
-    gate_hit = (report['agree'].get('top1', 0) >= 0.95
-                and report['agree'].get('top5', 0) >= 0.99
-                and report['cos_mean'] >= 0.98
-                and report['drift_mean'] <= 0.03)
-    report['gate_hit'] = bool(gate_hit)
+
+    def _hit(g):
+        return (report['agree'].get('top1', 0) >= g['top1']
+                and report['agree'].get('top5', 0) >= g['top5']
+                and report['cos_mean'] >= g['cos_mean']
+                and report['drift_mean'] <= g['drift'])
+
+    general_hit = _hit(gate_general)
+    scene_hit = _hit(gate_scene)
+    report['gate_hit_general'] = bool(general_hit)
+    report['gate_hit_scene'] = bool(scene_hit)
+    # 兼容旧字段：仍以通用门为准
+    report['gate_hit'] = bool(general_hit)
     json.dump(report, open(args.out, 'w'), indent=2)
     print(json.dumps(report, indent=2)[:3000], flush=True)
-    print('n=%d agree=%s cos_mean=%.4f drift=%.5f gate_hit=%s' % (
-        n, report['agree'], report['cos_mean'], report['drift_mean'],
-        gate_hit), flush=True)
-    if not gate_hit:
-        print('GATE MISS (report kept, exit 3)', flush=True)
+    print('n=%d agree=%s cos_mean=%.4f drift=%.5f' % (
+        n, report['agree'], report['cos_mean'], report['drift_mean']),
+        flush=True)
+    print('GATE-GENERAL %s  (top1>=0.95 top5>=0.99 cos>=0.98 drift<=0.03)'
+          % ('HIT' if general_hit else 'MISS'), flush=True)
+    print('GATE-SCENE   %s  (top1>=0.90 top5>=0.97 cos>=0.93 drift<=0.06)'
+          % ('HIT' if scene_hit else 'MISS'), flush=True)
+    if general_hit:
+        print('GATE HIT (general)', flush=True)
+        sys.exit(0)
+    if scene_hit:
+        print('GATE MISS on general, but HIT on scene line '
+              '(report kept, exit 3) -- 需产品侧裁决以哪套为准',
+              flush=True)
         sys.exit(3)
-    print('GATE HIT', flush=True)
+    print('GATE MISS on both lines (report kept, exit 3)', flush=True)
+    sys.exit(3)
 
 
 if __name__ == '__main__':
