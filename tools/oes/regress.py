@@ -95,9 +95,20 @@ def run_once(interp, image_bytes):
     interp.set_tensor(inp['index'], t)
     interp.invoke()
     v = interp.get_tensor(out['index']).flatten().astype(float)
-    q = out.get('quantization', (0.0, 0))
-    if isinstance(q, tuple) and q[0]:
-        v = (v - q[1]) * q[0]
+    # 反量化。不能用 isinstance(q, tuple) 判断：TF 各版本里
+    # details['quantization'] 可能是 tuple / list / ndarray，
+    # 判断失败会导致整型输出不被反量化，直接拿 int8 原始值(-128..127)
+    # 去和参考模型的 sigmoid 输出([0,1]) 比，cos 会低到 ~0.002
+    # （CI run 38913214531 实测）。故直接按下标解包。
+    q = out.get('quantization', None)
+    if q is not None:
+        try:
+            qsc = float(q[0])
+            qzp = float(q[1])
+            if qsc:
+                v = (v - qzp) * qsc
+        except (TypeError, IndexError, ValueError):
+            pass
     return v.tolist()
 
 
