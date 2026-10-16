@@ -214,6 +214,8 @@ def main():
     else:
         print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
               'will likely fail', flush=True)
+    print('=== ROUTE-C STAGE MARK: calling onnx2tf.convert ===', flush=True)
+    _sys.stdout.flush()
     print('calling onnx2tf.convert with: integer_quantized=%s quant_type=%s '
           'dtype=int8' % (True, args.quant_type), flush=True)
     try:
