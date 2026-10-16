@@ -46,17 +46,28 @@ jobs:
           python - <<'PY'
           import sys
           import numpy, onnx, onnxruntime, tensorflow, tf2onnx
-          want = {'numpy': '1.26.4', 'onnx': '1.16.1',
-                  'onnxruntime': '1.16.3', 'tensorflow': '2.15.1',
-                  'tf2onnx': '1.16.1'}
+          # onnxruntime 必须严格一致：量化器行为对版本敏感
+          # （1.16.3 vs 1.23.0 给出 cos 0.96 vs 0.60）。
+          # tensorflow 只影响 onnx2tf/TFLite 侧，tf-probability 会把它顶高，
+          # 属已知无害漂移，故仅告警。
+          strict = {'numpy': '1.26.4', 'onnx': '1.16.1',
+                    'onnxruntime': '1.16.3', 'tf2onnx': '1.16.1'}
+          soft = {'tensorflow': '2.15.1'}
           got = {'numpy': numpy.__version__, 'onnx': onnx.__version__,
                  'onnxruntime': onnxruntime.__version__,
                  'tensorflow': tensorflow.__version__,
                  'tf2onnx': tf2onnx.__version__}
-          bad = [k for k, v in want.items() if got[k] != v]
-          for k, v in want.items():
+          bad = []
+          for k, v in strict.items():
               print('%s %-14s want=%-8s got=%s' % (
                   'OK  ' if got[k] == v else 'DRIFT', k, v, got[k]))
+              if got[k] != v:
+                  bad.append(k)
+          for k, v in soft.items():
+              print('%s %-14s want=%-8s got=%s%s' % (
+                  'OK  ' if got[k] == v else 'WARN', k, v, got[k],
+                  '' if got[k] == v else '  (known: tf-probability bump;'
+                                        ' affects onnx2tf only, not QDQ)'))
           if bad:
               sys.exit('dependency drift: %s -- 本地/CI 结论不可比' % bad)
           import onnx2tf, tflite  # noqa
