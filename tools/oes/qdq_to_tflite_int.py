@@ -178,12 +178,14 @@ def main():
         npy = build_calib_npy(tmpdir, args.calib_num, args.calib_name,
                               out_dir=os.path.join(args.workdir,
                                                    'o2tf_calib'))
-        # 源码（onnx2tf 1.29.24 L1192-1198）：
-        #   custom_input_op_name_np_data_path : List[Sequence]
-        #   遍历每一项 param，要求 len(param) in (2, 4)
-        #   -> [[INPUT_NAME, NUMPY_PATH]] 或 [[NAME, PATH, MEAN, STD]]
-        # 不是 dict，也不是逗号串，更不是扁平 list。
-        kw['custom_input_op_name_np_data_path'] = [[args.calib_name, npy]]
+        # 源码实测：走 -oiqt 分支时必须给全 4 项，否则报
+        #   "If you want to use custom input with the '-oiqt' option,
+        #    {input_op_name}, {numpy_file_path}, {mean}, and {std}
+        #    must all be entered. However, you have only entered 2 options."
+        # 外层校验（L1192-1198）要求每项 len in (2,4)，故给 4 项。
+        # mean/std 用 0/1：npy 已是归一化后的 [-1,1]，不再二次归一化。
+        kw['custom_input_op_name_np_data_path'] = [[args.calib_name, npy,
+                                                  '0.0', '1.0']]
         print('calib npy: %s shape=%s (from %d cleaned images)' % (
             npy, np.load(npy).shape, len(os.listdir(tmpdir))), flush=True)
         print('cind arg: %s' % kw['custom_input_op_name_np_data_path'],
