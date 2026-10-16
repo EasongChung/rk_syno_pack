@@ -56,6 +56,29 @@ TFL_NAME = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8', 4: 'INT64',
             6: 'BOOL', 7: 'INT16', 9: 'INT8'}
 
 
+def build_calib_npy(calib_dir, num, name, out_dir=None, net=395):
+    """为 onnx2tf 的 INT8 校准生成 (N,395,395,3) float32 npy。
+
+    预处理必须与服务端、与 ort_quant 完全一致：resize(395,BILINEAR)
+    + (v-127.5)/127.5，否则 onnx2tf 校准出的 scale 与实际推理分布不符。
+    """
+    from PIL import Image
+    files = sorted(f for f in os.listdir(calib_dir)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png')))[:num]
+    assert files, 'calib dir empty: %s' % calib_dir
+    arr = np.zeros((len(files), net, net, 3), dtype=np.float32)
+    for i, f in enumerate(files):
+        img = Image.open(os.path.join(calib_dir, f)) \
+            .convert('RGB').resize((net, net), Image.BILINEAR)
+        v = np.frombuffer(img.tobytes(), dtype=np.uint8).astype(np.float32)
+        arr[i] = ((v - 127.5) * 0.00784313725).reshape(net, net, 3)
+    d = out_dir or os.path.join('work', 'o2tf_calib')
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, 'calib_%s.npy' % name)
+    np.save(p, arr)
+    return p
+
+
 def report(cand, tag):
     import collections
     import tflite
@@ -96,6 +119,14 @@ def main():
                     help='onnx2tf 的量化粒度（源码实测 choices 如此，'
                          '注意不是 tf dtype）')
     ap.add_argument('--keep-nchw', action='store_true')
+    ap.add_argument('--calib-dir', default='',
+                    help='INT8 校准图目录（onnx2tf 要求自带校准数据：'
+                         'custom_input_op_name_np_data_path）')
+    ap.add_argument('--calib-num', type=int, default=50)
+    ap.add_argument('--calib-name', default='inputs_0',
+                    help='校准 npy 对应的输入张量名')
+    ap.add_argument('--clean-k', type=float, default=3.0,
+                    help='校准集离群剔除阈值（mag > k * median）')
     args = ap.parse_args()
 
     _patch_for_onnx2tf()
@@ -120,6 +151,39 @@ def main():
         non_verbose=True,
         not_use_onnxsim=False,
     )
+    # onnx2tf 不信任 QDQ 图里已有的 scale：开 output_integer_quantized_tflite
+    # 后它会自己做一遍 INT8 校准，并强制要求提供校准数据，否则报
+    #   "For models that have multiple input OPs and need to perform INT8
+    #    quantization calibration ... specify the calibration data with
+    #    --quant_calib_input_op_name_np_data_path"
+    # 参数名（源码）：custom_input_op_name_np_data_path
+    # 数据格式：{输入张量名: (N,H,W,3) float32 npy}
+    if args.calib_dir:
+        # 关键：onnx2tf 会用这份数据重新校准。若喂未清洗的集（含把激活
+        # 推到 1633 的脏图），它会算回和 QDQ 图一样被撑爆的 scale，
+        # 白费清洗成果。故强制走 ort_quant.clean_calib_files。
+        import sys as _s
+        _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ort_quant as _oq
+        keep = _oq.clean_calib_files(args.qdq, args.calib_dir,
+                                     args.calib_num * 4, args.clean_k,
+                                     os.path.join(args.workdir, 'calib'))
+        tmpdir = os.path.join(args.workdir, 'calib_clean')
+        os.makedirs(tmpdir, exist_ok=True)
+        import shutil as _sh
+        for f in os.listdir(tmpdir):
+            _sh.rmtree(os.path.join(tmpdir, f), ignore_errors=True)
+        for f in keep[:args.calib_num]:
+            _sh.copy(f, os.path.join(tmpdir, os.path.basename(f)))
+        npy = build_calib_npy(tmpdir, args.calib_num, args.calib_name,
+                              out_dir=os.path.join(args.workdir,
+                                                   'o2tf_calib'))
+        kw['custom_input_op_name_np_data_path'] = {args.calib_name: npy}
+        print('calib npy: %s shape=%s (from %d cleaned images)' % (
+            npy, np.load(npy).shape, len(os.listdir(tmpdir))), flush=True)
+    else:
+        print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
+              'will likely fail', flush=True)
     print('calling onnx2tf.convert with: integer_quantized=%s quant_type=%s '
           'dtype=int8' % (True, args.quant_type), flush=True)
     try:

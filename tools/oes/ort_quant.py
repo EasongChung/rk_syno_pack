@@ -364,7 +364,10 @@ def main():
                           'qdq_to_tflite_int.py'),
              '--qdq', qdq_path,
              '--out', os.path.join(args.outdir, tflite_name),
-             '--workdir', args.workdir],
+             '--workdir', args.workdir,
+             '--calib-dir', args.calib_dir,
+             '--calib-num', str(min(args.num_calib, 50)),
+             '--clean-k', str(args.clean_k)],
             capture_output=True, text=True)
         print(r.stdout[-2000:], flush=True)
         if r.returncode:
