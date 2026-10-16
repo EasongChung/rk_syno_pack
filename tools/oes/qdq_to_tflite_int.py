@@ -188,6 +188,17 @@ def main():
         check_onnx_tf_outputs_elementwise_close_full=False,
         auto_generate_json=False,
         auto_generate_json_on_error=False,
+        # 保持输入为 NHWC（shape (1,395,395,3)）。
+        # 理由（CI run 38898318514 实测）：onnx2tf 把输入转成 NCHW
+        # (1,395,3,395)，导致其内部 INT8 校准分支判定
+        # `model_input.shape[-1] in [3,4]` 失败并 sys.exit(1)：
+        #   "specify the calibration data with
+        #    --quant_calib_input_op_name_np_data_path"
+        # 而 -cind 校准数据只对部分分支生效，仍有分支回落到 auto-calib。
+        # 改用 keep_nwc_... 让 shape[-1]==3，auto-calib 直接可用。
+        # 这也与本项目既定决策一致：全程 NHWC，不引入 NCHW-Transpose
+        # （理由见 docs/NOTE-NCHW-vs-NHWC.md）。
+        keep_nwc_or_nhwc_or_ndhwc_input_names=[args.calib_name],
     )
     # onnx2tf 不信任 QDQ 图里已有的 scale：开 output_integer_quantized_tflite
     # 后它会自己做一遍 INT8 校准，并强制要求提供校准数据，否则报
@@ -251,7 +262,7 @@ def main():
     else:
         print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
               'will likely fail', flush=True)
-    print('=== STAGE4: calling onnx2tf.convert ===', flush=True)
+    print('=== STAGE4: calling onnx2tf.convert (keep NHWC) ===', flush=True)
     _sys.stdout.flush()
     print('calling onnx2tf.convert with: integer_quantized=%s quant_type=%s '
           'dtype=int8' % (True, args.quant_type), flush=True)
