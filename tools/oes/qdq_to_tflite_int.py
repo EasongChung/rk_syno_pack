@@ -178,9 +178,16 @@ def main():
         npy = build_calib_npy(tmpdir, args.calib_num, args.calib_name,
                               out_dir=os.path.join(args.workdir,
                                                    'o2tf_calib'))
-        kw['custom_input_op_name_np_data_path'] = {args.calib_name: npy}
+        # 源码（onnx2tf 1.29.24 L1192-1198）：
+        #   custom_input_op_name_np_data_path : List[Sequence]
+        #   遍历每一项 param，要求 len(param) in (2, 4)
+        #   -> [[INPUT_NAME, NUMPY_PATH]] 或 [[NAME, PATH, MEAN, STD]]
+        # 不是 dict，也不是逗号串，更不是扁平 list。
+        kw['custom_input_op_name_np_data_path'] = [[args.calib_name, npy]]
         print('calib npy: %s shape=%s (from %d cleaned images)' % (
             npy, np.load(npy).shape, len(os.listdir(tmpdir))), flush=True)
+        print('cind arg: %s' % kw['custom_input_op_name_np_data_path'],
+              flush=True)
     else:
         print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
               'will likely fail', flush=True)
