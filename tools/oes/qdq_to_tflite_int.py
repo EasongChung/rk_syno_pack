@@ -174,6 +174,20 @@ def main():
         output_quant_dtype='int8',
         non_verbose=True,
         not_use_onnxsim=False,
+        # 关闭 onnx2tf 内部所有"用 ORT 跑一遍图"的环节。
+        # 原因（CI run 38895398097 实测）：转换本身已成功
+        # （Saved artifact at 'work/o2tf_int'），但随后的 ORT 复核在
+        # onnx2tf 动态生成的 `const_fold_opt__630_DequantizeLinear/duplicated`
+        # 上崩溃：IsAxisInRange(axis, tensor_rank) was false, axis 1 not in
+        # [-1,0]。本地审计原始 QDQ 图 251 个 DQ 全部 axis 合法（0 越界），
+        # 故越界来自 onnx2tf 生成的副本，而非我们的输入图。
+        # 该复核只影响精度验证报告，不影响产物本身。
+        disable_strict_mode=True,
+        check_gpu_delegate_compatibility=False,
+        check_onnx_tf_outputs_elementwise_close=False,
+        check_onnx_tf_outputs_elementwise_close_full=False,
+        auto_generate_json=False,
+        auto_generate_json_on_error=False,
     )
     # onnx2tf 不信任 QDQ 图里已有的 scale：开 output_integer_quantized_tflite
     # 后它会自己做一遍 INT8 校准，并强制要求提供校准数据，否则报
