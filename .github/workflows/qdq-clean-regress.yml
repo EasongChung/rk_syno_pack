@@ -142,6 +142,7 @@ jobs:
             --workdir work --outdir out \
             --calib-method minmax --clean-calib --clean-k 3.0 \
             --exclude-head 6 --quant-format qdq --int8-tflite --tag clean \
+            --calib-dir calib --clean-k 3.0 \
             || echo "ROUTE-C: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
