@@ -13,10 +13,39 @@ on:
       - tools/oes/ort_quant.py
       - tools/oes/ptq_forensics.py
       - tools/oes/regress.py
+      - tools/oes/route_probe.py
+      - tools/oes/min_probe.py
       - .github/workflows/qdq-clean-regress.yml
 
 jobs:
+  # 先定生死：用小图探完所有 TFLite 产出路线，选出能真出 INT8 的那条。
+  # 独立 job：即使某条路线 OOM/失败也不影响交付主线。
+  routeprobe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" \
+            "tensorflow-cpu==2.15.1" "onnx2tf==1.29.24" onnx-graphsurgeon tflite
+          pip install --quiet "onnxruntime==1.16.3"
+          pip install --quiet --no-deps "onnxruntime==1.16.3" "onnx==1.16.1"
+      - name: Probe TFLite output routes
+        run: |
+          set -euo pipefail
+          python tools/oes/route_probe.py out/route || true
+      - name: Minimal onnx2tf QDQ check
+        run: |
+          set -euo pipefail
+          python tools/oes/min_probe.py out/minprobe || true
+
   deliver:
+    needs: routeprobe
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
