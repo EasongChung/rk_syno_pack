@@ -268,21 +268,16 @@ def main():
           'dtype=int8' % (True, args.quant_type), flush=True)
     try:
         convert(**kw)
+        print('convert() returned normally', flush=True)
     except SystemExit as e:
-        # onnx2tf 内部用 sys.exit() 报告问题。注意：转换主体已完成
-        # （Saved artifact / flatbuffer_export 均已出现），产物可能已落盘，
-        # 所以不在这里直接失败，交给下面的产物检查裁决。
         print('convert() called sys.exit(%s); will inspect output dir'
               % e, flush=True)
-        _sys.stdout.flush()
-    except TypeError as e:
-        # 老版本参数名不同，退回最小签名再试
-        print('convert(**kw) TypeError (%s); retry minimal' % str(e)[:120],
+    except BaseException as e:                       # noqa: BLE001
+        print('convert() raised %s: %s' % (type(e).__name__, str(e)[:200]),
               flush=True)
-        convert(input_onnx_file_path=args.qdq,
-                output_folder_path=odir,
-                output_integer_quantized_tflite=True,
-                non_verbose=True)
+    _sys.stdout.flush()
+    print('=== STAGE5: convert() done, inspecting output dir ===', flush=True)
+    _sys.stdout.flush()
 
     cands = glob.glob(os.path.join(odir, '*.tflite'))
     if not cands:

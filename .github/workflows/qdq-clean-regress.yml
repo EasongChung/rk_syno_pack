@@ -145,6 +145,10 @@ jobs:
             --calib-dir calib --clean-k 3.0 \
             || echo "ROUTE-C: exit=$? (report kept)"
           ls -la out/*.tflite || true
+          echo "=== Route C output dir (direct listing) ==="
+          ls -la work/o2tf_int/ 2>/dev/null || echo "(no o2tf_int dir)"
+          echo "=== any tflite under work/ ==="
+          find work -name '*.tflite' -printf '%s\t%p\n' 2>/dev/null | head -20 || true
 
       - name: Route A - QDQ via onnx2tf (control)
         run: |
