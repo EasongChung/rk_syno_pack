@@ -128,10 +128,25 @@ jobs:
           # 不需要 gcc-10-base/libgcc-s1:arm64 —— 链接用 -static-libgcc，
           # arm64 侧只要 libgcc-10-dev-arm64-cross 提供 libgcc.a 即可。
           cd "$RUNNER_TEMP"
-          apt-get download -qq $APT_OPTS \
-            gcc-10-cross gcc-10-cross-base \
-            gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
-            cpp-10-aarch64-linux-gnu libgcc-10-dev-arm64-cross
+          XPKGS="gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu cpp-10-aarch64-linux-gnu \
+                 libgcc-10-dev-arm64-cross gcc-10-cross-base \
+                 gcc-10-aarch64-linux-gnu-base libstdc++-10-dev-arm64-cross"
+
+          # ---- 预检：包名必须真实存在于索引 ----
+          # 之前踩过：gcc-10-cross 在 bullseye main 里不存在（它是
+          # crossbuild-essential-arm64 提供的虚拟包），apt 直接报
+          # "Unable to locate package"。这里先查索引，避免白跑一轮。
+          # 包名是**已用 bullseye amd64 Packages 索引本地核实过**的清单。
+          apt-get download -qq $APT_OPTS $XPKGS 2>&1 | grep -v '^$' || true
+          for p in $XPKGS; do
+            if ls "$RUNNER_TEMP/${p}_"*.deb >/dev/null 2>&1; then
+              echo "  ✓ $p"
+            else
+              echo "  ✗ $p —— 索引里没有这个包名，停止"
+              apt-get download $APT_OPTS "$p" 2>&1 | tail -2 || true
+              exit 1
+            fi
+          done
           ls -la "$RUNNER_TEMP"/*.deb
           mkdir -p "$SR"
           for d in "$RUNNER_TEMP"/*.deb; do
