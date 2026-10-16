@@ -135,14 +135,17 @@ jobs:
           XPKGS="gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu cpp-10-aarch64-linux-gnu \
                  libgcc-10-dev-arm64-cross gcc-10-cross-base \
                  gcc-10-aarch64-linux-gnu-base libstdc++-10-dev-arm64-cross \
-                 binutils-aarch64-linux-gnu binutils-common"
+                 binutils-aarch64-linux-gnu=2.35.2-2 binutils-common=2.35.2-2"
 
           # ---- 预检：包名必须真实存在于索引 ----
           # 之前踩过：gcc-10-cross 在 bullseye main 里不存在（它是
           # crossbuild-essential-arm64 提供的虚拟包），apt 直接报
           # "Unable to locate package"。这里先查索引，避免白跑一轮。
           # 包名是**已用 bullseye amd64 Packages 索引本地核实过**的清单。
-          apt-get download -qq $APT_OPTS $XPKGS 2>&1 | grep -v '^$' || true
+          if ! apt-get download -qq $APT_OPTS $XPKGS 2>&1 | tee "$RUNNER_TEMP/dl.log"; then
+            echo "ERROR: apt-get download 整体失败（上面是原始报错）"
+            exit 1
+          fi
           for p in $XPKGS; do
             if ls "$RUNNER_TEMP/${p}_"*.deb >/dev/null 2>&1; then
               echo "  ✓ $p"
