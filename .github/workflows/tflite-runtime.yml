@@ -300,6 +300,29 @@ jobs:
           SR="$RUNNER_TEMP/sysroot"
           BUILD="$RUNNER_TEMP/tfbuild"
 
+          # ---- 顶层 CMakeLists：把 driver 和 TFLite 放进同一个工程 ----
+          # 不要再用独立的 g++ 命令行编 driver：那样要手工拼 flatbuffers/absl/ruy/
+          # gemmlowp/fft2d 的 -I 路径，而 FetchContent 的目录布局随 CMake 版本变化，
+          # 写死必错（第18次失败：find 一个都没找到）。
+          # 放进同一个工程后 driver 通过链接 tensorflow-lite target 自动继承
+          # 其 INTERFACE include 目录 —— 结构上消除这类问题。
+          mkdir -p "$RUNNER_TEMP/drv"
+          cp oes-teflon/verify/tf_load_check.cpp "$RUNNER_TEMP/drv/"
+          cat > "$RUNNER_TEMP/drv/CMakeLists.txt" <<'DRVEOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(tf_load_check CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          # TFLite 作为子工程构建（EXCLUDE_FROM_ALL 以免污染默认目标）
+          add_subdirectory(${TFLITE_SRC}/tensorflow/lite tflite-build EXCLUDE_FROM_ALL)
+
+          # driver 链接 tensorflow-lite → 自动获得 flatbuffers/absl 等 include 路径
+          add_executable(tf_load_check ${CMAKE_CURRENT_SOURCE_DIR}/tf_load_check.cpp)
+          target_link_libraries(tf_load_check PRIVATE tensorflow-lite)
+          DRVEOF
+
           cat > "$RUNNER_TEMP/tc.cmake" <<EOF
           set(CMAKE_SYSTEM_NAME Linux)
           set(CMAKE_SYSTEM_PROCESSOR aarch64)
@@ -353,7 +376,25 @@ jobs:
             exit 1
           fi
 
+          echo "=== TFLite 静态库 ==="
           cmake --build "$BUILD" --target tensorflow-lite -j"$(nproc)"
+
+          # ---- driver：与 TFLite 同一工程，自动继承 include ----
+          export TFLITE_SRC="$SRC"
+          cmake -S "$RUNNER_TEMP/drv" -B "$RUNNER_TEMP/drvbuild" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/tc.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTFLITE_ENABLE_XNNPACK=OFF -DTFLITE_ENABLE_GPU=OFF \
+            -DTFLITE_ENABLE_RUY=OFF -DTFLITE_ENABLE_MMAP=OFF \
+            -DTFLITE_ENABLE_INSTALL=OFF -DTFLITE_ENABLE_DELEGATE_LIBRARY=OFF \
+            -DBUILD_TESTS=OFF \
+            -DTHREADS_PREFER_PTHREAD_FLAG=ON \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fc"
+          cmake --build "$RUNNER_TEMP/drvbuild" --target tf_load_check -j"$(nproc)"
+
+          cp "$RUNNER_TEMP/drvbuild/tf_load_check" "$RUNNER_TEMP/tf_load_check"
+          readelf -h "$RUNNER_TEMP/tf_load_check" | grep Machine
 
           # 静态库位置因 CMake 版本而异，找出来即可
           find "$BUILD" -name 'libtensorflow-lite.a' -print
@@ -361,54 +402,6 @@ jobs:
           test -n "$LIB"
           echo "TFLITE_LIB=$LIB" >> "$GITHUB_ENV"
           ls -la "$LIB"
-
-      - name: Build tf_load_check driver
-        run: |
-          set -eux
-          SRC="$RUNNER_TEMP/tfsrc"
-          SR="$RUNNER_TEMP/sysroot"
-          LIB="$TFLITE_LIB"
-          # include 路径**搜索发现**，不写死。
-          # TFLite 2.13 用 CMake FetchContent 把 flatbuffers / absl / ruy / gemmlowp /
-          # fft2d 拉到 $FETCHCONTENT_BASE_DIR（= $RUNNER_TEMP/fc），
-          # 布局随 CMake 版本变化，老的 tools/make/downloads 路径早已不存在。
-          # 做法：按 header 文件名反查其 include 根目录。
-          INC=""
-          for hdr in flatbuffers/flatbuffers.h \
-                     absl/strings/string_view.h \
-                     absl/base/attributes.h \
-                     ruy/profiler/instrumentation.h \
-                     gemmlowp/fixedpoint/fixedpoint.h \
-                     fft2d/dft2d.h ; do
-            p=$(find "$RUNNER_TEMP/fc" "$SRC" -path "*/$hdr" 2>/dev/null | head -1)
-            if [ -n "$p" ]; then
-              d=$(dirname "$(dirname "$p")")   # .../include/flatbuffers/flatbuffers.h → .../include
-              case " $INC " in *" -I$d "*) ;; *) INC="$INC -I$d";; esac
-              echo "  + -I$d   ($hdr)"
-            fi
-          done
-          echo "INC=$INC"
-          [ -n "$INC" ] || { echo "ERROR: TFLite 依赖头一个都没找到"; exit 1; }
-          # 关键依赖必须找到（flatbuffers 是 TFLite 核心头的依赖）
-          find "$RUNNER_TEMP/fc" "$SRC" -path "*/flatbuffers/flatbuffers.h" 2>/dev/null | head -1 \
-            | grep -q . || { echo "ERROR: 找不到 flatbuffers.h"; exit 1; }
-
-          # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
-          # $INC_FLAGS 含 -nostdinc，作用同上：剔除 Ubuntu glibc 2.39 头，
-          # 换上 Debian 2.31 头。详见 sysroot 步骤注释。
-          "$CXX" -O2 -std=c++17 --sysroot="$SR" $INC_FLAGS \
-            -B "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" \
-            -B "$SR/usr/bin/" \
-            -L "$SR/usr/lib/aarch64-linux-gnu" \
-            -L "$SR/lib/aarch64-linux-gnu" \
-            -static-libstdc++ -static-libgcc \
-            $INC \
-            -o "$RUNNER_TEMP/tf_load_check" \
-            oes-teflon/verify/tf_load_check.cpp \
-            "$LIB" \
-            -lm -lpthread -ldl
-
-          readelf -h "$RUNNER_TEMP/tf_load_check" | grep Machine
 
       # 关键安全闸：设备 glibc = 2.36，符号版本不得高于它。
       # 这条专门拦截 __isoc23_*（GLIBC_2.38）这类「CI 能过但上机失败」的坑。
