@@ -17,13 +17,26 @@
  * （ReplaceNodeSubsetsWithDelegateKernels 那一步）。
  * 所以「能加载」与「能接管节点」是两件事，必须用解释器验证。
  *
+ * ## 为什么用 C API 而不是 C++ API
+ *
+ * 前一版用 tflite::InterpreterOptions / tflite::TfLiteModel，
+ * 在 TFLite 2.13 下编译失败：
+ *     'TfLiteModel' is not a member of 'tflite'
+ *     'class tflite::InterpreterOptions' has no member named 'AddDelegate'
+ * C++ 封装层在不同版本间变动较大（2.13 与后续版本的
+ * InterpreterOptions::AddDelegate 签名与可用性都不同）。
+ *
+ * C API（tensorflow/lite/c/c_api.h）是稳定 ABI，而且 **delegate 本身就是 C 接口**
+ * （tflite_plugin_create_delegate 的签名就是 TfLiteDelegate*(*)(const char*)），
+ * 用 C API 与它天然对齐。
+ *
  * ## 本程序做什么 / 不做什么
  *
  * 做：
  *   1. 加载 .tflite 模型
  *   2. 建解释器，把 libteflon.so 的 external delegate 挂上去
  *   3. AllocateTensors()   ← 这一步触发 PrepareDelegate
- *   4. 打印张量/算子统计与**分区数**
+ *   4. 打印张量统计与**分区数**
  *
  * 不做：
  *   - 不做正确的前处理/反量化
@@ -43,41 +56,19 @@
  *   设成 1 只置 bit0，1 & 2 == 0 → 一行日志都不打。
  *   而空日志极易被误读成「delegate 没接管任何节点」—— 方向正好反了。
  *
- * ## 为什么只用这几个 API
- *
- * 只使用 TfLiteInterpreter 最核心、跨版本稳定的接口：
- *   AllocateTensors() / inputs() / input_tensor(i) / outputs() / output_tensor(i)
- *   / tensors_size() / tensor(i) / execution_plan()
- *
- * 特别注意：
- *   - inputs() 与 outputs() 返回的是 **int（个数）**，不是 vector，
- *     所以循环上界直接用它，不能再 .size()
- *   - 量化参数直接读 t->params（TfLiteQuantizationParams{scale, zero_point}），
- *     不要用 C API 的 TfLiteTensorGetQuantizationParams —— 那需要额外头文件，
- *     且在不同版本间声明位置有变动
- *   - 不用 subgraph()/subgraphs()，它们在 2.13 的可见性不稳定
- *
- * 分区判定用 execution_plan()：AllocateTensors 之后，
- * 若 delegate 切出了分区，这个 vector 的长度会 > 1（主图 + 各委托分区）。
- * 这比逐子图统计更稳，也不依赖内部结构。
- *
  * ## 退出码
  *
  *   0   成功，AllocateTensors 通过
  *   64  用法错误
  *   1   模型加载失败
  *   2   AllocateTensors 失败
+ *   3   解释器创建失败
  */
 
 #include <cstdio>
-#include <cstring>
-#include <string>
-#include <vector>
-#include <memory>
+#include <cstdlib>
 
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
-#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/c/c_api.h"
 #include "tensorflow/lite/c/c_api_types.h"
 
 /* libteflon.so 导出的 external delegate 入口（Mesa teflon，ABI 见 tfl_device.c） */
@@ -85,7 +76,7 @@ extern "C" TfLiteDelegate* tflite_plugin_create_delegate(const char*);
 extern "C" void tflite_plugin_destroy_delegate(TfLiteDelegate*);
 
 /* tflite_type_name 在 teflon 内部是 file-static 短名版本（L1370），
- * 与 TFLite 公开枚举名不同。这里用公开枚举打印，便于阅读。 */
+ * 与公开枚举名不同。这里用公开枚举打印，便于阅读。 */
 static const char* dtype_name(TfLiteType t) {
   switch (t) {
     case kTfLiteFloat32: return "FLOAT32";
@@ -124,52 +115,58 @@ int main(int argc, char** argv) {
                getenv("TEFLON_DEBUG") ? getenv("TEFLON_DEBUG") : "(未设置)");
 
   /* 1. 加载模型 */
-  std::unique_ptr<tflite::TfLiteModel> model =
-      tflite::TfLiteModel::CreateFromFile(model_path);
-  if (!model) {
+  TfLiteModel* model = TfLiteModelCreateFromFile(model_path);
+  if (model == nullptr) {
     std::fprintf(stderr, "结果: FAIL - 模型加载失败\n");
     return 1;
   }
   std::fprintf(stderr, "模型        : flatbuffer 解析成功\n");
 
   /* 2. 建解释器并挂 delegate */
-  tflite::InterpreterOptions options;
-  options.AddDelegate(tflite_plugin_create_delegate,
-                      tflite_plugin_destroy_delegate);
-  options.SetNumThreads(1);
+  TfLiteInterpreterOptions* opts = TfLiteInterpreterOptionsCreate();
+  if (opts == nullptr) {
+    TfLiteModelDelete(model);
+    std::fprintf(stderr, "结果: FAIL - 选项创建失败\n");
+    return 3;
+  }
+  TfLiteInterpreterOptionsAddDelegate(opts, tflite_plugin_create_delegate,
+                                     tflite_plugin_destroy_delegate);
+  TfLiteInterpreterOptionsSetNumThreads(opts, 1);
 
-  std::unique_ptr<tflite::TfLiteInterpreter> interpreter;
-  try {
-    interpreter =
-        std::make_unique<tflite::TfLiteInterpreter>(model.get(), options);
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "结果: FAIL - 建解释器异常: %s\n", e.what());
-    return 2;
+  TfLiteInterpreter* interp = TfLiteInterpreterCreate(model, opts);
+  /* 解释器创建后会拷贝需要的选项，官方示例即在此处 Delete */
+  TfLiteInterpreterOptionsDelete(opts);
+  if (interp == nullptr) {
+    TfLiteModelDelete(model);
+    std::fprintf(stderr, "结果: FAIL - 解释器创建失败\n");
+    return 3;
   }
 
   /* 3. AllocateTensors —— 触发 PrepareDelegate，分区在这一步完成 */
-  if (interpreter->AllocateTensors() != kTfLiteOk) {
+  if (TfLiteInterpreterAllocateTensors(interp) != kTfLiteOk) {
     std::fprintf(stderr, "结果: FAIL - AllocateTensors 失败\n");
+    TfLiteInterpreterDelete(interp);
+    TfLiteModelDelete(model);
     return 2;
   }
   std::fprintf(stderr, "AllocateTensors: OK（delegate 分区已完成）\n");
 
-  /* 4. 分区数 —— 这是接管是否发生的直接证据
+  /* 4. 分区数 —— 接管是否发生的直接证据
    *
-   * AllocateTensors 之后 execution_plan() 的长度：
+   * AllocateTensors 之后：
    *   1  → 只有主图，delegate 一个节点都没接管
-   *   >1 → delegate 切出了分区（长度 = 主图 + 委托分区数）
+   *   >1 → delegate 切出了分区
    */
-  const int n_partitions = static_cast<int>(interpreter->execution_plan().size());
+  const int n_partitions = TfLiteInterpreterExecutionPlanSize(interp);
 
   /* 5. dtype 统计 —— 判「真 int8 vs 假 int8」的关键指标 */
-  const int n_tensors = interpreter->tensors_size();
+  const int n_tensors = TfLiteInterpreterGetTensorCount(interp);
   int n_int8 = 0, n_uint8 = 0, n_int32 = 0, n_float32 = 0, n_other = 0;
   int n_quantized = 0;   /* 带有效 scale 的量化张量 */
   int n_degenerate = 0;  /* scale 异常大，退化标量传染的征兆 */
 
   for (int i = 0; i < n_tensors; i++) {
-    const TfLiteTensor* t = interpreter->tensor(i);
+    const TfLiteTensor* t = TfLiteInterpreterGetTensor(interp, i);
     if (t == nullptr) continue;
     switch (t->type) {
       case kTfLiteInt8:    n_int8++;    break;
@@ -182,17 +179,17 @@ int main(int argc, char** argv) {
         t->params.scale > 0.0f) {
       n_quantized++;
       /* 正常 scale 在 1e-3 ~ 1e1 量级；
-         1e30 以上说明是常量 0 张量导致的 0/0 退化传染。 */
+         1e10 以上说明是常量 0 张量导致的 0/0 退化传染。 */
       if (t->params.scale > 1.0e10f) n_degenerate++;
     }
   }
 
   /* 6. 输入/输出张量信息 */
-  const int n_in = interpreter->inputs();     /* 返回 int 个数，不是 vector */
-  const int n_out = interpreter->outputs();
+  const int n_in = TfLiteInterpreterGetInputTensorCount(interp);
+  const int n_out = TfLiteInterpreterGetOutputTensorCount(interp);
   std::fprintf(stderr, "输入张量数    : %d\n", n_in);
   for (int i = 0; i < n_in; i++) {
-    const TfLiteTensor* t = interpreter->input_tensor(i);
+    const TfLiteTensor* t = TfLiteInterpreterGetInputTensor(interp, i);
     if (t == nullptr) continue;
     std::fprintf(stderr, "  输入[%d] dtype=%s scale=%g zp=%lld shape=",
                  i, dtype_name(t->type), t->params.scale,
@@ -202,7 +199,7 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "输出张量数    : %d\n", n_out);
   for (int i = 0; i < n_out; i++) {
-    const TfLiteTensor* t = interpreter->output_tensor(i);
+    const TfLiteTensor* t = TfLiteInterpreterGetOutputTensor(interp, i);
     if (t == nullptr) continue;
     std::fprintf(stderr, "  输出[%d] dtype=%s scale=%g zp=%lld shape=",
                  i, dtype_name(t->type), t->params.scale,
@@ -234,5 +231,8 @@ int main(int argc, char** argv) {
   const char* verdict = (n_partitions > 1) ? "DELEGATE_ACTIVE"
                                            : "DELEGATE_NO_PARTITION";
   std::fprintf(stderr, "结果: OK - %s (partitions=%d)\n", verdict, n_partitions);
+
+  TfLiteInterpreterDelete(interp);
+  TfLiteModelDelete(model);
   return 0;
 }
