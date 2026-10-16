@@ -146,6 +146,20 @@ jobs:
             || echo "ROUTE-T: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
+      # 对照组：旧版 TFLite 量化器。用于判定 1.334441e+36 退化 scale
+      # 是否 MLIR 独有（旧量化器若无退化 -> 无需 post-hoc requantize；
+      # 若同样退化 -> 必须走 requantize 路线）。
+      - name: Route T-legacy - old TFLite quantizer (control)
+        run: |
+          set -euo pipefail
+          python tools/oes/qdq_to_tflite_tf.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --calib-num 100 \
+            --workdir work --out out/concept_int8_tf_legacy.tflite \
+            --input-name inputs_0 --old-quantizer \
+            || echo "ROUTE-T-LEGACY: exit=$? (report kept)"
+          ls -la out/*.tflite || true
+
       - name: Route C - QDQ to int8 TFLite via onnx2tf convert
         run: |
           set -euo pipefail
@@ -176,20 +190,45 @@ jobs:
 
       # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：
       # float 假绿绝不能进 regress）。--require-int8 会二次拦 float 模型。
-      - name: Regression gate on all INT8 candidates
+      # float 基线必须跳过 --require-int8：它是 float 模型，本身就该被拒。
+      - name: Publish float baseline for anchor
+        run: |
+          set -euo pipefail
+          # och 第7轮要的"ref 本身多好"锚点：onnx2tf 的 float32 产物
+          # vs 原始 float16 TFLite。这衡量的是"转换是否无损"，
+          # 与"量化损失"是两件事，必须分开报，否则无法判断 0.98 门限是否合理。
+          for f in work/sm_for_tf/*.tflite work/o2tf_int/*float32*.tflite; do
+            [ -e "$f" ] || continue
+            cp "$f" "out/baseline_float_$(basename "$f")"
+          done
+          ls -la out/ || true
+
+      - name: Regression gate on all candidates
         run: |
           set -euo pipefail
           n=0
           for f in out/*.tflite; do
             [ -e "$f" ] || continue
-            n=$((n+1))
             b=$(basename "$f" .tflite)
             echo "=== REGRESS $b ==="
-            python tools/oes/regress.py \
-              --ref tools/oes/models/model_float16.tflite \
-              --quant "$f" --eval-dir eval --topk 1,5 \
-              --require-int8 --out "out/report_${b}.json" \
-              || echo "REGRESS ${b}: exit=$? (report kept)"
+            case "$b" in
+              baseline_float_*)
+                # float 基线：不加 --require-int8（它本就是 float）
+                python tools/oes/regress.py \
+                  --ref tools/oes/models/model_float16.tflite \
+                  --quant "$f" --eval-dir eval --topk 1,5 \
+                  --out "out/report_${b}.json" \
+                  || echo "REGRESS ${b}: exit=$? (baseline, expected float)"
+                ;;
+              *)
+                python tools/oes/regress.py \
+                  --ref tools/oes/models/model_float16.tflite \
+                  --quant "$f" --eval-dir eval --topk 1,5 \
+                  --require-int8 --out "out/report_${b}.json" \
+                  || echo "REGRESS ${b}: exit=$? (report kept)"
+                ;;
+            esac
+            n=$((n+1))
           done
           if [ "$n" -eq 0 ]; then
             echo "GATE ABORT: no tflite candidate produced"; exit 9

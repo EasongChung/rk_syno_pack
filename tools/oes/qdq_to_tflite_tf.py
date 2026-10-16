@@ -93,9 +93,47 @@ def report(cand, tag):
         100.0 * nq / max(nt, 1), len(raw)))
     print('  dtype: %s' % dict(sorted(dt.items())))
     print('  ops:   %s' % dict(sorted(ops.items(), key=lambda kv: -kv[1])[:12]))
-    ok = nq > 0 and tin.Type() in (3, 9)
-    print('  -> %s' % ('INT8 OK' if ok else 'FLOAT (FAILED)'))
-    return ok
+
+    # 退化 scale 检测（不依赖任何对齐，纯阈值判定）。
+    # 背景：MLIR PTQ 时期发现 Pad 的 0/0 constant_values 会产出
+    # scale=1.334441e+36 的退化张量并沿图传染。och 第7轮确认：该退化
+    # 在 delegate 侧不会被自动拒绝（scale>0 成立，0/1.33e36 不溢出），
+    # 风险在 etnaviv 转定点格式时溢出，故必须在导出侧处理。
+    # 本地实测种子：idx=133 pseudo_qconst112 -> 139 relu/Add ->
+    # 140 PadV2 -> 141 MaxPool2d，全部 1.334441e+36。
+    degen = []
+    for i in range(nt):
+        t = g.Tensors(i)
+        q = t.Quantization()
+        if q is None or q.ScaleLength() == 0:
+            continue
+        for k in range(q.ScaleLength()):
+            s = q.Scale(k)
+            if s > 1e6 or s <= 0:
+                nm = (t.Name().decode('utf-8', 'replace')
+                      if t.Name() else '')
+                degen.append((i, k, s, nm, t.Type()))
+                break
+    print('  DEGENERATE scale: %d tensor(s)' % len(degen), flush=True)
+    for i, k, s, nm, ty in degen[:12]:
+        print('    idx=%-4d scale=%.6e type=%s %s'
+              % (i, s, TFL_NAME.get(ty, ty), nm[:52]), flush=True)
+
+    # 未量化张量（och 第5节：fill_tensor 无空指针检查，20 个未量化
+    # INT32 张量若被 fill_tensor 处理会段错误；需真机确认）
+    nq_unquant = sum(1 for i in range(nt)
+                     if g.Tensors(i).Type() in (3, 9)
+                     and (g.Tensors(i).Quantization() is None
+                          or g.Tensors(i).Quantization().ScaleLength() == 0))
+    print('  int8/uint8 tensors WITHOUT quantization: %d '
+          '(och: fill_tensor 无空指针检查，需真机确认)' % nq_unquant,
+          flush=True)
+
+    ok = nq > 0 and tin.Type() in (3, 9) and not degen
+    print('  -> %s' % ('INT8 OK' if ok else
+                      ('FLOAT (FAILED)' if nq == 0 else
+                       'INT8 BUT DEGENERATE SCALE')))
+    return ok, len(degen), nq_unquant
 
 
 def main():
@@ -111,6 +149,11 @@ def main():
     ap.add_argument('--clean-k', type=float, default=3.0,
                     help='校准集离群剔除阈值（mag > k * median）')
     ap.add_argument('--int16', action='store_true')
+    ap.add_argument('--old-quantizer', action='store_true',
+                    help='退回旧版 TFLite 量化器（experimental_new_quantizer'
+                         '=False）。用于验证退化 scale 是否 MLIR 特有：'
+                         'MLIR 的 pseudo_qconst 标量退化 '
+                         '(scale=1.334441e+36) 在旧量化器下可能不存在。')
     args = ap.parse_args()
 
     print('=== TA0: args parsed, onnx exists=%s ==='
@@ -246,6 +289,11 @@ def main():
         conv = tf.lite.TFLiteConverter.from_saved_model(sm)
         print('converter created from %s' % sm, flush=True)
         conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        if args.old_quantizer:
+            # 换量化器实现（不是调参）：验证 1.334441e+36 退化是否为 MLIR 特有。
+            conv.experimental_new_quantizer = False
+            print('using LEGACY TFLite quantizer '
+                  '(experimental_new_quantizer=False)', flush=True)
         conv.representative_dataset = rep_gen
         if args.int16:
             conv.target_spec.supported_ops = [
@@ -270,7 +318,7 @@ def main():
     open(args.out, 'wb').write(blob)
     print('=== TA5: wrote %s (%d bytes) ===' % (
         args.out, os.path.getsize(args.out)), flush=True)
-    ok = report(args.out, 'tf-converter')
+    ok, ndegen, nq_unq = report(args.out, 'tf-converter')
     return 0 if ok else 4
 
 
