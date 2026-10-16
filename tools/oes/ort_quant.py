@@ -320,6 +320,10 @@ def main():
                     help="qdq=QuantFormat.QDQ（当前默认）；"
                          "qoperator=QuantFormat.QOperator，产出 ConvInteger/"
                          "QLinearConv 等原生整型算子，更接近 TFLite 的 int8 形式")
+    ap.add_argument('--int8-tflite', action='store_true',
+                    help='Route C：用 onnx2tf.convert('
+                         'output_integer_quantized_tflite=True) 导出 int8 '
+                         'TFLite。CLI 无此开关，必须走 convert() 直调。')
     ap.add_argument('--direct-tflite', action='store_true',
                     help='尝试让 quantize_static 直接输出 .tflite。'
                          '注意：ORT 1.16/1.31 的 quantize_static 只写 ONNX，'
@@ -350,7 +354,23 @@ def main():
                     quant_format=args.quant_format,
                     direct_tflite=args.direct_tflite)
     stage_validate_qdq(onnx_path, qdq_path, args.eval_dir, args.eval_num)
-    if args.direct_tflite:
+    if args.int8_tflite:
+        # Route C：onnx2tf.convert(output_integer_quantized_tflite=True)。
+        # 源码级依据：CLI 无量化参数，但 convert() 签名含该开关；不带它时
+        # ops/QuantizeLinear.py 走 fake_quant -> TFLite 量化张量为 0（实测 0/337）。
+        r = subprocess.run(
+            [sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'qdq_to_tflite_int.py'),
+             '--qdq', qdq_path,
+             '--out', os.path.join(args.outdir, tflite_name),
+             '--workdir', args.workdir],
+            capture_output=True, text=True)
+        print(r.stdout[-2000:], flush=True)
+        if r.returncode:
+            print(r.stderr[-1500:], file=sys.stderr, flush=True)
+            raise SystemExit('Route C failed (exit=%d)' % r.returncode)
+    elif args.direct_tflite:
         # ORT 1.16/1.31 的 quantize_static 始终写 ONNX（model_output 的后缀
         # 不改变输出格式），实测不会生成 .tflite。这里显式检测并报错，
         # 避免把 onnx 文件当 tflite 交付。

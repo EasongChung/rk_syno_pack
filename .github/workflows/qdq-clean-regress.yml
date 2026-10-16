@@ -131,9 +131,20 @@ jobs:
 
       # 判决轮：清洗校准集 + MinMax -> 量化 -> INT8 TFLite。
       # A 路：QDQ + onnx2tf（已知丢量化，保留作对照）
-      # B 路：QOperator 格式（本地实测 cos=0.9703/top1=0.9000，优于 QDQ 0.9569）
-      #     再过 onnx2tf —— QOperator 用 ConvInteger/QLinearConv 等原生整型算子，
-      #     比 QDQ 的伪量化更容易被翻译成真 int8。
+      # C 路（主攻）：QDQ + onnx2tf.convert(output_integer_quantized_tflite=True)
+      #   源码级依据：CLI 无量化开关，但 convert() 签名含该开关；不带它时
+      #   ops/QuantizeLinear.py 走 fake_quant -> TFLite 量化张量 0/337。
+      - name: Route C - QDQ to int8 TFLite via onnx2tf convert
+        run: |
+          set -euo pipefail
+          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
+            --workdir work --outdir out \
+            --calib-method minmax --clean-calib --clean-k 3.0 \
+            --exclude-head 6 --quant-format qdq --int8-tflite --tag clean \
+            || echo "ROUTE-C: exit=$? (report kept)"
+          ls -la out/*.tflite || true
+
       - name: Route A - QDQ via onnx2tf (control)
         run: |
           set -euo pipefail
