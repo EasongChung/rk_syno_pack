@@ -178,19 +178,35 @@ jobs:
           #   libstdc++10：$SR/usr/include/c++/10{,/aarch64-linux-gnu}
           #   glibc 2.31：$SR/usr/include{,/aarch64-linux-gnu}
           # 三者同为 GCC 10 / glibc 2.31，无版本冲突。
+          # ⚠️ 不要写死 libstdc++ 头的路径 —— Debian 的 multiarch 布局与常见写法**相反**：
+          #   ✗ $SR/usr/include/c++/10/aarch64-linux-gnu        （不存在）
+          #   ✓ $SR/usr/include/aarch64-linux-gnu/c++/10        （bits/c++config.h 在这）
+          # 写死会在「fatal error: bits/c++config.h: No such file」上白跑一轮。
+          # 这里用 glob 自动发现，配一条自检：必须能找到 bits/c++config.h。
           INC_FLAGS="-nostdinc"
-          for d in "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/include" \
-                   "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/include-fixed" \
-                   "$SR/usr/include/c++/10" \
-                   "$SR/usr/include/c++/10/aarch64-linux-gnu" \
-                   "$SR/usr/include/aarch64-linux-gnu" \
-                   "$SR/usr/include" ; do
+          for d in "$SR"/usr/lib/gcc-cross/*/*/include \
+                   "$SR"/usr/lib/gcc-cross/*/*/include-fixed \
+                   "$SR"/usr/include/c++/* \
+                   "$SR"/usr/include/*/c++/* \
+                   "$SR"/usr/include/aarch64-linux-gnu \
+                   "$SR"/usr/include ; do
             [ -d "$d" ] && INC_FLAGS="$INC_FLAGS -isystem $d"
           done
           echo "INC_FLAGS=$INC_FLAGS" >> "$GITHUB_ENV"
           echo "INC_FLAGS=$INC_FLAGS"
+
+          # 自检：libstdc++ 与 glibc 的关键头必须都在
+          if ! find "$SR" -path '*/bits/c++config.h' | grep -q .; then
+            echo "ERROR: sysroot 里找不到 bits/c++config.h，libstdc++ 头没装上"
+            find "$SR" -name 'c++config.h' || true
+            exit 1
+          fi
+          echo "  ✓ bits/c++config.h 位于: $(find "$SR" -path '*/bits/c++config.h' | head -1 | sed "s|$SR|\$SR|")"
+          [ -f "$SR/usr/include/features.h" ] || { echo "ERROR: 找不到 glibc features.h"; exit 1; }
+          echo "  ✓ glibc features.h 就位"
+
           # 确认 Ubuntu 的 glibc 头确实不在列表里
-          echo "$INC_FLAGS" | grep -q '/usr/aarch64-linux-gnu/include ' \
+          echo "$INC_FLAGS" | grep -q ' /usr/aarch64-linux-gnu/include' \
             && { echo "ERROR: Ubuntu glibc 2.39 头仍混入了 include 列表"; exit 1; } || true
 
           # ---- 5. probe 自检（含 glibc 符号天花板）----
