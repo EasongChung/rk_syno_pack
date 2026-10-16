@@ -320,26 +320,38 @@ jobs:
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           EOF
 
-          cmake -S "$SRC/tensorflow/lite" -B "$BUILD" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/tc.cmake" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DTFLITE_ENABLE_XNNPACK=OFF \
-            -DTFLITE_ENABLE_GPU=OFF \
-            -DTFLITE_ENABLE_RUY=OFF \
-            -DTFLITE_ENABLE_MMAP=OFF \
-            -DTFLITE_ENABLE_INSTALL=OFF \
-            -DTFLITE_ENABLE_DELEGATE_LIBRARY=OFF \
-            -DBUILD_TESTS=OFF \
-            # 交叉编译下 FindThreads 的两个标准开关：
-            #  1. THREADS_PREFER_PTHREAD_FLAG=ON —— 用 -pthread 而不是 -lpthread。
-            #     CMake 默认去找单独的 pthread 库并做运行时探测，交叉编译下探测必失败
-            #     （报 "Could NOT find Threads"，即使 sysroot 里 libpthread.so 齐全）。
-            #  2. CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY —— 只编译不链接可执行文件，
-            #     避免交叉目标无法运行导致的误判。
-            -DTHREADS_PREFER_PTHREAD_FLAG=ON \
-            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
-            -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fc"
+          # 交叉编译下 FindThreads 的两个标准开关：
+          #  1. THREADS_PREFER_PTHREAD_FLAG=ON —— 用 -pthread 而不是 -lpthread。
+          #     CMake 默认去找单独的 pthread 库并做运行时探测，交叉编译下探测必失败
+          #     （报 "Could NOT find Threads"，即使 sysroot 里 libpthread.so 齐全）。
+          #  2. CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY —— 只编译不链接可执行文件，
+          #     避免交叉目标无法运行导致的误判。
+          #
+          # configure 失败时把 CMakeError.log 全部打出来。
+          # try_compile 的真实编译错误（链接命令、缺哪个 .so、哪个符号）
+          # 都记在这里，只看 stdout 的 "Could NOT find Threads" 是猜不出原因的。
+          if ! cmake -S "$SRC/tensorflow/lite" -B "$BUILD" -G Ninja \
+               -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/tc.cmake" \
+               -DCMAKE_BUILD_TYPE=Release \
+               -DBUILD_SHARED_LIBS=OFF \
+               -DTFLITE_ENABLE_XNNPACK=OFF \
+               -DTFLITE_ENABLE_GPU=OFF \
+               -DTFLITE_ENABLE_RUY=OFF \
+               -DTFLITE_ENABLE_MMAP=OFF \
+               -DTFLITE_ENABLE_INSTALL=OFF \
+               -DTFLITE_ENABLE_DELEGATE_LIBRARY=OFF \
+               -DBUILD_TESTS=OFF \
+               -DTHREADS_PREFER_PTHREAD_FLAG=ON \
+               -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+               -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fc" ; then
+            echo "================= CMake 失败：真实编译错误 ================="
+            for f in $(find "$BUILD" "$RUNNER_TEMP/tfbuild" -name CMakeError.log 2>/dev/null | sort -u); do
+              echo "---- $f ----"
+              cat "$f"
+            done
+            echo "=============================================================="
+            exit 1
+          fi
 
           cmake --build "$BUILD" --target tensorflow-lite -j"$(nproc)"
 
