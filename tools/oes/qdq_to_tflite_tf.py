@@ -189,12 +189,25 @@ def main():
               flush=True)
         _sys.stdout.flush()
 
-    sm = os.path.join(sm_dir, 'float32')
-    if not os.path.isdir(sm):
-        print('no saved_model dir; listing: %s'
-              % (os.listdir(sm_dir) if os.path.isdir(sm_dir) else 'none'),
+    # 不假设目录名（onnx2tf 依 output_signaturedefs / -osd 等参数会在
+    # float32/ 与 saved_model.pb 同级之间变化），递归找 saved_model.pb。
+    sm = ''
+    hits = glob.glob(os.path.join(sm_dir, '**', 'saved_model.pb'),
+                     recursive=True)
+    if hits:
+        sm = os.path.dirname(hits[0])
+        print('=== TA3b: saved_model.pb at %s ===' % sm, flush=True)
+    else:
+        print('=== TA3b: NO saved_model.pb under %s ===' % sm_dir,
               flush=True)
+        for root, dirs, files in os.walk(sm_dir):
+            for f in files:
+                p = os.path.join(root, f)
+                print('    %s (%d bytes)' % (
+                    os.path.relpath(p, sm_dir), os.path.getsize(p)),
+                    flush=True)
         return 5
+    _sys.stdout.flush()
 
     print('=== TA4: SavedModel ready, converting to INT8 TFLite ===',
           flush=True)
@@ -204,20 +217,32 @@ def main():
         for i in range(calib.shape[0]):
             yield [calib[i:i + 1]]
 
-    conv = tf.lite.TFLiteConverter.from_saved_model(sm)
-    conv.optimizations = [tf.lite.Optimize.DEFAULT]
-    conv.representative_dataset = rep_gen
-    if args.int16:
-        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT16]
-        conv.inference_input_type = tf.int16
-        conv.inference_output_type = tf.int16
-    else:
-        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        conv.inference_input_type = tf.int8
-        conv.inference_output_type = tf.int8
+    try:
+        conv = tf.lite.TFLiteConverter.from_saved_model(sm)
+        print('converter created from %s' % sm, flush=True)
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        conv.representative_dataset = rep_gen
+        if args.int16:
+            conv.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT16]
+            conv.inference_input_type = tf.int16
+            conv.inference_output_type = tf.int16
+        else:
+            conv.target_spec.supported_ops = [
+                tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+            conv.inference_input_type = tf.int8
+            conv.inference_output_type = tf.int8
+        blob = conv.convert()
+    except BaseException as e:                                # noqa: BLE001
+        import traceback
+        print('TA4 FAILED: %s: %s' % (type(e).__name__, str(e)[:300]),
+              flush=True)
+        traceback.print_exc()
+        _sys.stdout.flush()
+        return 6
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    open(args.out, 'wb').write(conv.convert())
+    open(args.out, 'wb').write(blob)
     print('=== TA5: wrote %s (%d bytes) ===' % (
         args.out, os.path.getsize(args.out)), flush=True)
     ok = report(args.out, 'tf-converter')
