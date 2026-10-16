@@ -109,16 +109,15 @@ jobs:
           sh oes-teflon/build-recipe/make-sysroot-cxx.sh "$SR"
 
           # ---- 2. Debian bullseye 交叉工具链（gcc-10 aarch64-linux-gnu）----
-          # ⚠️ GitHub runner 的 step 不是 root（只有用 sudo 的步骤才是），
-          #    写 /etc/apt/sources.list.d/ 会 Permission denied。
-          #    所以 sources 写在 $RUNNER_TEMP，再用 apt 的 Dir::Etc::sourcelist
-          #    选项指过去，并把 sourceparts 置空，只让 bullseye 的索引进来。
+          # ⚠️ GitHub runner 的 step 不是 root。
+          #    - 写 /etc/apt/sources.list.d/     → Permission denied
+          #    - apt-get update 写 /var/lib/apt/lists/lock → Permission denied
+          #    两条都要处理：sources 放 $RUNNER_TEMP 由 -o 指过去（避第一步），
+          #    update 本身必须 sudo（它要写系统索引目录）。
           echo "deb http://deb.debian.org/debian bullseye main" \
             > "$RUNNER_TEMP/bullseye.list"
-          apt-get update -qq \
-            -o Dir::Etc::sourcelist="$RUNNER_TEMP/bullseye.list" \
-            -o Dir::Etc::sourceparts=/dev/null \
-            -o APT::Get::List-Cleanup=0
+          APT_OPTS="-o Dir::Etc::sourcelist=$RUNNER_TEMP/bullseye.list -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0"
+          sudo apt-get update -qq $APT_OPTS
 
           # 显式列出，不走依赖求解：
           # apt 的自动求解会拉 bullseye 的 libc6（宿主 amd64）并要求降级，会失败。
@@ -126,7 +125,7 @@ jobs:
           # 不需要 gcc-10-base/libgcc-s1:arm64 —— 链接用 -static-libgcc，
           # arm64 侧只要 libgcc-10-dev-arm64-cross 提供 libgcc.a 即可。
           cd "$RUNNER_TEMP"
-          apt-get download -qq \
+          apt-get download -qq $APT_OPTS \
             gcc-10-cross gcc-10-cross-base \
             gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
             cpp-10-aarch64-linux-gnu libgcc-10-dev-arm64-cross
