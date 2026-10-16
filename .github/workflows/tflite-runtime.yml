@@ -173,7 +173,22 @@ jobs:
           done
           rm -f "$RUNNER_TEMP"/*.deb
 
-          # ---- 3. 校验工具链就位 ----
+          # ---- 3. 宿主运行时库路径（关键）----
+          # Debian 交叉 binutils 的 as/ld 是 **宿主 x86_64 程序**，运行时需要
+          #   libopcodes-2.35.2-arm64.so / libbfd-2.35.2-arm64.so
+          # （文件名带 arm64 只是 Debian 交叉包的命名习惯，内容是 x86_64）
+          # 解包后落在 $SR/usr/lib/x86_64-linux-gnu/，
+          # 而 gcc 是以子进程方式调 as/ld 的，不会走 sysroot 的库搜索路径
+          # → "error while loading shared libraries: libopcodes-...: cannot open"
+          # 必须把该目录放进 LD_LIBRARY_PATH。写进 GITHUB_ENV，后续所有 step 继承。
+          export LD_LIBRARY_PATH="$SR/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          # 自检：as 能真正跑起来（不只存在，还要能执行）
+          "$SR/usr/bin/aarch64-linux-gnu-as" --version | head -1
+          "$SR/usr/bin/aarch64-linux-gnu-ld" --version | head -1
+
+          # ---- 3b. 校验工具链就位 ----
           CXX="$SR/usr/bin/aarch64-linux-gnu-g++-10"
           test -x "$CXX"
           echo "CXX=$CXX" >> "$GITHUB_ENV"
