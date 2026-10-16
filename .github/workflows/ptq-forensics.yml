@@ -1,0 +1,118 @@
+name: PTQ forensics (46x scale verdict)
+
+# 独立轻任务：只回答"激活 scale 高估 46 倍来自哪"。不产 TFLite、不跑回归。
+# 判决点是第1段（float 侧逐图 max，与量化无关），因此第2/3段只是佐证。
+# 前置结论：pre-rewrite 对照双份复制 cos=0.0000，改写无罪；算子 100% 在 Teflon 白名单内。
+# 详见 tools/oes/ptq_forensics.py 头注释。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/ptq_forensics.py
+      - .github/workflows/ptq-forensics.yml
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps (TF stack, 仅 prepare 需要)
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon onnxsim
+          python -c "import tensorflow as tf; print('tf', tf.__version__)"
+
+      - name: Fingerprint input model
+        run: |
+          set -euo pipefail
+          test "$(stat -c%s tools/oes/models/model_float16.tflite)" = "12094724"
+
+      - name: Fetch photo sets
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
+          python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 200 --min-ok 50
+
+      - name: Preseed onnx2tf check images
+        run: |
+          set -euo pipefail
+          python tools/oes/make_seed_npy.py --calib-dir calib \
+            --out calibration_image_sample_data_20x128x128x3_float32.npy
+
+      - name: Convert to repaired ONNX (skip quant)
+        run: |
+          set -euo pipefail
+          python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
+            --workdir work --outdir out --calib-dir calib --num-calib 300 \
+            --eval-dir eval --frontend-num 50 --skip-quant
+          ls -la work/concept_split.onnx
+
+      - name: Upload float ONNX
+        uses: actions/upload-artifact@v4
+        with:
+          name: float-onnx
+          path: work/concept_split.onnx
+          if-no-files-found: error
+
+  forensics:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps (无 TF：仅需 onnx/ort/pillow)
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          python -c "import onnxruntime as ort; print('ort', ort.__version__)"
+          python -c "import onnx; print('onnx', onnx.__version__)"
+
+      - name: Download float ONNX
+        uses: actions/download-artifact@v4
+        with:
+          name: float-onnx
+          path: work
+
+      - name: Fetch calib set (forensics 独立拉，与 prepare 并行)
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
+          ls calib | wc -l
+
+      - name: Three-stage PTQ forensics
+        run: |
+          set -euo pipefail
+          python tools/oes/ptq_forensics.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 \
+            --workdir work --outdir out
+
+      - name: Upload verdict report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptq-forensics-report
+          path: |
+            out/ptq_forensics.json
+            out/compare.json
+          if-no-files-found: warn
