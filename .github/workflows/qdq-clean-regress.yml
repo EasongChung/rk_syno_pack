@@ -28,19 +28,21 @@ jobs:
         with:
           python-version: '3.10'
 
-      # 必须单次安装：分多次 pip install 时，后装的 onnx2tf/onnx-tf/tf-probability
-      # 会把已 pin 的 onnxruntime/keras/protobuf 顶到新版本
-      # （曾导致要求 ort==1.16.3 实装 1.23.0，量化器行为不同 -> cos 0.96 掉到 0.60）。
-      - name: Install deps (single resolve + version assertions)
+      # 顺序有讲究：onnx2tf/tf-probability 会把 onnxruntime 顶到新版
+      # （曾要求 ort==1.16.3 却实装 1.23.0，量化器行为不同 -> cos 0.96 掉到 0.60）。
+      # 单次安装不可行：tf2onnx==1.16.1 与 onnx==1.16.1 存在解析冲突。
+      # 故按主 workflow 的顺序安装，最后统一 pin + 断言。
+      - name: Install deps (ordered, then re-pin + assert)
         run: |
           set -euo pipefail
-          pip install --quiet \
-            "numpy==1.26.4" pillow \
-            "onnx==1.16.1" "onnxruntime==1.16.3" \
-            "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1" \
-            "onnx2tf==1.29.24" onnx-graphsurgeon onnxsim tflite \
-            "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
-          # 断言而非仅打印：pin 失效曾静默通过，导致本地/CI 结论不可比
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
+          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
+          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
+          pip install --quiet tflite
+          pip install --quiet onnxsim "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
+          # 关键：把被顶掉的版本按兼容组合重新钉住（ORT 量化器行为对版本敏感）
+          pip install --quiet --no-deps "onnxruntime==1.16.3" "onnx==1.16.1" "numpy==1.26.4"
           python - <<'PY'
           import sys
           import numpy, onnx, onnxruntime, tensorflow, tf2onnx
@@ -51,12 +53,10 @@ jobs:
                  'onnxruntime': onnxruntime.__version__,
                  'tensorflow': tensorflow.__version__,
                  'tf2onnx': tf2onnx.__version__}
-          bad = []
+          bad = [k for k, v in want.items() if got[k] != v]
           for k, v in want.items():
-              mark = 'OK  ' if got[k] == v else 'DRIFT'
-              print('%s %-14s want=%-8s got=%s' % (mark, k, v, got[k]))
-              if got[k] != v:
-                  bad.append(k)
+              print('%s %-14s want=%-8s got=%s' % (
+                  'OK  ' if got[k] == v else 'DRIFT', k, v, got[k]))
           if bad:
               sys.exit('dependency drift: %s -- 本地/CI 结论不可比' % bad)
           import onnx2tf, tflite  # noqa
