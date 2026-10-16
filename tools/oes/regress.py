@@ -67,6 +67,9 @@ def load_interp(path):
         return it
 
 
+DEBUG = {'n': 0}
+
+
 def run_once(interp, image_bytes):
     from PIL import Image
     import numpy as np
@@ -94,21 +97,36 @@ def run_once(interp, image_bytes):
              .reshape(shape).astype(np.float32))
     interp.set_tensor(inp['index'], t)
     interp.invoke()
-    v = interp.get_tensor(out['index']).flatten().astype(float)
+    raw = interp.get_tensor(out['index']).flatten().astype(float)
     # 反量化。不能用 isinstance(q, tuple) 判断：TF 各版本里
     # details['quantization'] 可能是 tuple / list / ndarray，
     # 判断失败会导致整型输出不被反量化，直接拿 int8 原始值(-128..127)
     # 去和参考模型的 sigmoid 输出([0,1]) 比，cos 会低到 ~0.002
     # （CI run 38913214531 实测）。故直接按下标解包。
     q = out.get('quantization', None)
+    v = raw
     if q is not None:
         try:
             qsc = float(q[0])
             qzp = float(q[1])
             if qsc:
-                v = (v - qzp) * qsc
+                v = (raw - qzp) * qsc
         except (TypeError, IndexError, ValueError):
             pass
+    if DEBUG['n'] < 2:
+        DEBUG['n'] += 1
+        print('DBG in: dtype=%s shape=%s quant=%s type=%s' % (
+            inp['dtype'], shape, inp.get('quantization'), type(
+                inp.get('quantization'))), flush=True)
+        print('DBG in: fed range=[%.1f,%.1f] first8=%s' % (
+            float(np.min(t)), float(np.max(t)),
+            np.ravel(t)[:8].tolist()), flush=True)
+        print('DBG out: dtype=%s quant=%s type=%s' % (
+            out['dtype'], q, type(q)), flush=True)
+        print('DBG out: raw  range=[%.1f,%.1f] first8=%s' % (
+            raw.min(), raw.max(), np.round(raw[:8], 3).tolist()), flush=True)
+        print('DBG out: deq  range=[%.4f,%.4f] first8=%s' % (
+            v.min(), v.max(), np.round(v[:8], 4).tolist()), flush=True)
     return v.tolist()
 
 
