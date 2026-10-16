@@ -80,58 +80,94 @@ jobs:
           cmake --version | head -1
           ninja --version
 
-      # ⚠️ sysroot 只提供 **libc**，libstdc++ 头与库一律用交叉编译器自带的。
+      # 【第3次·决定性】去掉冲突后仍失败，且暴露了根本矛盾：
+      #   undefined reference to `__isoc23_strtol'        ← glibc 2.38+
+      #   undefined reference to `__libc_single_threaded' ← glibc 2.32+
+      #   undefined reference to `_dl_find_object'        ← glibc 2.35+
+      #   undefined reference to `arc4random'             ← glibc 2.36+
+      #   这些来自 Ubuntu gcc-13 **静态链入**的 libstdc++.a / libgcc_eh.a，
+      #   它们本身是按 glibc 2.39 编译的 → 无论怎么调 include 都消不掉。
+      #   结论：**Ubuntu 24.04 的交叉工具链无法产出 glibc≤2.36 兼容的 C++ 二进制。**
       #
-      # 踩过的坑（连续两次失败）：
+      # 【最终解法】改用 Debian bullseye 官方的 gcc-10-aarch64-linux-gnu 交叉工具链。
+      #   编译器(gcc-10) / libstdc++(10) / glibc(2.31) 三者同源同版本，
+      #   不存在任何跨版本混用。libteflon.so 那边用 Ubuntu 工具链编 C 是没问题的
+      #   （纯 C 不碰 libstdc++/libgcc 展开器），C++ 才必须换。
       #
-      # 【第1次】把 Debian sysroot 的 `usr/include/c++/10`（GCC 10）用 -isystem 塞进去，
-      #   编译器同时看到两套 libstdc++ 头 →
-      #   `_GLIBCXX20_DEPRECATED` 未定义 → 一片语法错误。
-      #   libstdc++ 头与编译器版本强绑定，跨版本混用必然失败。
-      #
-      # 【第2次】去掉 libstdc++ 冲突后仍失败，暴露更深一层：
-      #   Ubuntu 交叉编译器把 `/usr/aarch64-linux-gnu/include`（glibc **2.39** 头）
-      #   硬编码进搜索路径，`--sysroot` 盖不住它 →
-      #   /usr/aarch64-linux-gnu/include/stdlib.h 与 Debian 2.31 头混用 →
-      #   `expected initializer before '__attr_dealloc'`。
-      #   即：**两套 glibc 头在混用**，正是本 workflow 开头要躲的那个坑。
-      #
-      # 【解法】-nostdinc + 显式列出全部 include 目录：
-      #   保留  GCC 自带头        /usr/lib/gcc-cross/aarch64-linux-gnu/13/include
-      #   保留  gcc-13 libstdc++  /usr/aarch64-linux-gnu/include/c++/13{,/aarch64-linux-gnu,/backward}
-      #   剔除  Ubuntu glibc 2.39 /usr/aarch64-linux-gnu/include        ← 关键
-      #   换上  Debian glibc 2.31  $SR/usr/include{,/aarch64-linux-gnu}
-      #
-      # 剩下的组合是 gcc-13 libstdc++ 头 + glibc 2.31 头，
-      # 这是 libstdc++ 官方支持范围内的组合（gcc-13 支持 glibc ≥ 2.17），安全。
-      - name: Build aarch64 C++ sysroot (Debian bullseye, glibc 2.31)
+      # 用 --download-only + 手动解包，**不污染 runner**：
+      #   bullseye 的交叉包会依赖 bullseye 的 libc6（宿主 amd64），
+      #   真安装会与 Ubuntu 24.04 的 glibc 2.39 冲突并可能降级破坏 runner。
+      #   下载解包到 $SR 独立前缀，runner 本身不动。
+      - name: Fetch Debian bullseye cross toolchain (gcc-10 aarch64) + build sysroot
         run: |
           set -eux
-          chmod +x oes-teflon/build-recipe/make-sysroot-cxx.sh
-          sh oes-teflon/build-recipe/make-sysroot-cxx.sh "$RUNNER_TEMP/sysroot"
           SR="$RUNNER_TEMP/sysroot"
+          DEBS="$RUNNER_TEMP/debs"
 
-          # 把交叉编译器默认 include 目录解析出来，剔除 Ubuntu 的 glibc 头目录，
-          # 再拼上 Debian sysroot 的 glibc 头目录。
-          echo "=== 交叉编译器默认 include 搜索列表 ==="
-          echo | aarch64-linux-gnu-g++ -E -Wp,-v -xc++ - 2>&1 \
-            | sed -n '/search starts here/,/End of search list/p' || true
+          # ---- 1. 原有 sysroot（Debian bullseye arm64 glibc 2.31）----
+          chmod +x oes-teflon/build-recipe/make-sysroot-cxx.sh
+          sh oes-teflon/build-recipe/make-sysroot-cxx.sh "$SR"
 
-          GCC_INC=$(echo | aarch64-linux-gnu-g++ -E -Wp,-v -xc++ - 2>&1 \
-            | sed -n 's|^ \(\/[^ ]*\)$|\1|p' \
-            | grep -v '^/usr/aarch64-linux-gnu/include$' \
-            | tr '\n' ' ')
-          echo "保留(编译器自带): $GCC_INC"
-          echo "剔除(Ubuntu glibc 2.39 头): /usr/aarch64-linux-gnu/include"
-          echo "换上(Debian glibc 2.31 头): $SR/usr/include/aarch64-linux-gnu $SR/usr/include"
+          # ---- 2. Debian bullseye 交叉工具链（gcc-10 aarch64-linux-gnu）----
+          echo "deb http://deb.debian.org/debian bullseye main" \
+            > /etc/apt/sources.list.d/bullseye-cross.list
+          apt-get update -qq
 
+          # 显式列出，不走依赖求解：
+          # apt 的自动求解会拉 bullseye 的 libc6（amd64）并要求降级，会失败。
+          # 这几个包在 Ubuntu 上都有等价物，宿主侧运行依赖由系统满足。
+          apt-get download -q -o Dir::Cache="$DEBS" \
+            gcc-10-cross gcc-10-cross-base \
+            gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
+            cpp-10-aarch64-linux-gnu libgcc-10-dev-arm64-cross \
+            gcc-10-base:arm64 libgcc-s1:arm64
+
+          ls -la ./*.deb | head -20
+          mkdir -p "$SR"
+          for d in ./*.deb; do
+            rm -rf "$RUNNER_TEMP/_x"; mkdir -p "$RUNNER_TEMP/_x"
+            ( cd "$RUNNER_TEMP/_x" \
+              && ar x "$OLDPWD/$d" \
+              && tar xf data.tar.* \
+              && rm -f data.tar.* control.tar.* debian-binary )
+            cp -a "$RUNNER_TEMP/_x/." "$SR/"
+          done
+          rm -f ./*.deb
+
+          # ---- 3. 校验工具链就位 ----
+          CXX="$SR/usr/bin/aarch64-linux-gnu-g++-10"
+          test -x "$CXX"
+          echo "CXX=$CXX" >> "$GITHUB_ENV"
+          "$CXX" --version | head -1
+          ls "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" | head
+          # libgcc.a 必须是 arm64 的
+          file "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/libgcc.a" 2>/dev/null | head -1 || true
+          ar t "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/libgcc.a" 2>/dev/null | head -2 || true
+
+          # ---- 4. 显式 include 列表 ----
+          # Debian 的交叉 gcc 与 Ubuntu 一样，把 /usr/aarch64-linux-gnu/include
+          # 写进了默认搜索路径（那是 Ubuntu 的 glibc 2.39 头）。
+          # 必须 -nostdinc 并全部显式列出：
+          #   GCC 自带：  $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/include
+          #   libstdc++10：$SR/usr/include/c++/10{,/aarch64-linux-gnu}
+          #   glibc 2.31：$SR/usr/include{,/aarch64-linux-gnu}
+          # 三者同为 GCC 10 / glibc 2.31，无版本冲突。
           INC_FLAGS="-nostdinc"
-          for d in $GCC_INC; do INC_FLAGS="$INC_FLAGS -isystem $d"; done
-          INC_FLAGS="$INC_FLAGS -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include"
+          for d in "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/include" \
+                   "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/include-fixed" \
+                   "$SR/usr/include/c++/10" \
+                   "$SR/usr/include/c++/10/aarch64-linux-gnu" \
+                   "$SR/usr/include/aarch64-linux-gnu" \
+                   "$SR/usr/include" ; do
+            [ -d "$d" ] && INC_FLAGS="$INC_FLAGS -isystem $d"
+          done
           echo "INC_FLAGS=$INC_FLAGS" >> "$GITHUB_ENV"
           echo "INC_FLAGS=$INC_FLAGS"
+          # 确认 Ubuntu 的 glibc 头确实不在列表里
+          echo "$INC_FLAGS" | grep -q '/usr/aarch64-linux-gnu/include ' \
+            && { echo "ERROR: Ubuntu glibc 2.39 头仍混入了 include 列表"; exit 1; } || true
 
-          # 交叉编译器自检：能编能链才继续
+          # ---- 5. probe 自检（含 glibc 符号天花板）----
           cat > "$RUNNER_TEMP/probe.cpp" <<'EOF'
           #include <cstdio>
           #include <vector>
@@ -139,24 +175,32 @@ jobs:
           #include <cstdlib>
           int main(){
             std::vector<std::string> v{"ok"};
-            void* p = std::aligned_alloc(64, 64);   /* glibc≥2.16 才有，验证头版本对得上 */
+            void* p = std::aligned_alloc(64, 64);
             std::free(p);
             std::printf("%s %ld\n", v[0].c_str(), (long)std::strtol("42", nullptr, 10));
             return 0;
           }
           EOF
-          aarch64-linux-gnu-g++ $INC_FLAGS \
-            --sysroot="$SR" \
-            -B "$SR/usr/lib/aarch64-linux-gnu/" \
+          "$CXX" -O2 --sysroot="$SR" $INC_FLAGS \
+            -B "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" \
+            -B "$SR/usr/aarch64-linux-gnu/bin/" \
             -L "$SR/usr/lib/aarch64-linux-gnu" \
+            -L "$SR/lib/aarch64-linux-gnu" \
             -static-libstdc++ -static-libgcc \
             -o "$RUNNER_TEMP/probe" "$RUNNER_TEMP/probe.cpp"
           file "$RUNNER_TEMP/probe"
           readelf -h "$RUNNER_TEMP/probe" | grep Machine
-          # probe 自身也要过 glibc 天花板
+          echo "=== NEEDED ==="; readelf -d "$RUNNER_TEMP/probe" | grep NEEDED || true
           max=$(readelf -V "$RUNNER_TEMP/probe" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 | cut -d. -f2)
-          echo "probe 最高符号: GLIBC_2.${max:-?}"
-          [ -z "$max" ] || [ "$max" -le 36 ] || { echo "ERROR: probe 超出设备 glibc 2.36"; exit 1; }
+          echo "probe 最高符号: GLIBC_2.${max:-?}  (设备 2.36)"
+          if [ -n "$max" ] && [ "$max" -gt 36 ]; then
+            echo "ERROR: probe 超出设备 glibc 2.36 —— 换工具链的思路不成立"
+            readelf -sW "$RUNNER_TEMP/probe" | grep -E "GLIBC_2\.(3[7-9]|[4-9][0-9])" | head -10
+            exit 1
+          fi
+          readelf -sW "$RUNNER_TEMP/probe" | grep -q "__isoc23" \
+            && { echo "ERROR: 仍引用 __isoc23_*"; exit 1; } || true
+          echo "OK: probe 符号版本符合设备"
 
       - name: Fetch TFLite source (2.13.0 — must match Mesa 24.3.0 vendored headers)
         run: |
@@ -182,8 +226,8 @@ jobs:
           cat > "$RUNNER_TEMP/tc.cmake" <<EOF
           set(CMAKE_SYSTEM_NAME Linux)
           set(CMAKE_SYSTEM_PROCESSOR aarch64)
-          set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
-          set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+          set(CMAKE_C_COMPILER   "$SR/usr/bin/aarch64-linux-gnu-gcc-10")
+          set(CMAKE_CXX_COMPILER "$SR/usr/bin/aarch64-linux-gnu-g++-10")
           set(CMAKE_SYSROOT      "$SR")
           set(CMAKE_FIND_ROOT_PATH "$SR")
           # 交叉编译时不要去找宿主（amd64）的库
@@ -191,12 +235,11 @@ jobs:
           set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
           set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
           # TFLite 的 try_compile 会用到这些
-          # $INC_FLAGS 在上一步算出并存入 GITHUB_ENV：
-          #   -nostdinc + GCC 自带头 + gcc-13 libstdc++ + Debian 2.31 glibc 头
-          # ⚠️ 绝不能只写 --sysroot：Ubuntu 交叉编译器会硬编码
-          #   /usr/aarch64-linux-gnu/include（glibc 2.39 头），盖不掉。
-          set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
-          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          # $INC_FLAGS 含 -nostdinc：剔除 Ubuntu glibc 2.39 头，换 Debian 2.31 头。
+          # -B 指向 Debian gcc-10 自己的 libgcc.a 与 binutils。
+          # 详见上面 fetch 步骤的注释。
+          set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/ -B $SR/usr/aarch64-linux-gnu/bin/ -L $SR/usr/lib/aarch64-linux-gnu -L $SR/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/ -B $SR/usr/aarch64-linux-gnu/bin/ -L $SR/usr/lib/aarch64-linux-gnu -L $SR/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           EOF
 
@@ -241,9 +284,11 @@ jobs:
           # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
           # $INC_FLAGS 含 -nostdinc，作用同上：剔除 Ubuntu glibc 2.39 头，
           # 换上 Debian 2.31 头。详见 sysroot 步骤注释。
-          aarch64-linux-gnu-g++ -O2 --sysroot="$SR" $INC_FLAGS \
-            -B "$SR/usr/lib/aarch64-linux-gnu/" \
+          "$CXX" -O2 --sysroot="$SR" $INC_FLAGS \
+            -B "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" \
+            -B "$SR/usr/aarch64-linux-gnu/bin/" \
             -L "$SR/usr/lib/aarch64-linux-gnu" \
+            -L "$SR/lib/aarch64-linux-gnu" \
             -static-libstdc++ -static-libgcc \
             $INC \
             -o "$RUNNER_TEMP/tf_load_check" \
