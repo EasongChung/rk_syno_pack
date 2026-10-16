@@ -331,6 +331,14 @@ jobs:
             -DTFLITE_ENABLE_INSTALL=OFF \
             -DTFLITE_ENABLE_DELEGATE_LIBRARY=OFF \
             -DBUILD_TESTS=OFF \
+            # 交叉编译下 FindThreads 的两个标准开关：
+            #  1. THREADS_PREFER_PTHREAD_FLAG=ON —— 用 -pthread 而不是 -lpthread。
+            #     CMake 默认去找单独的 pthread 库并做运行时探测，交叉编译下探测必失败
+            #     （报 "Could NOT find Threads"，即使 sysroot 里 libpthread.so 齐全）。
+            #  2. CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY —— 只编译不链接可执行文件，
+            #     避免交叉目标无法运行导致的误判。
+            -DTHREADS_PREFER_PTHREAD_FLAG=ON \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fc"
 
           cmake --build "$BUILD" --target tensorflow-lite -j"$(nproc)"
