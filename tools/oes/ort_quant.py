@@ -369,9 +369,10 @@ def main():
              '--calib-num', str(min(args.num_calib, 50)),
              '--clean-k', str(args.clean_k)],
             capture_output=True, text=True)
-        print(r.stdout[-2000:], flush=True)
+        print(r.stdout[-4000:], flush=True)
         if r.returncode:
-            print(r.stderr[-1500:], file=sys.stderr, flush=True)
+            print('--- Route C stderr ---', flush=True)
+            print(r.stderr[-3000:], flush=True)
             raise SystemExit('Route C failed (exit=%d)' % r.returncode)
     elif args.direct_tflite:
         # ORT 1.16/1.31 的 quantize_static 始终写 ONNX（model_output 的后缀

@@ -20,6 +20,7 @@ import glob
 import os
 import subprocess
 import sys
+import sys as _sys
 
 import numpy as np
 
@@ -162,19 +163,38 @@ def main():
         # 关键：onnx2tf 会用这份数据重新校准。若喂未清洗的集（含把激活
         # 推到 1633 的脏图），它会算回和 QDQ 图一样被撑爆的 scale，
         # 白费清洗成果。故强制走 ort_quant.clean_calib_files。
+        # 注意：清洗很慢（逐图跑 float 子模型），故先打印，避免
+        # 失败时看不到任何上下文。
+        print('CLEAN-CALIB: start (dir=%s num*4=%d k=%.1f)' % (
+            args.calib_dir, args.calib_num * 4, args.clean_k), flush=True)
+        _sys.stdout.flush()
         import sys as _s
         _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import ort_quant as _oq
-        keep = _oq.clean_calib_files(args.qdq, args.calib_dir,
-                                     args.calib_num * 4, args.clean_k,
-                                     os.path.join(args.workdir, 'calib'))
+        try:
+            keep = _oq.clean_calib_files(args.qdq, args.calib_dir,
+                                         args.calib_num * 4, args.clean_k,
+                                         os.path.join(args.workdir, 'calib'))
+        except Exception as e:
+            print('CLEAN-CALIB failed (%s: %s); '
+                  'falling back to raw calib dir' % (type(e).__name__,
+                                                     str(e)[:160]), flush=True)
+            _sys.stdout.flush()
+            keep = None
         tmpdir = os.path.join(args.workdir, 'calib_clean')
+        if os.path.isdir(tmpdir):
+            import shutil as _sh2
+            _sh2.rmtree(tmpdir, ignore_errors=True)
         os.makedirs(tmpdir, exist_ok=True)
         import shutil as _sh
-        for f in os.listdir(tmpdir):
-            _sh.rmtree(os.path.join(tmpdir, f), ignore_errors=True)
-        for f in keep[:args.calib_num]:
+        srcs = keep if keep else sorted(
+            os.path.join(args.calib_dir, f) for f in os.listdir(args.calib_dir)
+            if f.lower().endswith(('.jpg', '.jpeg', '.png')))
+        for f in srcs[:args.calib_num]:
             _sh.copy(f, os.path.join(tmpdir, os.path.basename(f)))
+        print('CLEAN-CALIB: prepared %d calibration images' %
+              len(os.listdir(tmpdir)), flush=True)
+        _sys.stdout.flush()
         npy = build_calib_npy(tmpdir, args.calib_num, args.calib_name,
                               out_dir=os.path.join(args.workdir,
                                                    'o2tf_calib'))
@@ -190,6 +210,7 @@ def main():
             npy, np.load(npy).shape, len(os.listdir(tmpdir))), flush=True)
         print('cind arg: %s' % kw['custom_input_op_name_np_data_path'],
               flush=True)
+        _sys.stdout.flush()
     else:
         print('WARNING: no --calib-dir given; onnx2tf INT8 calibration '
               'will likely fail', flush=True)
