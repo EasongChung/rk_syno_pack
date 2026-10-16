@@ -38,9 +38,14 @@ os.makedirs(OUT, exist_ok=True)
 
 
 # ---------------------------------------------------------------- 小图
-def make_float_onnx(path, n=64):
-    """构造一个小 float ONNX（与 concept 同构：Conv-ReLU 堆叠 + GAP + FC +
-    Sigmoid），供各路线量化用。尺寸取小是为了探针快。"""
+def make_float_onnx(path):
+    """构造一个小 float ONNX（与 concept 同构：Conv-ReLU 堆叠 + GAP + FC
+    + Sigmoid）。尺寸取小是为了探针快。
+
+    注意：初版这里用 Flatten(axis=1) 导致 ORT shape 推断失败
+    （Type 'tensor(int32)' of input parameter ... INVALID_GRAPH），
+    改用显式 Reshape 到 2D，与 concept 图的写法一致。
+    """
     X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1, 16, 16, 3])
     Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1, 8])
     rs = np.random.RandomState(0)
@@ -52,18 +57,19 @@ def make_float_onnx(path, n=64):
         b = rs.randn(c).astype(np.float32) * 0.01
         inits.append(helper.make_tensor('w%d' % i, TensorProto.FLOAT,
                                         list(w.shape), w.ravel()))
-        inits.append(helper.make_tensor('b%d' % i, TensorProto.FLOAT, [c],
-                                        b))
+        inits.append(helper.make_tensor('b%d' % i, TensorProto.FLOAT, [c], b))
         nodes.append(helper.make_node('Conv', [prev, 'w%d' % i, 'b%d' % i],
                                       ['c%d' % i]))
         nodes.append(helper.make_node('Relu', ['c%d' % i], ['r%d' % i]))
         prev = 'r%d' % i
     nodes.append(helper.make_node('GlobalAveragePool', [prev], ['g']))
-    nodes.append(helper.make_node('Flatten', ['g'], ['f'], axis=1))
+    inits.append(helper.make_tensor('shape', TensorProto.INT64, [2],
+                                    [1, chans[-1]]))
+    nodes.append(helper.make_node('Reshape', ['g', 'shape'], ['f']))
     gf = rs.randn(8, chans[-1]).astype(np.float32) * 0.05
     inits.append(helper.make_tensor('gw', TensorProto.FLOAT,
                                     list(gf.shape), gf.ravel()))
-    nodes.append(helper.make_node('Gemm', ['f', 'gw'], ['o'], transB=1))
+    nodes.append(helper.make_node('MatMul', ['f', 'gw'], ['o']))
     nodes.append(helper.make_node('Sigmoid', ['o'], ['y']))
     g = helper.make_graph(nodes, 'mini', [X], [Y], inits)
     m = helper.make_model(g, opset_imports=[helper.make_opsetid('', 13)])
@@ -129,8 +135,13 @@ def r1_o2tf_then_converter(float_onnx, iname, sz):
     """onnx2tf -> SavedModel -> TFLiteConverter(INT8)。"""
     import tensorflow as tf
     d = os.path.join(OUT, 'r1_sm')
-    r = subprocess.run([sys.executable, '-m', 'onnx2tf', '-i', float_onnx,
-                        '-o', d, '--non_verbose', '-kt', iname],
+    # 必须走 run_onnx2tf.py：onnx2tf 内部 np.load(allow_pickle=False) 在
+    # numpy>=1.24 下会炸掉自带的校准 npy，该包装器已打补丁。
+    r = subprocess.run([sys.executable,
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'run_onnx2tf.py'),
+                        '-i', float_onnx, '-o', d,
+                        '--non_verbose', '-kt', iname],
                        capture_output=True, text=True)
     if r.returncode:
         print('  [R1] onnx2tf rc=%d: %s' % (r.returncode,
@@ -138,7 +149,8 @@ def r1_o2tf_then_converter(float_onnx, iname, sz):
         return False
     sm = os.path.join(d, 'float32')
     if not os.path.isdir(sm):
-        print('  [R1] no saved_model dir')
+        print('  [R1] no saved_model dir; entries=%s' %
+              os.listdir(d) if os.path.isdir(d) else 'no out dir')
         return False
     try:
         conv = tf.lite.TFLiteConverter.from_saved_model(sm)
@@ -211,8 +223,10 @@ def r4_control_o2tf_qdq(float_onnx, iname, sz):
              if n.op_type in ('QuantizeLinear', 'DequantizeLinear'))
     print('  [R4] QDQ onnx has %d Q/DQ nodes' % nq)
     d = os.path.join(OUT, 'r4_sm')
-    r = subprocess.run([sys.executable, '-m', 'onnx2tf', '-i', q, '-o', d,
-                        '--non_verbose', '-kt', iname],
+    r = subprocess.run([sys.executable,
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'run_onnx2tf.py'),
+                        '-i', q, '-o', d, '--non_verbose', '-kt', iname],
                        capture_output=True, text=True)
     if r.returncode:
         print('  [R4] onnx2tf rc=%d' % r.returncode)
@@ -230,14 +244,23 @@ def main():
     print('mini float onnx: %d nodes' % len(m.graph.node))
 
     res = {}
+
+    def safe(key, fn):
+        try:
+            res[key] = fn()
+        except Exception as e:
+            print('  [%s] EXCEPTION: %s: %s' % (key, type(e).__name__,
+                                                str(e)[:180]))
+            res[key] = False
+
     print('\n[R1] onnx2tf -> SavedModel -> TFLiteConverter(INT8):')
-    res['R1'] = r1_o2tf_then_converter(fp, iname, sz)
+    safe('R1', lambda: r1_o2tf_then_converter(fp, iname, sz))
     print('\n[R2] ORT quantize_static -> .tflite (QDQ):')
-    res['R2'] = r2_ort_direct(fp, iname, sz)
+    safe('R2', lambda: r2_ort_direct(fp, iname, sz))
     print('\n[R3] ORT quantize_static -> .tflite (QOperator):')
-    res['R3'] = r3_ort_qop_direct(fp, iname, sz)
+    safe('R3', lambda: r3_ort_qop_direct(fp, iname, sz))
     print('\n[R4] control: ORT-QDQ -> onnx2tf (expect FLOAT):')
-    res['R4'] = r4_control_o2tf_qdq(fp, iname, sz)
+    safe('R4', lambda: r4_control_o2tf_qdq(fp, iname, sz))
 
     print('\n=== ROUTE VERDICT ===')
     good = [k for k, v in res.items() if v]
