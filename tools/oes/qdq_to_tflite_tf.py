@@ -108,6 +108,8 @@ def main():
     ap.add_argument('--workdir', default='work')
     ap.add_argument('--out', required=True)
     ap.add_argument('--input-name', default='inputs_0')
+    ap.add_argument('--clean-k', type=float, default=3.0,
+                    help='校准集离群剔除阈值（mag > k * median）')
     ap.add_argument('--int16', action='store_true')
     args = ap.parse_args()
 
@@ -123,10 +125,33 @@ def main():
         print('=== TA1 FAILED: %s ===' % e, flush=True)
         raise
 
-    npy = build_calib_npy(args.calib_dir, args.calib_num,
+    print('=== TA2: cleaning calib set (mandatory) ===', flush=True)
+    _sys.stdout.flush()
+    # 必须清洗：本路线是 TFLiteConverter 独立重新校准（不搬运 ORT 的
+    # QDQ scale），若喂未清洗的 calib 目录，那张 mag=541.54 的脏图
+    # （oes-calib-0014.jpg，正好在排序前 100 张内）会再次撑爆 scale。
+    # CI run 38911268432 实测：未清洗 -> regress cos=0.009 / top1=0.005。
+    import shutil as _sh
+    import sys as _s
+    _s.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import ort_quant as _oq
+    qdq_or_float = args.float_onnx
+    keep = _oq.clean_calib_files(qdq_or_float, args.calib_dir,
+                                 args.calib_num * 4, args.clean_k,
+                                 os.path.join(args.workdir, 'calib'))
+    tmpdir = os.path.join(args.workdir, 'calib_clean')
+    if os.path.isdir(tmpdir):
+        _sh.rmtree(tmpdir, ignore_errors=True)
+    os.makedirs(tmpdir, exist_ok=True)
+    for f in keep[:args.calib_num]:
+        _sh.copy(f, os.path.join(tmpdir, os.path.basename(f)))
+    print('cleaned calib: %d images' % len(os.listdir(tmpdir)), flush=True)
+    _sys.stdout.flush()
+
+    npy = build_calib_npy(tmpdir, args.calib_num,
                          os.path.join(args.workdir, 'tf_calib'))
     calib = np.load(npy)
-    print('=== TA2: calib %s shape=%s range=[%.3f,%.3f] ===' % (
+    print('=== TA2b: calib %s shape=%s range=[%.3f,%.3f] ===' % (
         npy, calib.shape, calib.min(), calib.max()), flush=True)
     _sys.stdout.flush()
 
