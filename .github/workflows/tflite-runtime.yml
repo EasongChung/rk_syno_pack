@@ -80,6 +80,20 @@ jobs:
           cmake --version | head -1
           ninja --version
 
+      # ⚠️ sysroot 只提供 **libc**，libstdc++ 头与库一律用交叉编译器自带的。
+      #
+      # 踩过的坑（首次运行失败）：把 Debian sysroot 的
+      # `usr/include/c++/10`（GCC 10）用 -isystem 塞进去后，编译器同时看到了
+      #   /usr/aarch64-linux-gnu/include/c++/13/...   ← Ubuntu 交叉编译器自带（GCC 13）
+      #   $SR/usr/include/c++/10/type_traits          ← Debian sysroot（GCC 10）
+      # 两套 libstdc++ 头混合 → `_GLIBCXX20_DEPRECATED` 宏未定义 →
+      # "expected identifier before '(' token"，一堆语法错误。
+      # libstdc++ 头与编译器版本强绑定，跨版本混用必然失败。
+      #
+      # 所以：-isystem 里不要出现 $SR/usr/include/c++。
+      # 用 -static-libstdc++ -static-libgcc 把 libstdc++ 静态链进去，
+      # 避免运行时依赖 Ubuntu 那份（它是按 glibc 2.39 构建的）。
+      # job 末尾的 glibc 天花板闸门会校验静态链入后是否引入超限符号。
       - name: Build aarch64 C++ sysroot (Debian bullseye, glibc 2.31)
         run: |
           set -eux
@@ -94,8 +108,6 @@ jobs:
           int main(){ std::vector<std::string> v{"ok"}; std::printf("%s\n", v[0].c_str()); return 0; }
           EOF
           aarch64-linux-gnu-g++ --sysroot="$SR" \
-            -isystem "$SR/usr/include/c++/10" \
-            -isystem "$SR/usr/include/c++/10/aarch64-linux-gnu" \
             -isystem "$SR/usr/include/aarch64-linux-gnu" \
             -isystem "$SR/usr/include" \
             -B "$SR/usr/lib/aarch64-linux-gnu/" \
@@ -138,8 +150,11 @@ jobs:
           set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
           set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
           # TFLite 的 try_compile 会用到这些
-          set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR -isystem $SR/usr/include/c++/10 -isystem $SR/usr/include/c++/10/aarch64-linux-gnu -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
-          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR -isystem $SR/usr/include/c++/10 -isystem $SR/usr/include/c++/10/aarch64-linux-gnu -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          # ⚠️ 绝不要在这里加 $SR/usr/include/c++ —— 那是 Debian 的 GCC 10 头，
+          #    与 Ubuntu 交叉编译器自带的 GCC 13 头冲突，会导致语法错误。
+          #    详见上面 sysroot 步骤的注释。
+          set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR -isystem $SR/usr/include/aarch64-linux-gnu -isystem $SR/usr/include -B $SR/usr/lib/aarch64-linux-gnu/ -L $SR/usr/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           EOF
 
@@ -182,9 +197,9 @@ jobs:
           done
 
           # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
+          # ⚠️ 不要加 -isystem $SR/usr/include/c++（Debian GCC 10 头，
+          #    与交叉编译器自带的 GCC 13 头冲突）。
           aarch64-linux-gnu-g++ -O2 --sysroot="$SR" \
-            -isystem "$SR/usr/include/c++/10" \
-            -isystem "$SR/usr/include/c++/10/aarch64-linux-gnu" \
             -isystem "$SR/usr/include/aarch64-linux-gnu" \
             -isystem "$SR/usr/include" \
             -B "$SR/usr/lib/aarch64-linux-gnu/" \
