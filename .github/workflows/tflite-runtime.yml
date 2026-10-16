@@ -114,7 +114,10 @@ jobs:
           #    - apt-get update 写 /var/lib/apt/lists/lock → Permission denied
           #    两条都要处理：sources 放 $RUNNER_TEMP 由 -o 指过去（避第一步），
           #    update 本身必须 sudo（它要写系统索引目录）。
-          echo "deb http://deb.debian.org/debian bullseye main" \
+          # [trusted=yes]：Ubuntu 的 keyring 里没有 Debian bullseye 的归档密钥
+          # （NO_PUBKEY 0E98404D386FA1D9 等）。这里只用来下载交叉工具链，
+          # 且已用 --download-only + 手动解包，不进入 runner 的信任链。
+          echo "deb [trusted=yes] http://deb.debian.org/debian bullseye main" \
             > "$RUNNER_TEMP/bullseye.list"
           APT_OPTS="-o Dir::Etc::sourcelist=$RUNNER_TEMP/bullseye.list -o Dir::Etc::sourceparts=/dev/null -o APT::Get::List-Cleanup=0"
           sudo apt-get update -qq $APT_OPTS
