@@ -325,4 +325,13 @@ def main():
             raise SystemExit(
                 'direct-tflite unsupported: ORT wrote ONNX not TFLite (%s). '
                 'Use --quant-format qoperator without --direct-tflite so the '
+                'QOperator graph goes through onnx2tf.' % qdq_path)
+        stage_check_tflite_int8(direct, os.path.join(args.outdir, tflite_name))
+    else:
+        stage_qdq_to_tflite(qdq_path, os.path.join(args.outdir, tflite_name))
+    print('ORTQ DONE [%s]' % (args.tag or 'default'), flush=True)
+
+
+if __name__ == '__main__':
+    main()
                 
