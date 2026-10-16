@@ -373,14 +373,23 @@ def main():
         with open(log_path, 'w', encoding='utf-8', errors='replace') as lf:
             r = subprocess.run(cmd, stdout=lf,
                                stderr=subprocess.STDOUT, text=True)
+        # TF 会刷上万行 TensorSpec 噪音，尾部回显会把我们的 stage marker
+        # 挤掉。故：head 取前 40 行（我们的标记都在开头），tail 取后 40 行
+        # （真正的报错/结果通常在结尾），中间只报行数。
         try:
             with open(log_path, encoding='utf-8', errors='replace') as lf:
-                body = lf.read()
+                rows = lf.read().splitlines()
         except OSError as e:
-            body = '(cannot read %s: %s)' % (log_path, e)
-        print('=== Route C log (%s, %d bytes) ===' % (log_path, len(body)),
+            rows = ['(cannot read %s: %s)' % (log_path, e)]
+        print('=== Route C log: %s, %d lines ===' % (log_path, len(rows)),
               flush=True)
-        print(body[-8000:], flush=True)
+        print('--- head(40) ---', flush=True)
+        for _l in rows[:40]:
+            print(_l, flush=True)
+        print('--- tail(40) ---', flush=True)
+        for _l in rows[-40:]:
+            print(_l, flush=True)
+        print('=== end Route C log ===', flush=True)
         if r.returncode:
             raise SystemExit('Route C failed (exit=%d)' % r.returncode)
     elif args.direct_tflite:
