@@ -125,7 +125,27 @@ jobs:
             --require-int8 --out out/report_ortq_clean.json \
             || echo "REGRESS: exit=$? (report kept for review)"
 
-      - name: Summary
+      - name: Diagnose QDQ->TFLite quantization loss
+        if: always()
+        run: |
+          set -euo pipefail
+          Q=work/concept_ort_qdq_clean.onnx
+          test -f "$Q" || { echo "DIAG: qdq onnx missing"; exit 0; }
+          ls -la "$Q"
+          python - "$Q" <<'PY'
+          import sys, collections
+          import onnx
+          m = onnx.load(sys.argv[1])
+          ops = collections.Counter(n.op_type for n in m.graph.node)
+          print('DIAG nodes=%d' % len(m.graph.node))
+          print('DIAG op histogram:', dict(sorted(ops.items())))
+          # QDQ 格式的特征：DequantizeLinear/QuantizeLinear 应大量存在
+          nq = ops.get('QuantizeLinear', 0) + ops.get('DequantizeLinear', 0)
+          print('DIAG QDQ nodes=%d' % nq)
+          assert nq > 0, 'QDQ graph has NO Q/DQ nodes -> 上游就没量化'
+          print('DIAG QDQ graph OK (onnx2tf 侧丢失)')
+          PY
+          - name: Summary
         if: always()
         run: |
           set -euo pipefail
@@ -145,4 +165,5 @@ jobs:
             out/*.tflite
             out/report_ortq_clean.json
             out/compare.json
+            work/concept_ort_qdq_clean.onnx
           if-no-files-found: warn
