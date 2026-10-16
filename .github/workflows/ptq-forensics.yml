@@ -99,13 +99,31 @@ jobs:
           python tools/oes/fetch_photos.py --dest calib --prefix oes-calib --count 300 --min-ok 50
           ls calib | wc -l
 
-      - name: Three-stage PTQ forensics
+      - name: Stage 1 - per-image max (verdict point) + MinMax
         run: |
           set -euo pipefail
           python tools/oes/ptq_forensics.py \
             --float-onnx work/concept_split.onnx \
             --calib-dir calib --num-calib 300 \
-            --workdir work --outdir out
+            --workdir work --outdir out --stages 1
+
+      - name: Stage 2 - entropy (same calib set)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python tools/oes/ptq_forensics.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 \
+            --workdir work --outdir out --stages 2
+
+      - name: Stage 3 - MinMax on cleaned calib set
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python tools/oes/ptq_forensics.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 \
+            --workdir work --outdir out --stages 3
 
       - name: Upload verdict report
         if: always()

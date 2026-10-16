@@ -54,31 +54,34 @@ def calib_files(calib_dir, num):
 
 
 class ListReader:
-    """按文件列表构造校准数据。
+    """按文件列表流式提供校准数据（不缓存全量，避免 CI 内存峰值）。
 
     预处理逐字复制 ort_quant.Reader（NET/MEAN/SCALE 从该模块 import，
     保证与服务端、与 ort_quant 主流程逐位一致）。
     """
 
     def __init__(self, files, input_name):
+        from ort_quant import NET
+        self.files = files
+        self.input_name = input_name
+        self.size = NET
+        self.i = 0
+
+    @staticmethod
+    def _load(path, size):
         from PIL import Image
         from ort_quant import MEAN, NET, SCALE
-        self.input_name = input_name
-        self.data = []
-        for f in files:
-            img = Image.open(f).convert('RGB').resize(
-                (NET, NET), Image.BILINEAR)
-            arr = np.frombuffer(img.tobytes(),
-                                dtype=np.uint8).astype(np.float32)
-            arr = ((arr - MEAN) * SCALE).reshape(1, NET, NET, 3)
-            self.data.append({input_name: arr})
-        self.i = 0
+        img = Image.open(path).convert('RGB').resize(
+            (NET, NET), Image.BILINEAR)
+        arr = np.frombuffer(img.tobytes(),
+                            dtype=np.uint8).astype(np.float32)
+        return ((arr - MEAN) * SCALE).reshape(1, NET, NET, 3)
 
     def get_next(self):
         # 必须直接返回 dict/None，不能 yield（ORT 内部对返回值调 .keys()）。
-        if self.i >= len(self.data):
+        if self.i >= len(self.files):
             return None
-        d = self.data[self.i]
+        d = {self.input_name: self._load(self.files[self.i], self.size)}
         self.i += 1
         return d
 
@@ -86,7 +89,7 @@ class ListReader:
         self.i = 0
 
     def __len__(self):
-        return len(self.data)
+        return len(self.files)
 
 
 def build_submodel(float_onnx, points, out_path):
@@ -229,6 +232,19 @@ def verdict(per_stats, scales_minmax):
             'ratio': ratio, 'verdict': v}
 
 
+def load_report(path):
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+
+def save_report(path, rep):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(rep, f, indent=2, ensure_ascii=False)
+    print('FORENSICS REPORT -> %s' % path, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--float-onnx', required=True)
@@ -237,74 +253,84 @@ def main():
     ap.add_argument('--workdir', default='work')
     ap.add_argument('--outdir', default='out')
     ap.add_argument('--outlier-k', type=float, default=OUTLIER_K)
+    ap.add_argument('--stages', default='1,2,3',
+                    help='逗号分隔阶段。必须分进程跑：entropy 校准在本图'
+                         '（191 个大张量）内存峰值极高，同进程连跑会被 OOM kill')
     args = ap.parse_args()
 
+    stages = {s.strip() for s in args.stages.split(',') if s.strip()}
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
+    report_path = os.path.join(args.outdir, 'ptq_forensics.json')
+    rep = load_report(report_path)
+
     files = calib_files(args.calib_dir, args.num_calib)
     assert files, 'calib dir empty: %s' % args.calib_dir
-    print('FORENSICS: float=%s  calib=%d images' % (
-        args.float_onnx, len(files)), flush=True)
+    print('FORENSICS stages=%s float=%s calib=%d' % (
+        sorted(stages), args.float_onnx, len(files)), flush=True)
 
-    # ---- 第1段：float 侧逐图 max（判决点，与量化无关） ----
-    per = stage1_per_image(args.float_onnx, files, args.workdir)
-    print('PERIMAGE n=%d median=%.2f p90=%.2f p99=%.2f max=%.2f' % (
-        per['n_images'], per['mag_median'], per['mag_p90'],
-        per['mag_p99'], per['mag_max']), flush=True)
-    for o in per['top_outliers'][:5]:
-        print('  TOP %-22s mag=%9.2f  dominant=%s' % (
-            o['file'], o['mag'], o['dominant']), flush=True)
+    import gc
 
-    # ---- 第1b段：MinMax + 全量校准集 ----
-    q_minmax = os.path.join(args.workdir, 'qdq_minmax.onnx')
-    quantize(args.float_onnx, q_minmax, files, 'minmax')
-    s_minmax = report_stage('STAGE1 MinMax (全量)', dump_act_scales(q_minmax),
-                            per['per_point'])
+    # ---- 第1段：float 侧逐图 max（判决点，与量化无关）+ MinMax ----
+    if '1' in stages:
+        per = stage1_per_image(args.float_onnx, files, args.workdir)
+        print('PERIMAGE n=%d median=%.2f p90=%.2f p99=%.2f max=%.2f' % (
+            per['n_images'], per['mag_median'], per['mag_p90'],
+            per['mag_p99'], per['mag_max']), flush=True)
+        for o in per['top_outliers'][:5]:
+            print('  TOP %-22s mag=%9.2f  dominant=%s' % (
+                o['file'], o['mag'], o['dominant']), flush=True)
+        rep['stage1_per_image'] = per
+        q_minmax = os.path.join(args.workdir, 'qdq_minmax.onnx')
+        quantize(args.float_onnx, q_minmax, files, 'minmax')
+        rep['stage1_minmax'] = report_stage(
+            'STAGE1 MinMax (全量)', dump_act_scales(q_minmax), per['per_point'])
+        rep['args'] = vars(args)
+        gc.collect()
+        save_report(report_path, rep)
 
-    # ---- 第2段：entropy + 同一批图 ----
-    q_ent = os.path.join(args.workdir, 'qdq_entropy.onnx')
-    quantize(args.float_onnx, q_ent, files, 'entropy')
-    s_ent = report_stage('STAGE2 Entropy (同批)', dump_act_scales(q_ent),
-                         per['per_point'])
+    # ---- 第2段：entropy + 同一批图（对照） ----
+    if '2' in stages:
+        pp = rep.get('stage1_per_image', {}).get('per_point')
+        q_ent = os.path.join(args.workdir, 'qdq_entropy.onnx')
+        quantize(args.float_onnx, q_ent, files, 'entropy')
+        rep['stage2_entropy'] = report_stage(
+            'STAGE2 Entropy (同批)', dump_act_scales(q_ent), pp)
+        gc.collect()
+        save_report(report_path, rep)
 
-    # ---- 第3段：清洗后图集 + MinMax ----
-    thresh = per['mag_median'] * args.outlier_k
-    drop_names = {r['file'] for r in per['per_file'] if r['mag'] > thresh}
-    keep_files = [f for f in files if os.path.basename(f) not in drop_names]
-    dropped = [{'file': r['file'], 'mag': r['mag']}
-               for r in per['per_file'] if r['mag'] > thresh]
-    if dropped:
+    # ---- 第3段：清洗后图集 + MinMax（验证清洗效果） ----
+    if '3' in stages:
+        per = rep.get('stage1_per_image')
+        assert per and 'per_file' in per, 'stage3 依赖 stage1 的逐图结果'
+        pp = per['per_point']
+        thresh = per['mag_median'] * args.outlier_k
+        drop = {r['file'] for r in per['per_file'] if r['mag'] > thresh}
+        keep = [f for f in files if os.path.basename(f) not in drop]
+        dropped = [{'file': r['file'], 'mag': r['mag']}
+                   for r in per['per_file'] if r['mag'] > thresh]
         print('CLEAN: threshold=%.2f dropped=%d kept=%d' % (
-            thresh, len(dropped), len(keep_files)), flush=True)
+            thresh, len(dropped), len(keep)), flush=True)
         for d in sorted(dropped, key=lambda r: -r['mag'])[:5]:
             print('  DROP %-22s mag=%.2f' % (d['file'], d['mag']), flush=True)
-    else:
-        print('CLEAN: 无需清洗（max=%.2f <= threshold=%.2f）' % (
-            per['mag_max'], thresh), flush=True)
+        s_clean = {}
+        if dropped:
+            q_clean = os.path.join(args.workdir, 'qdq_clean.onnx')
+            quantize(args.float_onnx, q_clean, keep, 'minmax')
+            s_clean = report_stage('STAGE3 MinMax (清洗后)',
+                                   dump_act_scales(q_clean), pp)
+            gc.collect()
+        rep['stage3_clean'] = {'threshold': thresh, 'dropped': dropped,
+                               'n_kept': len(keep), 'scales': s_clean}
+        save_report(report_path, rep)
 
-    s_clean = {}
-    if dropped:
-        q_clean = os.path.join(args.workdir, 'qdq_clean.onnx')
-        quantize(args.float_onnx, q_clean, keep_files, 'minmax')
-        s_clean = report_stage('STAGE3 MinMax (清洗后)',
-                               dump_act_scales(q_clean), per['per_point'])
-
-    vd = verdict(per, s_minmax)
-    print('VERDICT %s' % vd['verdict'], flush=True)
-
-    rep = {
-        'verdict': vd,
-        'stage1_per_image': per,
-        'stage1_minmax': s_minmax,
-        'stage2_entropy': s_ent,
-        'stage3_clean': {'threshold': thresh, 'dropped': dropped,
-                         'n_kept': len(keep_files), 'scales': s_clean},
-        'args': vars(args),
-    }
-    out = os.path.join(args.outdir, 'ptq_forensics.json')
-    with open(out, 'w', encoding='utf-8') as f:
-        json.dump(rep, f, indent=2, ensure_ascii=False)
-    print('FORENSICS REPORT -> %s' % out, flush=True)
+    # ---- 判决（任一阶段跑完即可给结论） ----
+    per = rep.get('stage1_per_image')
+    s_mm = rep.get('stage1_minmax')
+    if per and s_mm:
+        rep['verdict'] = verdict(per, s_mm)
+        print('VERDICT %s' % rep['verdict']['verdict'], flush=True)
+        save_report(report_path, rep)
 
 
 if __name__ == '__main__':
