@@ -156,6 +156,40 @@ def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib,
         calibrate_method=method,
     )
     print('QUANT FORMAT: %s activation=%s' % (quant_format, act), flush=True)
+    # onnx2tf 的 QLinearConv/QLinearMatMul 实现会读
+    # graph_node.i().inputs[0].shape，若 shape 推断缺失则报
+    # "TypeError: 'NoneType' object is not subscriptable"（QLinearConv.py:229）。
+    # 补一次 shape 推断即可绕过（只影响 QOperator 格式）。
+    if quant_format == 'qoperator':
+        try:
+            import onnx as _onnx
+            from onnx import shape_inference as _si
+            _m = _onnx.load(qdq_path)
+            _m = _si.infer_shapes(_m, strict_mode=False)
+            _onnx.save(_m, qdq_path)
+            print('QOP: shape inference applied for onnx2tf', flush=True)
+        except Exception as e:
+            print('QOP: shape inference failed (%s)' % str(e)[:120], flush=True)
+    # 打印输入图指纹：CI 与本地 cos 长期反向（0.60 vs 0.97），需确认
+    # 两次 CI 产出的 float onnx 是否同一张图。
+    try:
+        import hashlib as _h
+        import onnx as _onnx
+        from onnx import numpy_helper as _nh
+        _m = _onnx.load(onnx_path)
+        _hh = _h.md5()
+        _sizes = []
+        for _i in sorted(_m.graph.initializer, key=lambda x: x.name):
+            _a = _nh.to_array(_i)
+            _hh.update(_i.name.encode())
+            _hh.update(str(_a.shape).encode())
+            _hh.update(_a[:min(_a.size, 4096)].tobytes())
+            _sizes.append(int(_a.size))
+        print('INPUT-ONNX fp=%s nodes=%d inits=%d elems=%d' % (
+            _hh.hexdigest()[:16], len(_m.graph.node), len(_m.graph.initializer),
+            sum(_sizes)), flush=True)
+    except Exception as e:
+        print('INPUT-ONNX fingerprint failed (%s)' % str(e)[:120], flush=True)
     assert os.path.exists(qdq_path), 'ort quant produced nothing'
     print('ORT QDQ OK [%s] -> %s' % (calib_method, qdq_path), flush=True)
 

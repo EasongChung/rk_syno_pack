@@ -260,7 +260,9 @@ jobs:
           name: oes-int8-cleaned
           path: |
             out/*.tflite
-            out/report_ortq_clean.json
+            out/report_*.json
             out/compare.json
             work/concept_ort_qdq_clean.onnx
+            work/concept_ort_qdq_qoperator_clean.onnx
+            work/concept_split.onnx
           if-no-files-found: warn
