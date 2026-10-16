@@ -145,7 +145,8 @@ jobs:
           assert nq > 0, 'QDQ graph has NO Q/DQ nodes -> 上游就没量化'
           print('DIAG QDQ graph OK (onnx2tf 侧丢失)')
           PY
-          - name: Summary
+
+      - name: Summary
         if: always()
         run: |
           set -euo pipefail
