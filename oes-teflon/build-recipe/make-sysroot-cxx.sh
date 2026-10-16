@@ -98,10 +98,23 @@ done
 # C++ 部分：libstdc++ 的开发头 + 运行时 .so
 # 缺了这两样，g++ 交叉编译 TFLite 会直接失败。
 #
-# 注意包名：Debian bullseye 里没有「libstdc++-dev」这个包名，
-# 实际是版本化的「libstdc++-10-dev」（gcc-10 对应）。
-# 写死 10 会在 Debian 换 GCC 大版本后失效，故先用模式匹配取最高版本，
-# 再回退到固定名。
+# ⚠️ 重要：本脚本下载的 libstdc++ 是 **Debian bullseye 的 GCC 10** 版本。
+#    若你的交叉编译器是 Ubuntu 的 g++-aarch64-linux-gnu（Ubuntu 24.04 = GCC 13），
+#    **绝对不要把 $SR/usr/include/c++ 加进 -isystem**：
+#
+#      /usr/aarch64-linux-gnu/include/c++/13/...   ← 编译器自带（GCC 13）
+#      $SR/usr/include/c++/10/type_traits          ← 本脚本放的（GCC 10）
+#      → _GLIBCXX20_DEPRECATED 宏未定义 → 一片语法错误
+#
+#    libstdc++ 头与编译器版本强绑定，跨版本混用必然失败。
+#    正确做法：sysroot 只提供 libc，libstdc++ 用编译器自带的，
+#    并加 -static-libstdc++ -static-libgcc 静态链入。
+#    （保留这里的下载是为了在「编译器恰好也是 GCC 10」时可选用。）
+#
+# 包名坑：Debian bullseye 里没有「libstdc++-dev」这个包名，它只是
+# libstdc++-10-dev 的 Provides（虚拟包），索引里查不到，
+# 实际包名是版本化的「libstdc++-10-dev」（gcc-10 对应）。
+# 故先用模式匹配取版本，再回退到固定名。
 echo "    [C++] libstdc++-dev / libstdc++6"
 
 # resolve_pkg_pat <正则> —— 打印首个匹配包的 Filename
