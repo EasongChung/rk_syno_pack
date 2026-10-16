@@ -257,6 +257,13 @@ def main():
           'dtype=int8' % (True, args.quant_type), flush=True)
     try:
         convert(**kw)
+    except SystemExit as e:
+        # onnx2tf 内部用 sys.exit() 报告问题。注意：转换主体已完成
+        # （Saved artifact / flatbuffer_export 均已出现），产物可能已落盘，
+        # 所以不在这里直接失败，交给下面的产物检查裁决。
+        print('convert() called sys.exit(%s); will inspect output dir'
+              % e, flush=True)
+        _sys.stdout.flush()
     except TypeError as e:
         # 老版本参数名不同，退回最小签名再试
         print('convert(**kw) TypeError (%s); retry minimal' % str(e)[:120],
@@ -273,7 +280,15 @@ def main():
     if not cands:
         print('NO TFLITE produced; dir listing: %s' % os.listdir(odir))
         return 4
-    cand = sorted(cands, key=os.path.getsize, reverse=True)[0]
+    # 优先取 onnx2tf 的全整数量化产物（output_integer_quantized_tflite
+    # 对应文件名后缀 _full_integer_quant.tflite）。
+    full = [c for c in cands if 'full_integer_quant' in os.path.basename(c)]
+    if full:
+        print('found %d full_integer_quant candidate(s)' % len(full),
+              flush=True)
+    cand = sorted(full or cands, key=os.path.getsize, reverse=True)[0]
+    print('all candidates: %s' % [os.path.basename(c) for c in cands],
+          flush=True)
     print('picked: %s (%d bytes)' % (cand, os.path.getsize(cand)), flush=True)
     ok = report(cand, 'o2tf-int')
     if not ok:
