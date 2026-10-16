@@ -368,15 +368,30 @@ jobs:
           SRC="$RUNNER_TEMP/tfsrc"
           SR="$RUNNER_TEMP/sysroot"
           LIB="$TFLITE_LIB"
+          # include 路径**搜索发现**，不写死。
+          # TFLite 2.13 用 CMake FetchContent 把 flatbuffers / absl / ruy / gemmlowp /
+          # fft2d 拉到 $FETCHCONTENT_BASE_DIR（= $RUNNER_TEMP/fc），
+          # 布局随 CMake 版本变化，老的 tools/make/downloads 路径早已不存在。
+          # 做法：按 header 文件名反查其 include 根目录。
           INC=""
-          for d in "$SRC" "$SRC/tensorflow/lite/tools/make/downloads" \
-                   "$SRC/tensorflow/lite/tools/make/downloads/absl" \
-                   "$SRC/tensorflow/lite/tools/make/downloads/flatbuffers" \
-                   "$SRC/tensorflow/lite/tools/make/downloads/ruy" \
-                   "$SRC/tensorflow/lite/tools/make/downloads/gemmlowp" \
-                   "$SRC/tensorflow/lite/tools/make/downloads/fft2d" ; do
-            [ -d "$d" ] && INC="$INC -I$d"
+          for hdr in flatbuffers/flatbuffers.h \
+                     absl/strings/string_view.h \
+                     absl/base/attributes.h \
+                     ruy/profiler/instrumentation.h \
+                     gemmlowp/fixedpoint/fixedpoint.h \
+                     fft2d/dft2d.h ; do
+            p=$(find "$RUNNER_TEMP/fc" "$SRC" -path "*/$hdr" 2>/dev/null | head -1)
+            if [ -n "$p" ]; then
+              d=$(dirname "$(dirname "$p")")   # .../include/flatbuffers/flatbuffers.h → .../include
+              case " $INC " in *" -I$d "*) ;; *) INC="$INC -I$d";; esac
+              echo "  + -I$d   ($hdr)"
+            fi
           done
+          echo "INC=$INC"
+          [ -n "$INC" ] || { echo "ERROR: TFLite 依赖头一个都没找到"; exit 1; }
+          # 关键依赖必须找到（flatbuffers 是 TFLite 核心头的依赖）
+          find "$RUNNER_TEMP/fc" "$SRC" -path "*/flatbuffers/flatbuffers.h" 2>/dev/null | head -1 \
+            | grep -q . || { echo "ERROR: 找不到 flatbuffers.h"; exit 1; }
 
           # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
           # $INC_FLAGS 含 -nostdinc，作用同上：剔除 Ubuntu glibc 2.39 头，
