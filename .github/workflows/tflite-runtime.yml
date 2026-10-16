@@ -380,8 +380,9 @@ jobs:
           cmake --build "$BUILD" --target tensorflow-lite -j"$(nproc)"
 
           # ---- driver：与 TFLite 同一工程，自动继承 include ----
-          export TFLITE_SRC="$SRC"
+          # 显式 -D 传路径，不依赖环境变量（上一轮 export 后 CMake 仍读到空值）
           cmake -S "$RUNNER_TEMP/drv" -B "$RUNNER_TEMP/drvbuild" -G Ninja \
+            -DTFLITE_SRC="$SRC" \
             -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/tc.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DTFLITE_ENABLE_XNNPACK=OFF -DTFLITE_ENABLE_GPU=OFF \
