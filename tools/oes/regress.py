@@ -47,6 +47,16 @@ def run_once(interp, image_bytes):
     arr = np.frombuffer(img.tobytes(), dtype=np.uint8)
     if inp['dtype'] == np.uint8:
         t = arr.reshape(shape)
+    elif inp['dtype'] == np.int8:
+        # int8 输入（TFLiteConverter 全整数量化产物，in_type=9）：
+        # 必须按该张量的 scale/zero_point 把 float 归一化输入量化成 int8，
+        # 否则会把 float32 塞进 int8 tensor 直接报类型错（exit=1）。
+        isc, izp = inp.get('quantization', (0.0, 0))
+        f = ((arr.astype(np.float32) - MEAN) * SCALE).reshape(shape)
+        if isc:
+            t = np.clip(np.round(f / isc) + izp, -128, 127).astype(np.int8)
+        else:
+            t = f.astype(np.int8)
     else:
         t = (((arr.astype(np.float32) - MEAN) * SCALE)
              .reshape(shape).astype(np.float32))
