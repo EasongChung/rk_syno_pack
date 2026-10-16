@@ -215,15 +215,23 @@ jobs:
           #include <vector>
           #include <string>
           #include <cstdlib>
+          #include <cstdint>
           int main(){
             std::vector<std::string> v{"ok"};
-            void* p = std::aligned_alloc(64, 64);
-            std::free(p);
-            std::printf("%s %ld\n", v[0].c_str(), (long)std::strtol("42", nullptr, 10));
+            /* 用 :: 而不是 std:: —— std::aligned_alloc 是 C++17 才引入的，
+               GCC 10 默认 -std=gnu++14 下 std:: 里没有它。
+               ::aligned_alloc 来自 glibc stdlib.h（≥2.16），正好用来验头版本。 */
+            void* p = ::aligned_alloc(64, 64);
+            ::free(p);
+            /* strtol 正是 glibc≥2.38 会被重定向到 __isoc23_strtol 的那个函数，
+               调用它即可暴露头版本是否过高。 */
+            std::printf("%s %ld %u\n", v[0].c_str(),
+                        (long)::strtol("42", nullptr, 10),
+                        (unsigned)::lround(1.5));
             return 0;
           }
           EOF
-          "$CXX" -O2 --sysroot="$SR" $INC_FLAGS \
+          "$CXX" -O2 -std=c++17 --sysroot="$SR" $INC_FLAGS \
             -B "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" \
             -B "$SR/usr/aarch64-linux-gnu/bin/" \
             -L "$SR/usr/lib/aarch64-linux-gnu" \
@@ -281,7 +289,7 @@ jobs:
           # -B 指向 Debian gcc-10 自己的 libgcc.a 与 binutils。
           # 详见上面 fetch 步骤的注释。
           set(CMAKE_C_FLAGS_INIT   "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/ -B $SR/usr/aarch64-linux-gnu/bin/ -L $SR/usr/lib/aarch64-linux-gnu -L $SR/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
-          set(CMAKE_CXX_FLAGS_INIT "--sysroot=$SR $INC_FLAGS -B $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/ -B $SR/usr/aarch64-linux-gnu/bin/ -L $SR/usr/lib/aarch64-linux-gnu -L $SR/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
+          set(CMAKE_CXX_FLAGS_INIT "-std=c++17 --sysroot=$SR $INC_FLAGS -B $SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/ -B $SR/usr/aarch64-linux-gnu/bin/ -L $SR/usr/lib/aarch64-linux-gnu -L $SR/lib/aarch64-linux-gnu -static-libstdc++ -static-libgcc")
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           EOF
 
@@ -326,7 +334,7 @@ jobs:
           # 依赖顺序：先链接 -lstdc++ 等，最后给 TFLite 静态库
           # $INC_FLAGS 含 -nostdinc，作用同上：剔除 Ubuntu glibc 2.39 头，
           # 换上 Debian 2.31 头。详见 sysroot 步骤注释。
-          "$CXX" -O2 --sysroot="$SR" $INC_FLAGS \
+          "$CXX" -O2 -std=c++17 --sysroot="$SR" $INC_FLAGS \
             -B "$SR/usr/lib/gcc-cross/aarch64-linux-gnu/10/" \
             -B "$SR/usr/aarch64-linux-gnu/bin/" \
             -L "$SR/usr/lib/aarch64-linux-gnu" \
