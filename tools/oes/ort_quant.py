@@ -228,8 +228,13 @@ def stage_qdq_to_tflite(qdq_path, out_path):
     print('  dtype histogram: %s' % _hist, flush=True)
     print('  file size: %d bytes' % os.path.getsize(cand), flush=True)
     # 真 INT8 必须：整型输入 + 存在整型张量 + 文件明显小于 float 版(12MB)
+    # 真 INT8 必须：整型输入 + 存在整型张量 + 文件明显小于 float 版(12MB)
     assert _nq > 0 and _tin.Type() in (3, 9), \
-        'qdq->tflite is NOT quantized (float false positive)!'
+        ('qdq->tflite is NOT quantized (float false positive)! '
+         'in_type=%d quantized=%d/%d dtype=%s size=%d -- '
+         '若 qdq->tflite 后量化张量归零，通常是量化器版本漂移或'
+         'QDQ 图未被 onnx2tf 识别' % (_tin.Type(), _nq, _nt, _hist,
+                                     os.path.getsize(cand)))
     assert _dt.get(9, 0) + _dt.get(3, 0) > 0, \
         'no integer tensors at all (float false positive)!'
     shutil.copy(cand, out_path)

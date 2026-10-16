@@ -28,17 +28,40 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps (OEC-verified pins)
+      # 必须单次安装：分多次 pip install 时，后装的 onnx2tf/onnx-tf/tf-probability
+      # 会把已 pin 的 onnxruntime/keras/protobuf 顶到新版本
+      # （曾导致要求 ort==1.16.3 实装 1.23.0，量化器行为不同 -> cos 0.96 掉到 0.60）。
+      - name: Install deps (single resolve + version assertions)
         run: |
           set -euo pipefail
-          pip install --quiet "numpy==1.26.4" pillow
-          pip install --quiet "onnx==1.16.1" "onnxruntime==1.16.3" "protobuf==4.25.4"
-          pip install --quiet "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1"
-          pip install --quiet "onnx2tf==1.29.24" onnx-graphsurgeon
-          pip install --quiet tflite
-          pip install --quiet onnxsim "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
-          python -c "import tensorflow as tf; print('tf', tf.__version__)"
-          python -c "import onnxruntime as ort; print('ort', ort.__version__)"
+          pip install --quiet \
+            "numpy==1.26.4" pillow \
+            "onnx==1.16.1" "onnxruntime==1.16.3" \
+            "tensorflow-cpu==2.15.1" "tf2onnx==1.16.1" \
+            "onnx2tf==1.29.24" onnx-graphsurgeon onnxsim tflite \
+            "onnx-tf==1.10.0" "tensorflow-probability==0.23.0"
+          # 断言而非仅打印：pin 失效曾静默通过，导致本地/CI 结论不可比
+          python - <<'PY'
+          import sys
+          import numpy, onnx, onnxruntime, tensorflow, tf2onnx
+          want = {'numpy': '1.26.4', 'onnx': '1.16.1',
+                  'onnxruntime': '1.16.3', 'tensorflow': '2.15.1',
+                  'tf2onnx': '1.16.1'}
+          got = {'numpy': numpy.__version__, 'onnx': onnx.__version__,
+                 'onnxruntime': onnxruntime.__version__,
+                 'tensorflow': tensorflow.__version__,
+                 'tf2onnx': tf2onnx.__version__}
+          bad = []
+          for k, v in want.items():
+              mark = 'OK  ' if got[k] == v else 'DRIFT'
+              print('%s %-14s want=%-8s got=%s' % (mark, k, v, got[k]))
+              if got[k] != v:
+                  bad.append(k)
+          if bad:
+              sys.exit('dependency drift: %s -- 本地/CI 结论不可比' % bad)
+          import onnx2tf, tflite  # noqa
+          print('onnx2tf', onnx2tf.__version__)
+          PY
 
       - name: Fingerprint input model
         run: |
@@ -81,6 +104,7 @@ jobs:
       - name: Regression gate vs float reference
         run: |
           set -euo pipefail
+          # 必须硬失败：float 假绿产物绝不能进 regress（-oiqt 教训）
           test -f out/concept_ortq_clean.tflite || {
             echo "GATE ABORT: concept_ortq_clean.tflite not produced"; exit 9; }
           python tools/oes/regress.py \
