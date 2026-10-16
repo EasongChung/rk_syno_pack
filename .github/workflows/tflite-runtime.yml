@@ -146,12 +146,17 @@ jobs:
             echo "ERROR: apt-get download 整体失败（上面是原始报错）"
             exit 1
           fi
+          # 注意 $XPKGS 里可能有 "name=version" 形式（binutils 必须锁版本，
+          # 否则 apt 会去找 runner 上已装的 Ubuntu 2.42，bullseye 源里没有），
+          # 所以比对时要先剥掉 =version 部分。
           for p in $XPKGS; do
-            if ls "$RUNNER_TEMP/${p}_"*.deb >/dev/null 2>&1; then
+            pname=$(echo "$p" | sed 's/=.*//')
+            if ls "$RUNNER_TEMP/${pname}_"*.deb >/dev/null 2>&1; then
               echo "  ✓ $p"
             else
-              echo "  ✗ $p —— 索引里没有这个包名，停止"
-              apt-get download $APT_OPTS "$p" 2>&1 | tail -2 || true
+              echo "  ✗ $p —— 包没下载下来，停止"
+              ls "$RUNNER_TEMP"/*.deb 2>/dev/null | sed 's/^/    已下: /'
+              apt-get download $APT_OPTS "$p" 2>&1 | tail -3 || true
               exit 1
             fi
           done
