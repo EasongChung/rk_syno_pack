@@ -103,13 +103,20 @@ def clean_calib_files(float_onnx, calib_dir, num_calib, k, workdir):
 
 def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib,
                     calib_method='minmax', clean_calib=False, clean_k=3.0,
-                    workdir='work', exclude_head=0):
+                    workdir='work', exclude_head=0, quant_format='qdq',
+                    direct_tflite=False):
     from onnxruntime.quantization import (CalibrationMethod, QuantFormat,
                                           QuantType, quantize_static)
     import onnxruntime as ort
     method = {'minmax': CalibrationMethod.MinMax,
               'entropy': CalibrationMethod.Entropy,
               'percentile': CalibrationMethod.Percentile}[calib_method]
+    fmt = (QuantFormat.QOperator if quant_format == 'qoperator'
+           else QuantFormat.QDQ)
+    # QOperator 格式的激活必须是 uint8（QLinearConv 语义要求），
+    # QDQ 格式则用 int8 对称量化。
+    act = (QuantType.QUInt8 if quant_format == 'qoperator'
+           else QuantType.QInt8)
     sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     iname = sess.get_inputs()[0].name
     del sess
@@ -140,14 +147,15 @@ def stage_ort_quant(onnx_path, qdq_path, calib_dir, num_calib,
         model_output=qdq_path,
         calibration_data_reader=Reader(calib_dir, num_calib, iname,
                                        files=files),
-        quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QInt8,
+        quant_format=fmt,
+        activation_type=act,
         weight_type=QuantType.QInt8,
         per_channel=True,
         reduce_range=False,
         nodes_to_exclude=exclude,
         calibrate_method=method,
     )
+    print('QUANT FORMAT: %s activation=%s' % (quant_format, act), flush=True)
     assert os.path.exists(qdq_path), 'ort quant produced nothing'
     print('ORT QDQ OK [%s] -> %s' % (calib_method, qdq_path), flush=True)
 
@@ -190,6 +198,57 @@ def stage_validate_qdq(ref_onnx, qdq_onnx, eval_dir, num):
               'continuing to regress for the authoritative verdict', flush=True)
 
 
+def check_tflite_int8(cand, tag):
+    """INT8 硬门：量化张量数/总张量数、dtype 直方图、文件大小。
+
+    och 要求出件前三项同时报告（-oiqt 的 12MB float 产物曾以 cos=1.0 假绿）。
+    返回 (ok, info)。
+    """
+    import tflite
+    from collections import Counter
+    raw = open(cand, 'rb').read()
+    m = tflite.Model.GetRootAsModel(raw, 0)
+    g = m.Subgraphs(0)
+    nt = g.TensorsLength()
+    nq = sum(1 for i in range(nt)
+             if (q := g.Tensors(i).Quantization()) is not None
+             and q.ScaleLength() > 0)
+    tin = g.Tensors(g.Inputs(0))
+    dt = Counter(g.Tensors(i).Type() for i in range(nt))
+    names = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8',
+             4: 'INT64', 5: 'STRING', 6: 'BOOL', 7: 'INT16', 9: 'INT8'}
+    hist = dict((names.get(k, 'type%d' % k), v)
+                for k, v in sorted(dt.items()))
+    ops = Counter()
+    codes = {}
+    for i in range(m.OperatorCodesLength()):
+        oc = m.OperatorCodes(i)
+        codes[i] = oc.BuiltinCode() if oc.BuiltinCode() < 127 \
+            else oc.DeprecatedBuiltinCode()
+    for i in range(g.OperatorsLength()):
+        ops[codes.get(g.Operators(i).OpcodeIndex())] += 1
+    print('%s check: in_type=%d quantized=%d/%d (%.1f%%)' % (
+        tag, tin.Type(), nq, nt, 100.0 * nq / max(nt, 1)), flush=True)
+    print('  dtype histogram: %s' % hist, flush=True)
+    print('  file size: %d bytes' % len(raw), flush=True)
+    print('  builtin ops: %s' % dict(sorted(
+        ops.items(), key=lambda kv: -kv[1])[:10]), flush=True)
+    ok = nq > 0 and tin.Type() in (3, 9) and \
+        (dt.get(9, 0) + dt.get(3, 0)) > 0
+    assert ok, ('%s is NOT a quantized model (float false positive)! '
+                'in_type=%d quantized=%d/%d dtype=%s size=%d' % (
+                    tag, tin.Type(), nq, nt, hist, len(raw)))
+    return ok, {'n_quantized': nq, 'n_tensors': nt, 'dtype': hist,
+                'size': len(raw), 'in_type': tin.Type()}
+
+
+def stage_check_tflite_int8(src, out_path):
+    import shutil
+    shutil.copy(src, out_path)
+    check_tflite_int8(out_path, 'direct-tflite')
+    print('WROTE %s (ort direct)' % out_path, flush=True)
+
+
 def stage_qdq_to_tflite(qdq_path, out_path):
     r = subprocess.run(
         [sys.executable,
@@ -203,40 +262,9 @@ def stage_qdq_to_tflite(qdq_path, out_path):
     import glob as gb
     outs = gb.glob(os.path.join(out_path + '.qd', '*.tflite'))
     assert outs, 'qdq->tflite produced nothing'
-    import shutil
-    # 防 -oiqt 式假阳性：落盘前先验确为量化模型（量化张量数>0 且输入为整型）
     cand = sorted(outs, key=os.path.getsize, reverse=True)[0]
-    import tflite
-    _raw = open(cand, 'rb').read()
-    _m = tflite.Model.GetRootAsModel(_raw, 0)
-    _g = _m.Subgraphs(0)
-    _nt = _g.TensorsLength()
-    _nq = sum(1 for _i in range(_nt)
-              if (_q := _g.Tensors(_i).Quantization()) is not None
-              and _q.ScaleLength() > 0)
-    _tin = _g.Tensors(_g.Inputs(0))
-    # dtype 直方图：och 要求出件前同时报告量化张量数/总张量数、dtype 分布、
-    # 文件大小。三者一致才能排除 -oiqt 式 float 假绿。
-    from collections import Counter
-    _dt = Counter(_g.Tensors(_i).Type() for _i in range(_nt))
-    _names = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8',
-              4: 'INT64', 5: 'STRING', 6: 'BOOL', 7: 'INT16', 9: 'INT8'}
-    _hist = dict((_names.get(_k, 'type%d' % _k), _v)
-                 for _k, _v in sorted(_dt.items()))
-    print('qdq-tflite check: in_type=%d quantized=%d/%d (%.1f%%)' % (
-        _tin.Type(), _nq, _nt, 100.0 * _nq / max(_nt, 1)), flush=True)
-    print('  dtype histogram: %s' % _hist, flush=True)
-    print('  file size: %d bytes' % os.path.getsize(cand), flush=True)
-    # 真 INT8 必须：整型输入 + 存在整型张量 + 文件明显小于 float 版(12MB)
-    # 真 INT8 必须：整型输入 + 存在整型张量 + 文件明显小于 float 版(12MB)
-    assert _nq > 0 and _tin.Type() in (3, 9), \
-        ('qdq->tflite is NOT quantized (float false positive)! '
-         'in_type=%d quantized=%d/%d dtype=%s size=%d -- '
-         '若 qdq->tflite 后量化张量归零，通常是量化器版本漂移或'
-         'QDQ 图未被 onnx2tf 识别' % (_tin.Type(), _nq, _nt, _hist,
-                                     os.path.getsize(cand)))
-    assert _dt.get(9, 0) + _dt.get(3, 0) > 0, \
-        'no integer tensors at all (float false positive)!'
+    check_tflite_int8(cand, 'qdq-tflite')
+    import shutil
     shutil.copy(cand, out_path)
     print('WROTE %s (ort-qdq via onnx2tf)' % out_path, flush=True)
 
@@ -253,6 +281,16 @@ def main():
     ap.add_argument('--outdir', default='out')
     ap.add_argument('--calib-method', default='minmax',
                     choices=['minmax', 'entropy', 'percentile'])
+    ap.add_argument('--quant-format', default='qdq',
+                    choices=['qdq', 'qoperator'],
+                    help="qdq=QuantFormat.QDQ（当前默认）；"
+                         "qoperator=QuantFormat.QOperator，产出 ConvInteger/"
+                         "QLinearConv 等原生整型算子，更接近 TFLite 的 int8 形式")
+    ap.add_argument('--direct-tflite', action='store_true',
+                    help='尝试让 quantize_static 直接输出 .tflite。'
+                         '注意：ORT 1.16/1.31 的 quantize_static 只写 ONNX，'
+                         '即使 model_output 后缀为 .tflite 也会按 ONNX 落盘，'
+                         '故该开关默认关闭，仅在确认 ORT 版本支持时启用。')
     ap.add_argument('--clean-calib', action='store_true',
                     help='量化前剔除校准集离群图（见 clean_calib_files）')
     ap.add_argument('--clean-k', type=float, default=3.0,
@@ -267,16 +305,24 @@ def main():
     os.makedirs(args.workdir, exist_ok=True)
     os.makedirs(args.outdir, exist_ok=True)
     suf = ('_' + args.tag) if args.tag else ''
-    qdq_path = os.path.join(args.workdir, 'concept_ort_qdq%s.onnx' % suf)
-    tflite_name = 'concept_ortq%s.tflite' % suf
+    fmt_suf = '' if args.quant_format == 'qdq' else '_' + args.quant_format
+    qdq_path = os.path.join(args.workdir,
+                            'concept_ort_qdq%s%s.onnx' % (fmt_suf, suf))
+    tflite_name = 'concept_ortq%s%s.tflite' % (fmt_suf, suf)
     stage_ort_quant(onnx_path, qdq_path, args.calib_dir, args.num_calib,
                     args.calib_method, clean_calib=args.clean_calib,
                     clean_k=args.clean_k, workdir=args.workdir,
-                    exclude_head=args.exclude_head)
+                    exclude_head=args.exclude_head,
+                    quant_format=args.quant_format,
+                    direct_tflite=args.direct_tflite)
     stage_validate_qdq(onnx_path, qdq_path, args.eval_dir, args.eval_num)
-    stage_qdq_to_tflite(qdq_path, os.path.join(args.outdir, tflite_name))
-    print('ORTQ DONE [%s]' % (args.tag or 'default'), flush=True)
-
-
-if __name__ == '__main__':
-    main()
+    if args.direct_tflite:
+        # ORT 1.16/1.31 的 quantize_static 始终写 ONNX（model_output 的后缀
+        # 不改变输出格式），实测不会生成 .tflite。这里显式检测并报错，
+        # 避免把 onnx 文件当 tflite 交付。
+        direct = qdq_path[:-len('.onnx')] + '.tflite'
+        if not os.path.exists(direct):
+            raise SystemExit(
+                'direct-tflite unsupported: ORT wrote ONNX not TFLite (%s). '
+                'Use --quant-format qoperator without --direct-tflite so the '
+                

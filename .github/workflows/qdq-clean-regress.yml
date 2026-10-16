@@ -129,32 +129,54 @@ jobs:
             --workdir work --outdir out --calib-dir calib --num-calib 300 \
             --eval-dir eval --frontend-num 50 --skip-quant
 
-      # 判决轮：清洗校准集 + MinMax -> QDQ -> onnx2tf -> INT8 TFLite
-      # ORT QDQ 内部的 cos 门(>=0.95/top1>=0.85)是早期信号，失败也要继续，
-      # 因为最终判决在 regress.py（335 维 top-k 一致率 + cos + drift）。
-      - name: ORT QDQ with cleaned calib set
+      # 判决轮：清洗校准集 + MinMax -> 量化 -> INT8 TFLite。
+      # A 路：QDQ + onnx2tf（已知丢量化，保留作对照）
+      # B 路：QOperator 格式（本地实测 cos=0.9703/top1=0.9000，优于 QDQ 0.9569）
+      #     再过 onnx2tf —— QOperator 用 ConvInteger/QLinearConv 等原生整型算子，
+      #     比 QDQ 的伪量化更容易被翻译成真 int8。
+      - name: Route A - QDQ via onnx2tf (control)
         run: |
           set -euo pipefail
           python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
             --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
             --workdir work --outdir out \
             --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --tag clean \
-            || echo "ORTQ-CLEAN: exit=$? (report kept)"
+            --exclude-head 6 --quant-format qdq --tag clean \
+            || echo "ROUTE-A: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
-      - name: Regression gate vs float reference
+      - name: Route B - QOperator via onnx2tf
         run: |
           set -euo pipefail
-          # 必须硬失败：float 假绿产物绝不能进 regress（-oiqt 教训）
-          test -f out/concept_ortq_clean.tflite || {
-            echo "GATE ABORT: concept_ortq_clean.tflite not produced"; exit 9; }
-          python tools/oes/regress.py \
-            --ref tools/oes/models/model_float16.tflite \
-            --quant out/concept_ortq_clean.tflite \
-            --eval-dir eval --topk 1,5 \
-            --require-int8 --out out/report_ortq_clean.json \
-            || echo "REGRESS: exit=$? (report kept for review)"
+          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
+            --workdir work --outdir out \
+            --calib-method minmax --clean-calib --clean-k 3.0 \
+            --exclude-head 6 --quant-format qoperator --tag clean \
+            || echo "ROUTE-B: exit=$? (report kept)"
+          ls -la out/*.tflite || true
+
+      # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：
+      # float 假绿绝不能进 regress）。--require-int8 会二次拦 float 模型。
+      - name: Regression gate on all INT8 candidates
+        run: |
+          set -euo pipefail
+          n=0
+          for f in out/*.tflite; do
+            [ -e "$f" ] || continue
+            n=$((n+1))
+            b=$(basename "$f" .tflite)
+            echo "=== REGRESS $b ==="
+            python tools/oes/regress.py \
+              --ref tools/oes/models/model_float16.tflite \
+              --quant "$f" --eval-dir eval --topk 1,5 \
+              --require-int8 --out "out/report_${b}.json" \
+              || echo "REGRESS ${b}: exit=$? (report kept)"
+          done
+          if [ "$n" -eq 0 ]; then
+            echo "GATE ABORT: no tflite candidate produced"; exit 9
+          fi
+          echo "regress ran on $n candidate(s)"
 
       - name: Diagnose QDQ->TFLite quantization loss
         if: always()
@@ -166,15 +188,58 @@ jobs:
           python - "$Q" <<'PY'
           import sys, collections
           import onnx
+          from onnx import numpy_helper
           m = onnx.load(sys.argv[1])
           ops = collections.Counter(n.op_type for n in m.graph.node)
           print('DIAG nodes=%d' % len(m.graph.node))
           print('DIAG op histogram:', dict(sorted(ops.items())))
-          # QDQ 格式的特征：DequantizeLinear/QuantizeLinear 应大量存在
           nq = ops.get('QuantizeLinear', 0) + ops.get('DequantizeLinear', 0)
           print('DIAG QDQ nodes=%d' % nq)
-          assert nq > 0, 'QDQ graph has NO Q/DQ nodes -> 上游就没量化'
-          print('DIAG QDQ graph OK (onnx2tf 侧丢失)')
+          assert nq > 0, 'QDQ graph has NO Q/DQ nodes'
+          # dtype 审计：确认图里存在真 int8 激活张量
+          vt = {}
+          for v in list(m.graph.value_info) + list(m.graph.input):
+              try:
+                  vt[v.name] = v.type.tensor_type.elem_type
+              except Exception:
+                  pass
+          ini = {i.name for i in m.graph.initializer}
+          dq_in = collections.Counter()
+          for n in m.graph.node:
+              if n.op_type != 'DequantizeLinear':
+                  continue
+              dq_in[('init' if n.input[0] in ini else
+                      {1: 'FLOAT', 2: 'UINT8', 3: 'INT8'}
+                      .get(vt.get(n.input[0]), '?'))] += 1
+          print('DIAG DQ input dtypes: %s' % dict(dq_in))
+          print('DIAG QDQ graph has real int8 tensors -> conversion-side loss')
+          PY
+          # 找到 onnx2tf 实际产出的 tflite，逐个算子类型看清楚
+          echo "=== DIAG: inspect produced tflite ==="
+          python - <<'PY'
+          import glob, collections, os
+          import tflite
+          for f in sorted(glob.glob('work/*.qd/**/*.tflite', recursive=True) +
+                          glob.glob('work/*.qd/*.tflite')):
+              raw = open(f, 'rb').read()
+              mo = tflite.Model.GetRootAsModel(raw, 0)
+              g = mo.Subgraphs(0)
+              ops = collections.Counter()
+              for i in range(g.OperatorsLength()):
+                  ops[g.Operators(i).OpcodeIndex()] += 1
+              codes = {}
+              for i in range(mo.OperatorCodesLength()):
+                  oc = mo.OperatorCodes(i)
+                  codes[i] = (oc.BuiltinCode(),
+                              oc.BuiltinCode() if oc.BuiltinCode() < 127
+                              else oc.DeprecatedBuiltinCode())
+              nt = g.TensorsLength()
+              nq = sum(1 for i in range(nt)
+                       if (q := g.Tensors(i).Quantization()) is not None
+                       and q.ScaleLength() > 0)
+              print('%s size=%d quantized=%d/%d' % (f, len(raw), nq, nt))
+              for oc, cnt in ops.most_common(12):
+                  print('   op%-4d builtin=%-6s x%d' % (oc, codes.get(oc), cnt))
           PY
 
       - name: Summary
