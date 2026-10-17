@@ -207,12 +207,22 @@ jobs:
           #    所以要分两步查：
           #      1. [ -L ] 确认软链本身还在
           #      2. [ -e "$SR/lib/aarch64-linux-gnu/<真实名>" ] 确认 sysroot 内的目标存在
+          # ⚠️ 三者的形态**不一样**，检查方式必须都覆盖：
+          #     libdl.so / libpthread.so  → 绝对路径**软链**（指向 /lib/aarch64-linux-gnu/…）
+          #                                 在 amd64 runner 上 [ -e ] 会去解析宿主路径而误判，
+          #                                 所以要用 -L 或对 sysroot 内的真实目标做 -e
+          #     libc.so                   → **291 字节的 GNU ld 链接脚本文本**，不是软链
+          #                                 所以 [ -L ] 反而会误判
+          # 统一用「存在（文件或软链均可）」+「sysroot 内真实目标存在」两步判定。
           for pair in "libdl.so:libdl.so.2" "libpthread.so:libpthread.so.0" "libc.so:libc.so.6"; do
             link="$SR/usr/lib/aarch64-linux-gnu/${pair%%:*}"
             real="$SR/lib/aarch64-linux-gnu/${pair##*:}"
-            [ -L "$link" ] || { echo "ERROR: 软链丢失 $link"; exit 1; }
-            [ -e "$real" ] || { echo "ERROR: 目标丢失 $real"; exit 1; }
-            echo "  ✓ ${pair%%:*} → ${pair##*:} 解析正常"
+            if [ ! -e "$link" ] && [ ! -L "$link" ]; then
+              echo "ERROR: 缺失 $link"; exit 1
+            fi
+            [ -e "$real" ] || { echo "ERROR: 目标缺失 $real"; exit 1; }
+            kind=$([ -L "$link" ] && echo 软链 || echo 链接脚本)
+            echo "  ✓ ${pair%%:*} (${kind}) → ${pair##*:} 解析正常"
           done
           echo "  ✓ 动态 .so 均保留且可解析"
 
