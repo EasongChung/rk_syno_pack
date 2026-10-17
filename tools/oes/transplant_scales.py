@@ -53,6 +53,23 @@ def _attr(obj, snake, camel):
     return camel if hasattr(obj, camel) else snake
 
 
+def _len(v):
+    """安全长度：绝不能用 `v or []`。
+    对象 API 的向量是 numpy 数组，长度 >1 时 `arr or []` 会抛
+    `ValueError: truth value of an array ... is ambiguous`
+    （CI run 39026333343 实测：t127/131/133 形状长度<=1 通过，
+     t139 长度 4 崩溃）。"""
+    return 0 if v is None else len(v)
+
+
+def _shape_of(t):
+    return [int(t.shape[j]) for j in range(_len(t.shape))]
+
+
+def _first(seq):
+    return seq[0] if seq is not None and len(seq) > 0 else None
+
+
 def read_index(path):
     """用只读 API 建索引：name -> [(idx, type, shape, scale, zp)]。"""
     import tflite as T
@@ -136,7 +153,7 @@ def transplant(degen, source, out_path, dry_run=False):
     fixed_by_name = {}
     for i, t in enumerate(tensors):
         q = qt_of(t)
-        if q is None or len(q.scale or []) == 0:
+        if q is None or _len(getattr(q, 'scale', None)) == 0:
             continue
         s = float(q.scale[0])
         if not (abs(s) > 1e10 or s <= 0):
@@ -144,16 +161,16 @@ def transplant(degen, source, out_path, dry_run=False):
         name = t.name.decode('utf-8', 'replace') if t.name else ''
         cands = src_by_name.get(name, [])
         same = [c for c in cands if c['type'] == t.type
-                and c['shape'] == [t.shape[j]
-                                   for j in range(len(t.shape or []))]
+                and c['shape'] == _shape_of(t)
                 and c['scale'] is not None
                 and not (abs(c['scale']) > 1e10 or c['scale'] <= 0)]
         if len(same) == 1:
             set_q(i, same[0]['scale'], same[0]['zp'])
             fixed_by_name[i] = (s, same[0]['scale'], same[0]['zp'])
             print('  t%-4d by NAME  %-11s %.6g -> %.6g zp %s -> %s'
-                  % (i, name[:28], s, same[0]['scale'], q.zeroPoint[0],
-                     same[0]['zp']), flush=True)
+                  % (i, name[:28], s, same[0]['scale'],
+                     _first(getattr(q, 'zeroPoint', None)), same[0]['zp']),
+                  flush=True)
         else:
             print('  t%-4d NO clean name match (cands=%d, same=%d) name=%r'
                   % (i, len(cands), len(same), name[:40]), flush=True)
@@ -161,7 +178,7 @@ def transplant(degen, source, out_path, dry_run=False):
     # ---- 2. 重算全部 conv bias 尺度（依据已验证公式）----
     def s_of(idx):
         q = qt_of(tensors[idx])
-        if q is None or len(q.scale or []) == 0:
+        if q is None or _len(getattr(q, 'scale', None)) == 0:
             return None
         return float(q.scale[0])
 
@@ -189,12 +206,12 @@ def transplant(degen, source, out_path, dry_run=False):
     # ---- 3. 修空形状/仍退化的孤立张量（t133 类）----
     n_orphan = 0
     for i, t in enumerate(tensors):
-        shape = [t.shape[j] for j in range(len(t.shape or []))]
+        shape = _shape_of(t)
         q = qt_of(t)
-        bad_q = (q is None or len(q.scale or []) == 0
+        bad_q = (q is None or _len(getattr(q, 'scale', None)) == 0
                  or abs(float(q.scale[0])) > 1e10
                  or float(q.scale[0]) <= 0)
-        if shape == []:
+        if len(shape) == 0:
             t.shape = [1]
             if bad_q:
                 set_q(i, NEUTRAL_SCALE, NEUTRAL_ZP)
