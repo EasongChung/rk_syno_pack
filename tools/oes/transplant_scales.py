@@ -105,6 +105,12 @@ def transplant(degen, source, out_path, dry_run=False):
 
     src_by_name, _ = read_index(source)
 
+    n_quant_before = sum(
+        1 for t in tensors
+        if _len(getattr(getattr(t, 'quantization', None), 'scale', None)) > 0)
+    print('quantized tensors BEFORE transplant: %d / %d'
+          % (n_quant_before, len(tensors)), flush=True)
+
     def eff(oc):
         bc = oc.builtinCode
         return bc if bc < 127 else oc.deprecatedBuiltinCode
@@ -208,17 +214,23 @@ def transplant(degen, source, out_path, dry_run=False):
     for i, t in enumerate(tensors):
         shape = _shape_of(t)
         q = qt_of(t)
-        bad_q = (q is None or _len(getattr(q, 'scale', None)) == 0
-                 or abs(float(q.scale[0])) > 1e10
-                 or float(q.scale[0]) <= 0)
+        # 「没有量化参数」与「量化参数退化」是两件事，**绝不能混**：
+        # INT32 形状/axes/paddings 常量按 TFLite 惯例就没有量化参数，
+        # 给它们硬塞 scale/zp 会损坏模型（本工具第一版就是这么错的：
+        # 337/337 全量化 -> 产物不可用）。只有**已有 scale 且退化**
+        # 的才需要修。
+        has_sc = q is not None and _len(getattr(q, 'scale', None)) > 0
+        degen = has_sc and (abs(float(q.scale[0])) > 1e10
+                            or float(q.scale[0]) <= 0)
         if len(shape) == 0:
             t.shape = [1]
-            if bad_q:
+            if degen:
                 set_q(i, NEUTRAL_SCALE, NEUTRAL_ZP)
             n_orphan += 1
-            print('  t%-4d empty shape -> [1]; q set to neutral' % i,
+            print('  t%-4d empty shape -> [1] (%s)'
+                  % (i, 'scale neutralized' if degen else 'no scale, left alone'),
                   flush=True)
-        elif bad_q and i not in fixed_by_name:
+        elif degen and i not in fixed_by_name:
             set_q(i, NEUTRAL_SCALE, NEUTRAL_ZP)
             n_orphan += 1
             print('  t%-4d STILL degenerate -> neutral scale' % i, flush=True)
@@ -232,7 +244,7 @@ def transplant(degen, source, out_path, dry_run=False):
     out = bytes(builder.Output())
     if out[4:8] != FILE_IDENTIFIER:
         raise RuntimeError('file_identifier lost: %r' % bytes(out[4:8]))
-    _revalidate(out)
+    _revalidate(out, expect_quant=n_quant_before)
     print('PACK OK: %d bytes' % len(out), flush=True)
     if dry_run:
         print('dry-run: not writing', flush=True)
@@ -243,8 +255,8 @@ def transplant(degen, source, out_path, dry_run=False):
     return 0
 
 
-def _revalidate(buf):
-    """按 och 六条门的静态项逐条断言（a/b/c）。"""
+def _revalidate(buf, expect_quant=None):
+    """按 och 六条门的静态项逐条断言（a/b/c）+ 量化张量数不变。"""
     import tflite as T
     if bytes(buf[4:8]) != FILE_IDENTIFIER:
         raise RuntimeError('file_identifier bad')
@@ -257,11 +269,13 @@ def _revalidate(buf):
         codes[i] = bc if bc < 127 else oc.DeprecatedBuiltinCode()
 
     degen, empty, pc = [], [], []
+    n_quant = 0
     for t in range(g.TensorsLength()):
         tt = g.Tensors(t)
         q = tt.Quantization()
         ns = 0 if q is None else q.ScaleLength()
         if ns:
+            n_quant += 1
             s = q.Scale(0)
             if abs(s) > 1e10 or s <= 0:
                 degen.append((t, s))
@@ -278,16 +292,24 @@ def _revalidate(buf):
         nz = 0 if q is None else q.ZeroPointLength()
         if ns != 1 or nz != 1:
             pc.append((i, ns, nz))
-    print('REVALIDATE: tensors=%d  a)degenerate=%d  b)empty_shape=%d  '
-          'c)non-per-tensor-weights=%d'
-          % (g.TensorsLength(), len(degen), len(empty), len(pc)), flush=True)
+    print('REVALIDATE: tensors=%d  quantized=%d  a)degenerate=%d  '
+          'b)empty_shape=%d  c)non-per-tensor-weights=%d'
+          % (g.TensorsLength(), n_quant, len(degen), len(empty), len(pc)),
+          flush=True)
     if degen:
         raise RuntimeError('gate a FAIL: degenerate %s' % degen[:8])
     if empty:
         raise RuntimeError('gate b FAIL: empty shape %s' % empty[:8])
     if pc:
         raise RuntimeError('gate c FAIL: per-channel weights %s' % pc[:8])
-    print('GATES a,b,c PASS', flush=True)
+    if expect_quant is not None and n_quant != expect_quant:
+        raise RuntimeError(
+            'quantized tensor count CHANGED: %d -> %d. The transplant must '
+            'only MODIFY scales, never ADD quantization params to tensors '
+            'that had none (INT32 shape/axes constants).'
+            % (expect_quant, n_quant))
+    print('GATES a,b,c PASS (quantized=%d, unchanged=%s)'
+          % (n_quant, expect_quant is not None), flush=True)
 
 
 def main():
