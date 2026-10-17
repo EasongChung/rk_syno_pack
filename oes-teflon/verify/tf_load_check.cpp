@@ -106,6 +106,9 @@
 #include <memory>
 #include <vector>
 #include <csignal>
+#include <cstdint>
+#include <algorithm>
+#include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -200,6 +203,92 @@ static void install_crash_handler() {
   sigaction(SIGABRT, &sa, nullptr);
 }
 
+/* ---- 真实推理 + 计时 + 输出校验 ----
+ *
+ * 独立成函数而非内联：用提前 return 代替 goto。
+ * 本机无 C++ 前端（无 cc1plus），goto 跨嵌套作用域**无法本地验证**，
+ * 而这是一个可靠的等价写法（提前 return 在 C++ 里语义明确）。
+ *
+ * 预热 3 次：首次 Invoke 会包含惰性初始化（NPU 资源分配、shader 编译等），
+ * 计入计时会严重低估稳态性能。
+ *
+ * 报 min / 中位数 / 均值三个数：只报均值会被单次抖动带偏；
+ * min 最接近"稳态性能上限"，中位数抗离群。 */
+static void run_invoke(tflite::Interpreter* interpreter, int invoke_n) {
+  const std::vector<int>& ins = interpreter->inputs();
+  const std::vector<int>& outs = interpreter->outputs();
+  if (ins.empty() || outs.empty()) {
+    std::fprintf(stderr, "INVOKE 跳过: 输入或输出张量为空\n");
+    return;
+  }
+  TfLiteTensor* in = interpreter->tensor(ins[0]);
+  if (in == nullptr || in->data.raw == nullptr || in->bytes == 0) {
+    std::fprintf(stderr, "INVOKE 跳过: 输入张量不可写\n");
+    return;
+  }
+
+  /* 确定性填充：两组必须完全一致，否则对比无意义 */
+  {
+    std::uint8_t* p = static_cast<std::uint8_t*>(in->data.raw);
+    for (std::size_t k = 0; k < in->bytes; k++)
+      p[k] = static_cast<std::uint8_t>((k * 31u + 7u) & 0xFFu);
+  }
+  std::fprintf(stderr, "INVOKE 输入填充: bytes=%zu pattern=(i*31+7)&0xFF\n",
+               in->bytes);
+
+  const int warmup = 3;
+  for (int w = 0; w < warmup; w++) {
+    if (interpreter->Invoke() != kTfLiteOk) {
+      std::fprintf(stderr, "INVOKE 预热第 %d 次失败\n", w + 1);
+      return;
+    }
+  }
+
+  std::vector<double> ms;
+  ms.reserve(static_cast<std::size_t>(invoke_n));
+  for (int r = 0; r < invoke_n; r++) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const TfLiteStatus st = interpreter->Invoke();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (st != kTfLiteOk) {
+      std::fprintf(stderr, "INVOKE 第 %d 次失败\n", r + 1);
+      return;
+    }
+    ms.push_back((t1.tv_sec - t0.tv_sec) * 1e3
+                 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+  }
+  std::sort(ms.begin(), ms.end());
+  double sum = 0.0;
+  for (double v : ms) sum += v;
+
+  /* 输出校验：哈希 + 极值 + 均值，便于跨组比对 */
+  const TfLiteTensor* out = interpreter->tensor(outs[0]);
+  std::uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 初值 */
+  int omin = 127, omax = -128;
+  long long osum = 0;
+  std::size_t out_bytes = 0;
+  if (out != nullptr && out->data.raw != nullptr && out->bytes > 0) {
+    out_bytes = out->bytes;
+    const std::int8_t* q = static_cast<const std::int8_t*>(out->data.raw);
+    for (std::size_t k = 0; k < out_bytes; k++) {
+      h ^= static_cast<std::uint8_t>(q[k]);
+      h *= 1099511628211ULL;
+      if (q[k] < omin) omin = q[k];
+      if (q[k] > omax) omax = q[k];
+      osum += q[k];
+    }
+  }
+  std::fprintf(stderr,
+               "INVOKE n=%d warmup=%d min_ms=%.3f median_ms=%.3f mean_ms=%.3f "
+               "out_bytes=%zu out_hash=0x%016llx out_min=%d out_max=%d out_mean=%.4f\n",
+               invoke_n, warmup, ms.front(), ms[ms.size() / 2],
+               sum / static_cast<double>(ms.size()), out_bytes,
+               static_cast<unsigned long long>(h), omin, omax,
+               out_bytes ? static_cast<double>(osum) / static_cast<double>(out_bytes)
+                         : 0.0);
+}
+
 static void print_shape(const TfLiteTensor* t) {
   std::fprintf(stderr, "[");
   for (int d = 0; d < t->dims->size; d++) {
@@ -211,10 +300,13 @@ static void print_shape(const TfLiteTensor* t) {
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
-                 "用法: %s <model.tflite> [libteflon.so] [--no-delegate]\n"
-                 "  --no-delegate  不挂 delegate，用于归因：\n"
-                 "                 能跑通 → 崩溃在 delegate（PrepareDelegate/fill_tensor）\n"
-                 "                 仍崩溃 → 崩溃在 TFLite 解释器本身\n",
+                 "用法: %s <model.tflite> [libteflon.so] [--no-delegate] [--dump-tensors] [--invoke N]\n"
+                 "  --no-delegate   不挂 delegate，用于归因（也用于取 CPU 基准耗时）\n"
+                 "  --dump-tensors  逐张量转储 type/dims/量化参数/name\n"
+                 "  --invoke N      真实推理 N 次并计时（含 3 次预热）；\n"
+                 "                  输入用确定性模式填充，输出打 FNV-1a 哈希，\n"
+                 "                  所以「挂 delegate」与「--no-delegate」两组的\n"
+                 "                  耗时与 out_hash 可以直接对比\n",
                  argv[0]);
     return 64;
   }
@@ -222,12 +314,17 @@ int main(int argc, char** argv) {
   /* 解析 --no-delegate */
   bool no_delegate = false;
   bool dump_tensors = false;
+  int  invoke_n = 0;          /* --invoke N：真实推理 N 次并计时 */
   const char* lib_path = nullptr;
   for (int i = 2; i < argc; i++) {
     if (std::strcmp(argv[i], "--no-delegate") == 0) {
       no_delegate = true;
     } else if (std::strcmp(argv[i], "--dump-tensors") == 0) {
       dump_tensors = true;
+    } else if (std::strcmp(argv[i], "--invoke") == 0 && i + 1 < argc) {
+      invoke_n = std::atoi(argv[++i]);
+      if (invoke_n < 1) invoke_n = 1;
+      if (invoke_n > 10000) invoke_n = 10000;
     } else {
       lib_path = argv[i];
     }
@@ -424,6 +521,20 @@ int main(int argc, char** argv) {
       print_shape(t);
       std::fprintf(stderr, "\n");
     }
+  }
+
+  /* 7b. Invoke：真实推理 + 计时 + 输出校验
+   *
+   * 为什么必须有这一段：`AllocateTensors()` 只证明 delegate 完成了分区，
+   * **不证明推理能跑、更不证明它更快**。而当前被接管的只有 CONCAT/PAD
+   * （卷积因 per-channel 量化留在 CPU），所以「NPU 版是否更快」无法先验判断，
+   * 只能实测。
+   *
+   * 输入用**确定性模式**填充，保证 CPU 组与 NPU 组喂的是同一份数据；
+   * 输出打 FNV-1a 哈希 —— 两边哈希相同即说明计算结果一致。
+   */
+  if (invoke_n > 0) {
+    run_invoke(interpreter.get(), invoke_n);
   }
 
   /* 8. 机器可读摘要：一行 key=value，便于 grep/awk 判定 */
