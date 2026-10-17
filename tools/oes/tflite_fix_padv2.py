@@ -174,7 +174,9 @@ def rewrite(src, dst, dry_run=False):
     bo_attr = f(targets[0], 'builtin_options', 'builtinOptions')
 
     for op in targets:
-        del op.inputs[2]
+        # op.inputs 是 numpy array，不能用 del（ValueError: cannot delete
+        # array elements），必须整体替换为切片。
+        op.inputs = op.inputs[:2]
         setattr(op, oi_attr, pad_idx)
         ok = False
         if union_tag is not None and not isinstance(union_tag, int):

@@ -176,33 +176,11 @@ jobs:
             --in "$SRC" --out "$DST" || echo "FIX: rc=$?"
           ls -la out/*.tflite || true
 
-      - name: Route C - QDQ to int8 TFLite via onnx2tf convert
-        run: |
-          set -euo pipefail
-          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
-            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
-            --workdir work --outdir out \
-            --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --quant-format qdq --int8-tflite --tag clean \
-            --calib-dir calib --clean-k 3.0 \
-            || echo "ROUTE-C: exit=$? (report kept)"
-          ls -la out/*.tflite || true
-          echo "=== Route C output dir (direct listing) ==="
-          ls -la work/o2tf_int/ 2>/dev/null || echo "(no o2tf_int dir)"
-          echo "=== any tflite under work/ ==="
-          find work -name '*.tflite' -printf '%s\t%p\n' 2>/dev/null | head -20 || true
-
-      - name: Route A - QDQ via onnx2tf (control)
-        run: |
-          set -euo pipefail
-          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
-            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 50 \
-            --workdir work --outdir out \
-            --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --quant-format qdq --int8-tflite --tag clean \
-            --calib-dir calib \
-            || echo "ROUTE-C: exit=$? (report kept)"
-          ls -la out/*.tflite || true
+      # Route C/A（onnx2tf output_integer_quantized_tflite）已证死并删除：
+      #   CI run 38900946439 实测其产物目录只有 float32 / float16 /
+      #   dynamic_range_quant 三个文件，从不产出 _full_integer_quant.tflite。
+      #   该结论已固化在 tools/oes/qdq_to_tflite_tf.py 的头注释里。
+      # 现在唯一产出 int8 的路径是 Route T（TFLiteConverter 直出）。
 
       # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：
       # float 假绿绝不能进 regress）。--require-int8 会二次拦 float 模型。
