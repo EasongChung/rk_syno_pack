@@ -253,6 +253,40 @@ jobs:
           [ -s out/concept_int8_tf.tflite ] && \
             python tools/oes/check_pc.py --model out/concept_int8_tf.tflite \
               || true
+
+      # ★ 关键变体：legacy 量化器 + per-tensor 权重 + PADV2 修复
+      #
+      # 为什么必须补这一个：上面那个 per-tensor 变体做在 **MLIR** 路径上，
+      # 而 MLIR 路径本身 cos=0.0021 就是崩坏的（6 个退化 scale）。
+      # 实测 per-tensor(MLIR)=0.0002 与 MLIR 基线 0.0021 同属崩坏量级
+      # —— **无法判断 per-tensor 的精度代价**，基线不可用。
+      #
+      # legacy 路径是唯一可用的基线（+PADV2 修复后 cos=0.8879），
+      # 所以这里是唯一能给出「per-tensor 真实代价」的组合，
+      # 也是唯一可能交付的 per-tensor 产物。
+      - name: Route T-legacy-per-tensor - per-tensor + legacy + PADV2 fix
+        run: |
+          set -euo pipefail
+          RAW=out/concept_int8_legacy_pt_raw.tflite
+          OUT=out/concept_int8_legacy_pt.tflite
+          python tools/oes/qdq_to_tflite_tf.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --calib-num 100 \
+            --workdir work --out "$RAW" \
+            --input-name inputs_0 --old-quantizer --per-tensor-weights \
+            || echo "LEGACY-PT: exit=$? (report kept)"
+          test -s "$RAW" || { echo "LEGACY-PT: no raw model"; exit 0; }
+          # legacy 产物必须过 PADV2->PAD 修复，否则内核拒绝 prepare
+          python tools/oes/tflite_fix_padv2.py --in "$RAW" --out "$OUT" \
+            || echo "LEGACY-PT: padv2 fix rc=$?"
+          test -s "$OUT" || { echo "LEGACY-PT: fix failed"; exit 0; }
+          echo "=== verify per-tensor took effect ==="
+          python tools/oes/check_pc.py --model "$OUT" \
+            --expect per-tensor --verbose \
+            || echo "LEGACY-PT: NOT per-tensor (honest negative result)"
+          echo "=== degenerate scale check (legacy had 0) ==="
+          python tools/oes/check_pc.py --model "$RAW" 2>/dev/null || true
+          ls -la "$OUT"
       # 同集对照（och 第12轮任务）已完成并上报，结论：
       #   ORT QDQ cos=0.9624 top1=0.875  vs  TFLite cos=0.8879 top1=0.730
       #   （同一批 200 张 / 同一 ref / 同一个循环 —— 用 regress.py
