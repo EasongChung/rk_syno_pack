@@ -419,7 +419,7 @@ echo "==> [5/6] meson setup（只构建 teflon + etnaviv）"
 cd "$BUILD_DIR/mesa"
 rm -rf _build
 
-# 选项说明（均已对照 mesa-24.3.0 的 meson_options.txt 逐个核实存在）：
+# 选项说明（**不要硬编码** —— 不同 Mesa 版本选项集不同，下面会自动探测）：
 #   -Dteflon=true            启用 TFLite delegate（默认 false，必开）
 #   -Dgallium-drivers=etnaviv 只建 etnaviv（choices 里确有此项）
 #   -Dllvm=disabled          避免拉 LLVM 依赖，加速且减小体积
@@ -427,33 +427,76 @@ rm -rf _build
 #   -Dbuild-tests=false      不建测试
 #   -Dshared-glapi=disabled  交叉编译下 glapi 不单独共享
 #
-# 注意：vulkan / shared-egl / gl-dri / dri-tests / install-test-dri-deps
-# 这几个选项在 24.3.0 的 meson_options.txt 中**不存在**，传了会让 meson 报错，
-# 故不传（不同 Mesa 版本选项集有差异，升级 tag 时需重新核对）。
+# 实测差异：mesa-24.3.0 有 92 个选项、mesa-26.2.5 有 113 个，
+# 且 26.2.5 **删除了 osmesa**，传 -Dosmesa=false 会报
+#   ERROR: Unknown option: "osmesa".
+# 反之 vulkan / shared-egl / gl-dri / dri-tests / install-test-dri-deps
+# 在 24.3.0 中不存在，传了同样会报错。
+# → 所以下面统一走「探测该版本真实存在的选项，只传存在的」。
 #
 # -Dexpat=disabled：避免 meson 退回 expat subproject（交叉编译下会因
 #   arc4random_buf（glibc 2.36+ 才有）编译失败）。
 # -Dvulkan-drivers= / -Dvulkan-layers=：默认 auto 会带入 intel/amd，
 #   进而要求宿主装 glslangValidator，纯属无谓。
 # -Dplatforms= 必须留空而不是 "none"（choices 里没有 none）。
+# ⚠️ 选项集随 Mesa 版本变化，**不能硬编码**。
+# 实测：mesa-26.2.5 已删除 osmesa 选项，meson 直接报
+#   meson.build:4:0: ERROR: Unknown option: "osmesa".
+# 而 mesa-24.3.0 仍有该选项，删掉它又会走别的路。
+#
+# 所以做法：**探测该版本真实存在的选项**，只传存在的。
+# meson 1.1+ 把 meson_options.txt 改名为 meson.options，两个名字都试。
+OPT_FILE=""
+for f in meson.options meson_options.txt; do
+	[ -f "$f" ] && { OPT_FILE="$f"; break; }
+done
+if [ -z "$OPT_FILE" ]; then
+	echo "ERROR: 找不到 meson.options / meson_options.txt，无法探测选项集"
+	exit 1
+fi
+echo "    选项定义文件: $OPT_FILE"
+
+# 提取全部选项名。**必须兼容两种写法**，否则会误判：
+#   meson 1.1+ 的 meson.options：option( 换行后才是 'name',   ← 26.2.5
+#   旧 meson_options.txt：      option('name', type=...) 同一行  ← 24.3.0
+# 注意不能用 grep -E "option\(\s*'name'"：grep 逐行处理，\s* 不跨行，
+# 对 26.2.5 会把**所有**选项都误判为不存在（已实测踩过）。
+extract_opts() {
+	awk '
+	/^[[:space:]]*option\([[:space:]]*$/ { want=1; next }
+/^[[:space:]]*option\(/              { want=0
+	    if (match($0, /'"'"'[^'"'"']+'"'"'/)) print substr($0, RSTART+1, RLENGTH-2); next }
+	want && match($0, /'"'"'[^'"'"']+'"'"'/) { print substr($0, RSTART+1, RLENGTH-2); want=0 }
+	' "$OPT_FILE" | sort -u
+}
+OPT_NAMES="$(extract_opts)"
+echo "    该版本共 $(printf '%s\n' "$OPT_NAMES" | grep -c .) 个选项"
+
+# 期望传的选项及默认值（只是「想要」的值，不保证该版本认识）
+WANT_OPTS="teflon=true gallium-drivers=etnaviv llvm=disabled platforms= \
+build-tests=false shared-glapi=disabled glx=disabled gles2=disabled \
+opengl=false osmesa=false gbm=disabled libunwind=disabled egl=disabled \
+expat=disabled vulkan-drivers= vulkan-layers="
+
+MESON_D=""
+DROPPED=""
+for kv in $WANT_OPTS; do
+	name="${kv%%=*}"
+	if printf '%s\n' "$OPT_NAMES" | grep -qx "$name"; then
+		MESON_D="$MESON_D -D$kv"
+	else
+		DROPPED="$DROPPED $name"
+	fi
+done
+echo "    传入选项:$MESON_D"
+if [ -n "$DROPPED" ]; then
+	echo "    本版本不存在的选项（已剔除）:$DROPPED"
+fi
+
+# shellcheck disable=SC2086
 meson setup _build \
 	--cross-file "$BUILD_DIR/cross.ini" \
-	-Dteflon=true \
-	-Dgallium-drivers=etnaviv \
-	-Dllvm=disabled \
-	-Dplatforms= \
-	-Dbuild-tests=false \
-	-Dshared-glapi=disabled \
-	-Dglx=disabled \
-	-Dgles2=disabled \
-	-Dopengl=false \
-	-Dosmesa=false \
-	-Dgbm=disabled \
-	-Dlibunwind=disabled \
-	-Degl=disabled \
-	-Dexpat=disabled \
-	-Dvulkan-drivers= \
-	-Dvulkan-layers=
+	$MESON_D
 
 echo "==> 编译中（只编 libteflon.so，避免全量构建）"
 # 只构建 teflon 目标：依赖会自动带上 etnaviv/gallium 所需部分，
