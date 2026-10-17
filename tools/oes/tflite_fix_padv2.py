@@ -392,11 +392,18 @@ def main():
     ap.add_argument('--out', dest='dst', required=True)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--survey-only', action='store_true')
+    ap.add_argument('--audit-only', action='store_true',
+                    help='只做完整性审计（量化数/dtype/退化 scale/孤立张量），'
+                         '不改写。用于 before/after 对比。')
     args = ap.parse_args()
 
     print('=== STAGE-P0: args parsed, src exists=%s ==='
           % __import__('os').path.exists(args.src), flush=True)
     _sys.stdout.flush()
+
+    if args.audit_only:
+        audit(args.src)
+        return 0
 
     if args.survey_only:
         survey(args.src)

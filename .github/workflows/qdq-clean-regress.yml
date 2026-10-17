@@ -254,6 +254,48 @@ jobs:
             python tools/oes/check_pc.py --model out/concept_int8_tf.tflite \
               || true
 
+      # ★ 验证假设：删掉退化的 constant_values(133) 能否修好整条退化链
+      #
+      # 背景（och 第20轮）：
+      #   per-tensor 模型有 6 个退化张量（scale≈1.33e36=FLT_MAX/255）：
+      #     127/131 Int32(bias, pseudo_qconst106/110)
+      #     133 Int8 无形状(pseudo_qconst112) <- PadV2 的 constant_values
+      #     139/140/141 Int8(relu/pad_2/maxpool 路径)
+      #   机理：TF MinMax 对**从未被观测**的张量保留哨兵 {min=0,max=FLT_MAX}
+      #        -> scale=(FLT_MAX-0)/255 -> requant 乘数≈0 -> 输出坍缩成 zp。
+      #
+      #   注意 127/131 是 **bias**，其 scale = in_scale * w_scale。
+      #   若 in_scale 退化，bias_scale 是被**连坐**的，不是独立坏掉。
+      #
+      # 假设：133 是退化的源头（0 值常量的范围退化），
+      #       PADV2->PAD 改写把它整个删掉 -> 整条链可能自愈。
+      # 若假设成立：退化张量数大幅下降、输入敏感性恢复。
+      # 若不成立：说明退化已烘焙进各张量自身的量化参数，需逐张量修。
+      # 无论哪种，都是明确结论（不是猜测）。
+      - name: Test hypothesis - PADV2 rewrite on per-tensor model
+        run: |
+          set -euo pipefail
+          SRC=out/concept_int8_pertensor.tflite
+          DST=out/concept_int8_pertensor_padfix.tflite
+          if [ ! -s "$SRC" ]; then
+            echo "PT-PADFIX: $SRC missing, skip"; exit 0
+          fi
+          echo "########## BEFORE (degenerate count) ##########"
+          python tools/oes/tflite_fix_padv2.py --in "$SRC" \
+            --out /tmp/x.tflite --audit-only --survey-only || true
+          python tools/oes/check_pc.py --model "$SRC" || true
+          echo "########## rewrite PADV2 -> PAD ##########"
+          python tools/oes/tflite_fix_padv2.py --in "$SRC" --out "$DST" \
+            || echo "PT-PADFIX: rc=$?"
+          echo "########## AFTER (degenerate count + per-tensor preserved?) ##########"
+          if [ -s "$DST" ]; then
+            python tools/oes/tflite_fix_padv2.py --in "$DST" \
+              --out /tmp/x.tflite --audit-only || true
+            python tools/oes/check_pc.py --model "$DST" \
+              --expect per-tensor --verbose || true
+          fi
+          ls -la "$DST" 2>/dev/null || echo "(no output model)"
+
       # ★ 关键变体：legacy 量化器 + per-tensor 权重 + PADV2 修复
       #
       # 为什么必须补这一个：上面那个 per-tensor 变体做在 **MLIR** 路径上，
