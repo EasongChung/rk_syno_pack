@@ -151,32 +151,55 @@ def rewrite(src, dst, dry_run=False):
         print('nothing to do', flush=True)
         return 0
 
-    # BuiltinOptions union 的构造：不同 TF 版本略有差异，这里自适应。
+    # BuiltinOptions 是 union，tag 名在不同 TF 版本里不一致
+    # （Pad / PadOptions / NONE 都出现过）。这里一次 introspect 全部候选，
+    # 打印出来供人工核对，并按优先级尝试，避免再猜。
     bo_cls = fb.BuiltinOptions
-    union_tag = getattr(bo_cls, 'Pad')
-    print('API probe: BuiltinOptions.Pad=%r' % (union_tag,), flush=True)
+    bo_attrs = sorted(a for a in dir(bo_cls) if not a.startswith('_'))
+    print('API probe: BuiltinOptions attrs=%s' % bo_attrs, flush=True)
+
+    tag_name, union_tag = None, None
+    for cand in ('PadOptions', 'Pad', 'PadV2Options', 'NONE', 'None'):
+        if hasattr(bo_cls, cand):
+            tag_name, union_tag = cand, getattr(bo_cls, cand)
+            break
+    print('API probe: chosen BuiltinOptions.%s = %r'
+          % (tag_name, union_tag), flush=True)
+
     pad_opts_t = getattr(fb, 'PadOptionsT', None)
+    print('API probe: PadOptionsT=%s' % (pad_opts_t is not None,),
+          flush=True)
+
+    bt_attr = f(targets[0], 'builtin_options_type', 'builtinOptionsType')
+    bo_attr = f(targets[0], 'builtin_options', 'builtinOptions')
 
     for op in targets:
         del op.inputs[2]
         setattr(op, oi_attr, pad_idx)
-        setattr(op, f(op, 'builtin_options_type', 'builtinOptionsType'),
-                union_tag)
-        try:
-            union_obj = union_tag()
-            if hasattr(union_obj, 'Type'):
-                union_obj.Type = union_tag
-            if hasattr(union_obj, 'Value') and pad_opts_t is not None:
-                union_obj.Value = pad_opts_t()
-            setattr(op, f(op, 'builtin_options', 'builtinOptions'),
-                    union_obj)
-        except Exception as e:
-            # 退化路径：直接把 PadOptionsT 挂在 builtin_options 上
-            print('  union ctor failed (%s); try plain PadOptionsT' % e,
-                  flush=True)
-            setattr(op, f(op, 'builtin_options', 'builtinOptions'),
-                    pad_opts_t() if pad_opts_t is not None else None)
-        print('  rewrote one PADV2 -> PAD', flush=True)
+        ok = False
+        if union_tag is not None and not isinstance(union_tag, int):
+            # 真 union：构造 union 对象
+            try:
+                uo = union_tag()
+                if hasattr(uo, 'Type'):
+                    uo.Type = union_tag
+                if hasattr(uo, 'Value'):
+                    uo.Value = pad_opts_t() if pad_opts_t else None
+                setattr(op, bt_attr, union_tag)
+                setattr(op, bo_attr, uo)
+                ok = True
+            except Exception as e:
+                print('  union ctor failed: %s' % str(e)[:100], flush=True)
+        if not ok and isinstance(union_tag, int):
+            # NONE 之类的纯 tag：options 置空（PAD 无必填 options）
+            setattr(op, bt_attr, union_tag)
+            setattr(op, bo_attr, None)
+            ok = True
+        if not ok and pad_opts_t is not None:
+            setattr(op, bt_attr, 0)
+            setattr(op, bo_attr, pad_opts_t())
+            ok = True
+        print('  rewrote one PADV2 -> PAD (options=%s)' % ok, flush=True)
 
     if dry_run:
         print('dry-run: not writing', flush=True)
