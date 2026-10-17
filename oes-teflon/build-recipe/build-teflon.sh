@@ -244,6 +244,35 @@ fi
 echo "    vendored TFLite 头就位 (来自 TF 2.13.0)"
 
 # ---------------------------------------------------------------- #
+# 3b. 打 NPU 识别补丁（och）
+# ---------------------------------------------------------------- #
+# 不打这个补丁，teflon 在真机上**必然段错误**：
+#   NPU 类型（ETNA_CORE_NPU）唯一的赋值点在 etna_query_feature_db()，
+#   而它只在 drm_version >= 1.4 时才被调用。本设备内核报 1.3.0，
+#   但实际支持 PRODUCT_ID/CUSTOMER_ID/ECO_ID 这三个 param（0x1c/0x1d/0x1e，
+#   与 Mesa enum etna_param_id 完全一致）—— Mesa 的版本号代理判断错误。
+#   结果：hwdb 查找被跳过 → info->type 恒为 ETNA_CORE_GPU
+#        → screen->npu 恒为 NULL → etna_ml_get_core_info() 空指针 → 段错误。
+#
+# 已用崩溃栈 + 反汇编把崩溃点定位到单条指令（etna_ml_subgraph_create+0x44
+# 的 `ldr w0, [x0]`），完整推导见 docs/15-npu-detection-rootcause.md。
+#
+# 补丁脚本自带校验：匹配数不为 1 就**中止构建**，避免静默产出
+# 一个没打上补丁的 .so（那会表现为"换版本也没用"，很难查）。
+echo "==> [3b/6] 打 etnaviv NPU 识别补丁"
+# 用 $0 推导脚本所在目录，不依赖调用方的 cwd
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATCHER="$SCRIPT_DIR/patch-etnaviv-npu-detect.py"
+if [ ! -f "$PATCHER" ]; then
+	echo "ERROR: 缺 $PATCHER"
+	exit 1
+fi
+python3 "$PATCHER" mesa/src/etnaviv/drm/etnaviv_gpu.c || {
+	echo "ERROR: NPU 识别补丁应用失败 —— 不要跳过，否则产物在真机上会段错误"
+	exit 1
+}
+
+# ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #
 echo "==> [4/6] 生成 meson cross file"
