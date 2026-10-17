@@ -105,7 +105,10 @@
 #include <cstring>
 #include <memory>
 #include <vector>
+#include <csignal>
+#include <unistd.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 
 #include "tensorflow/lite/core/model_builder.h"       // FlatBufferModel
 #include "tensorflow/lite/core/interpreter_builder.h" // InterpreterBuilder
@@ -142,8 +145,42 @@ static const char* dtype_name(TfLiteType t) {
     case kTfLiteInt8:    return "INT8";
     case kTfLiteFloat16: return "FLOAT16";
     case kTfLiteFloat64: return "FLOAT64";
-    default:             return "OTHER";
+    /* 以下在 2.13 的 TensorType 里存在，但 delegate 的 create_resource()
+     * 会走 default: unreachable() —— 必须能显式打印出来，
+     * 否则会混在 "OTHER" 里看不出是哪几个。 */
+    case kTfLiteInt4:      return "INT4";
+    case kTfLiteBFloat16:  return "BFLOAT16";
+    case kTfLiteResource:  return "RESOURCE";
+    case kTfLiteVariant:   return "VARIANT";
+    case kTfLiteUInt4:     return "UINT4";
+    default:               return "OTHER";
   }
+}
+
+/* ---- 崩溃处理器：段错误时把调用栈写到 stderr（无缓冲，已保证不丢）---- */
+static void crash_handler(int sig) {
+  void* bt[64];
+  const int n = backtrace(bt, 64);
+  const char* name = (sig == SIGSEGV) ? "SIGSEGV"
+                  : (sig == SIGBUS)  ? "SIGBUS"
+                                     : "SIGABRT";
+  std::fprintf(stderr, "\n*** %s ***\n", name);
+  std::fprintf(stderr, "*** backtrace (%d frames) ***\n", n);
+  backtrace_symbols_fd(bt, n, STDERR_FILENO);
+  std::fprintf(stderr,
+               "*** 提示：地址用 addr2line -f -C -e <elf> <addr> 解析；\n"
+               "*** libteflon.so 的偏移可用 nm -D + objdump -d 反查。\n");
+  _exit(139);
+}
+
+static void install_crash_handler() {
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = crash_handler;
+  sa.sa_flags = SA_NODEFER;   /* 崩在 handler 里也能再崩一次 */
+  sigaction(SIGSEGV, &sa, nullptr);
+  sigaction(SIGBUS,  &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
 }
 
 static void print_shape(const TfLiteTensor* t) {
@@ -167,15 +204,28 @@ int main(int argc, char** argv) {
 
   /* 解析 --no-delegate */
   bool no_delegate = false;
+  bool dump_tensors = false;
   const char* lib_path = nullptr;
   for (int i = 2; i < argc; i++) {
     if (std::strcmp(argv[i], "--no-delegate") == 0) {
       no_delegate = true;
+    } else if (std::strcmp(argv[i], "--dump-tensors") == 0) {
+      dump_tensors = true;
     } else {
       lib_path = argv[i];
     }
   }
   if (lib_path == nullptr) lib_path = "./libteflon.so";
+
+  /* 输出必须无缓冲 —— 否则段错误时缓冲区里的 delegate 日志全部丢失，
+   * 表现为「零输出」，会被误读成「崩在第一条日志之前」。
+   * 真机上曾因此误判过（Mesa 的 teflon_debug 走 dump_graph，在最后才调用）。 */
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
+
+  /* 段错误时打印调用栈。DSM 上没有 gdb，这是唯一的定位手段。
+   * 地址可配合 nm / addr2line 在本地解析出函数名。 */
+  install_crash_handler();
 
   std::fprintf(stderr, "=== tf_load_check ===\n");
   std::fprintf(stderr, "模型        : %s\n", argv[1]);
@@ -298,6 +348,38 @@ int main(int argc, char** argv) {
          1e10 以上说明是常量 0 张量导致的 0/0 退化传染。 */
       if (t->params.scale > 1.0e10f) n_degenerate++;
     }
+
+    /* 逐张量转储：用来回答两个问题
+     *   (1) tensors_size() 报出的槽位里有没有「未写入的占位槽」；
+     *   (2) delegate 的 create_resource() 对未支持 dtype 会走
+     *       default: unreachable("Unsupported TF type")，
+     *       若被 NDEBUG 编译掉则 bytes 未初始化 → 必须列出所有非 INT8/INT32 的。
+     * 每行：idx type dims has_data scale zp name
+     * 有量化参数的标 *，无量化参数标 -（delegate 会跳过，见 fill_tensor 守卫）。 */
+    if (dump_tensors) {
+      const bool has_q = (t->quantization.type == kTfLiteAffineQuantization);
+      char dims[96] = "?";
+      if (t->dims != nullptr) {
+        std::size_t off = 0;
+        dims[0] = '\0';
+        for (int d = 0; d < t->dims->size; d++) {
+          int k = std::snprintf(dims + off, sizeof(dims) - off, "%s%d",
+                                d ? "x" : "", t->dims->data[d]);
+          if (k < 0 || static_cast<std::size_t>(k) >= sizeof(dims) - off) break;
+          off += static_cast<std::size_t>(k);
+        }
+      }
+      std::fprintf(stderr, "TENSOR %4d %-9s %-22s data=%-3s %c scale=%-14g zp=%-5d %s\n",
+                   i, dtype_name(t->type), dims,
+                   t->data.data ? "yes" : "no",
+                   has_q ? '*' : '-',
+                   t->params.scale,
+                   static_cast<int>(t->params.zero_point),
+                   (t->name != nullptr) ? t->name : "");
+    }
+  }
+  if (dump_tensors) {
+    std::fprintf(stderr, "TENSOR_DUMP_END count=%d\n", n_tensors);
   }
 
   /* 7. 输入/输出张量 —— Interpreter::inputs()/outputs() 返回 const std::vector<int>&
