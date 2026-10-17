@@ -277,6 +277,32 @@ python3 "$PATCHER" mesa/src/etnaviv/drm/etnaviv_gpu.c || {
 }
 
 # ---------------------------------------------------------------- #
+# 3c. 打「只接受卷积」运行时开关补丁（och）
+# ---------------------------------------------------------------- #
+# 实测背景：本 delegate 接管的算子全是 TRANSPOSE/RESHAPE/CONCAT/PAD（布局操作），
+# 而 partition_invoke 每次调用、每个分区都 context_create/destroy，
+# 单分区固定开销 6–31 ms → 18 个分区就超过 CPU 全部推理时间（302 ms）。
+# 置 TEFLON_CONV_ONLY=1 可只接受 Conv2d/DWConv2d，让布局操作留 CPU。
+#
+# ⚠️ 与 3b 的致命性**故意不同**：3b 的补丁缺失会导致真机段错误（静默产出坏产物），
+#    所以必须 fail loudly；而本补丁缺失只是**少一个实验开关**，
+#    产物本身仍完全可用（默认行为不变）。
+#    因此这里**非致命** —— 否则会给 25.0.7 等结构不同的版本带来假失败。
+#    但要**醒目警告**，并且靠真机验证开关是否真的生效（缺补丁时开关无效会被发现）。
+echo "==> [3c/6] 打「只接受卷积」运行时开关补丁"
+PATCHER2="$SCRIPT_DIR/patch-teflon-conv-only.py"
+if [ -f "$PATCHER2" ]; then
+	if python3 "$PATCHER2" mesa/src/gallium/frontends/teflon/tfl_device.c; then
+		echo "    TEFLON_CONV_ONLY 开关已就绪（默认关闭，行为不变）"
+	else
+		echo "    ！！警告：本 Mesa 版本结构不同，TEFLON_CONV_ONLY 开关【不可用】"
+		echo "    ！！这不影响产物可用性（默认行为不变），但真机上设了开关也不会生效"
+	fi
+else
+	echo "    ！！警告：缺 $PATCHER2，跳过（开关不可用）"
+fi
+
+# ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #
 echo "==> [4/6] 生成 meson cross file"
