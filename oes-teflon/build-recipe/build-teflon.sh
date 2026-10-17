@@ -17,12 +17,6 @@
 #   GLIBC_VER      sysroot glibc 版本，默认 2.31
 #   DEB_SUITE      Debian 套件，默认 bullseye
 #   CROSS_PREFIX   交叉前缀，默认 aarch64-linux-gnu-
-#
-# 诊断/修复开关（默认全关，产物与生产完全一致）：
-#   TEFLON_DIAG=1        越界取证补丁（打印尺寸/指针 + 钳界；产物不可交付）
-#   TEFLON_FIX_V7=1      v7 calculate_bias_correction depthwise 修复
-#   TEFLON_DEBUG_INFO=1  c_args/cpp_args 追加 -g3
-#   ⚠️ TEFLON_DIAG 与 TEFLON_FIX_V7 互斥（改同一函数）。
 
 set -eu
 
@@ -320,11 +314,14 @@ fi
 # ⚠️ 设了 TEFLON_DIAG=1 的产物**只能用于诊断，不可交付**（会改变越界处行为）。
 #
 # 用法：TEFLON_DIAG=1 TEFLON_DEBUG_INFO=1 ./build-teflon.sh
-# 诊断补丁与修复补丁改的是**同一个函数**，因此互斥：
-#    诊断补丁会先插入诊断块（改动函数体），修复补丁要求原文精确匹配，
-#    两个一起开会以「匹配到 0 处」失败。所以这里硬拦。
+# 诊断补丁与修复补丁针对**同一个函数**，同时开没有意义
+#（诊断版会钳住循环、修复版会纠正长度，语义上互斥）。
+#
+# 说明：实测两者**文本上其实能共存**（fix 之后 diag 的锚点
+# `int32_t correction = 0;` 依然存在），所以下面这道拦截是**防混淆的安全栏**，
+# 不是「技术上必然失败」—— 注释别写成后者，那会误导下一个人。
 if [ "${TEFLON_DIAG:-0}" = "1" ] && [ "${TEFLON_FIX_V7:-0}" = "1" ]; then
-	echo "ERROR: TEFLON_DIAG 与 TEFLON_FIX_V7 互斥，只能二选一"
+	echo "ERROR: TEFLON_DIAG 与 TEFLON_FIX_V7 语义互斥，只能二选一"
 	exit 1
 fi
 
@@ -620,7 +617,7 @@ echo "    选项定义文件: $OPT_FILE"
 # 对 26.2.5 会把**所有**选项都误判为不存在（已实测踩过）。
 extract_opts() {
 	awk '
-	/^[[:space:]]*option\([[:space:]]*$/ { want=1; next }
+/^[[:space:]]*option\([[:space:]]*$/ { want=1; next }
 /^[[:space:]]*option\(/              { want=0
 	    if (match($0, /'"'"'[^'"'"']+'"'"'/)) print substr($0, RSTART+1, RLENGTH-2); next }
 	want && match($0, /'"'"'[^'"'"']+'"'"'/) { print substr($0, RSTART+1, RLENGTH-2); want=0 }
@@ -753,8 +750,20 @@ if readelf -d libteflon.so 2>/dev/null | grep -q "libc\.musl"; then
 fi
 
 # 仅对产物做 strip，保留调试可读性
-if command -v "$STRIP_BIN" >/dev/null 2>&1; then
+#
+# TEFLON_NO_STRIP=1 时**跳过**，保留 DWARF 调试段。
+# 用途：`addr2line -e libteflon.so <地址>` 一行给出源码行，省掉
+# 「指令指纹 + 结构体偏移反查 + 同仓库函数对照」这套容易出错的间接推理。
+# ⚠️ 默认关闭（干净产物）；带调试段的产物明显变大且**不可交付**。
+#
+# 历史：第一轮我判断「先不加，等真机验证不过再说」——那一轮判断是对的；
+#真机证明首个修复无效后，它就从「可选」变成了硬需求（2026-10-17）。
+if [ "${TEFLON_NO_STRIP:-0}" = "1" ]; then
+	echo "    strip：跳过（保留调试段，供 addr2line 使用；该产物不可交付）"
+elif command -v "$STRIP_BIN" >/dev/null 2>&1; then
 	"$STRIP_BIN" --strip-unneeded libteflon.so || true
+else
+	echo "    警告：找不到 strip 可执行文件，跳过 strip"
 fi
 
 # 自检：产物必须是 aarch64 + 纯 glibc 依赖

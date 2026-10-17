@@ -1,26 +1,35 @@
 name: build-teflon-diag
 
-# 【修复专用】交叉编译带 v7 depthwise 修复的 libteflon.so (aarch64 / glibc)
+# 【修复+调试专用】交叉编译带 v7 depthwise 修复、**保留 DWARF** 的 libteflon.so
 #
 # ⚠️⚠️ 本 workflow 产出的 .so **绝不可交付/部署为生产物**：
-#   它改变 calculate_bias_correction() 的扫描长度（这是对上游 v7 缺陷的修复，
-#   但与上游未修复行为不同）。唯一用途是**真机验证修复是否消除 SIGSEGV**。
-#   验证通过后，修复逻辑应以补丁形式并入生产构建（另议）。
+#   1) 它改了 calculate_bias_correction() 的扫描长度（v8 特判 backport 到 v7）；
+#   2) 它保留调试段，体积大数倍（TEFLON_NO_STRIP=1）。
+#   唯一用途：**真机归因**。addr2line 定位到源码行后，修复逻辑才谈得上并入生产。
 #
 # 与生产构建的分工（必须分离，避免拿错产物）：
-#   build-teflon.yml       -> artifact `libteflon-aarch64-glibc`（生产，干净）
-#   build-teflon-diag.yml  -> artifact `libteflon-diag`           （修复验证）
+#   build-teflon.yml       -> artifact `libteflon-aarch64-glibc`（生产，干净，已 strip）
+#   build-teflon-diag.yml  -> artifact `libteflon-diag`           （修复+调试，不可交付）
 #
 # 开关：
 #   TEFLON_FIX_V7=1      -> 打 patch-etnaviv-v7-biasfix.py（v8 depthwise 特判 backport）
 #   TEFLON_DEBUG_INFO=1  -> c_args/cpp_args 追加 -g3
-#   TEFLON_DIAG          -> **不启用**。诊断（钳界取证）已被 och 的静态证明取代；
-#                           钳界会掩盖后续问题，故只在历史记录里保留。
-#   注：TEFLON_DIAG 与 TEFLON_FIX_V7 互斥（改同一函数），build-teflon.sh 会硬拦。
+#   TEFLON_NO_STRIP=1    -> 第 6 步跳过 strip，**保留 .debug_* 段**（addr2line 的前提）
+#   TEFLON_DIAG          -> **不启用**。诊断（钳界取证）已被静态分析取代；钳界会掩盖后续问题。
+#   注：TEFLON_DIAG 与 TEFLON_FIX_V7 语义互斥（改同一函数），build-teflon.sh 会硬拦。
 #
 # ⚠️ 触发方式：**仅 workflow_dispatch**（och 第 22 轮要求）。
 #   去掉 push 触发，避免「改 build-teflon.sh 时与生产 workflow 同时跑」的问题。
-#   要跑就手动 dispatch。生产 build-teflon.yml 保持 push 触发不变。
+#
+# 历史（别重走）：
+#   - 第 1 轮 heredoc bug：把 shell 控制流写进了 cross.ini，构建"看起来 success"
+#     却产出损坏产物 → 由此加了「三行断言」硬门。
+#   - 第 2 轮（stripped .so）：`readelf -S | grep debug` 为 ABSENT，addr2line 无从下手
+#     → 由此加了 TEFLON_NO_STRIP，并把 `.debug_info` 升为**硬门**（不是可选项）。
+#   - 第 3 轮真机：修复版仍 SIGSEGV，且 `[och-fix]` 日志证明 depthwise 特判在此
+#     调用点不生效（depthwise=0, buggy_bound=48 ≪ wt_size=1152）
+#     → **「v7 缺 depthwise 特判」这一根因判断被证伪**，不再靠反汇编猜函数，
+#     直接用 DWARF 拿源码行。
 
 on:
   workflow_dispatch:
@@ -29,6 +38,10 @@ on:
         description: 'Mesa tag（需带 vendored TFLite 头，最低 24.1.0）'
         required: false
         default: 'mesa-26.2.5'
+      fault_addrs:
+        description: '要做 addr2line 归因的 .text vaddr 列表（逗号分隔，0x 前缀）'
+        required: false
+        default: '0x256a60,0x256a4c,0x256a54,0x256a58,0x256a5c,0x256a64,0x256a74,0x256a78,0x256a80,0x255710,0x256a30,0x256cc0'
 
 env:
   # 必须在 workflow 级：Collect artifact 步骤也要读它，否则会写出假标签。
@@ -36,10 +49,11 @@ env:
   TEFLON_FIX_V7: '1'
   TEFLON_DIAG: '0'
   TEFLON_DEBUG_INFO: '1'
+  TEFLON_NO_STRIP: '1'
 
 jobs:
   build:
-    name: build libteflon.so FIX_V7 (aarch64-glibc, NOT deliverable)
+    name: build libteflon.so FIX_V7+NOSTRIP (aarch64-glibc, NOT deliverable)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -79,6 +93,7 @@ jobs:
           set -eux
           aarch64-linux-gnu-gcc --version | head -1
           aarch64-linux-gnu-gcc -dumpmachine
+          aarch64-linux-gnu-addr2line --version | head -1
           meson --version
           ninja --version
           python3 -c "import mako, yaml, pycparser; print('python deps OK')"
@@ -138,25 +153,28 @@ jobs:
               shutil.rmtree(tmp, ignore_errors=True)
           PY
 
-      - name: Build libteflon.so (FIX_V7)
+      - name: Build libteflon.so (FIX_V7 + NO_STRIP)
         run: |
           set -eux
           chmod +x oes-teflon/build-recipe/build-teflon.sh
-          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO}"
+          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-diag.log"
 
-      # ★ 硬门（och 第22轮明确要求）：构建成功 ≠ 产物可用。
-      #   -g3 与修复注入两行必须都出现，缺一行就判失败。
-      #   历史教训：heredoc bug 曾让构建"看起来 success"却产出损坏 cross.ini。
-      - name: Assert FIX_V7 switches actually took effect
+      # ★ 硬门（och 第 23 轮要求，四条缺任一条即失败）：
+      #   1) [och-fix] 已修复   —— 证明修复补丁真的进了源码
+      #   2) 调试信息：开启（-g3）—— 证明 DWARF 被请求
+      #   3) strip：跳过（保留调试段 —— 证明 DWARF 没被 strip 删掉
+      #   历史教训：构建成功 ≠ 产物可用（heredoc bug / strip 吃掉 debug 段各一次）。
+      - name: Assert switches actually took effect
         run: |
           set -eux
           L="$RUNNER_TEMP/build-diag.log"
           ok=1
           for pat in '调试信息：开启（-g3）' \
                      '[3e/6] 打【修复】v7' \
-                     '[och-fix] 已修复 v7 calculate_bias_correction'; do
+                     '[och-fix] 已修复 v7 calculate_bias_correction' \
+                     'strip：跳过（保留调试段'; do
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
             else
@@ -166,7 +184,7 @@ jobs:
           done
           if [ "$ok" -ne 1 ]; then
             echo "  ---- 相关日志片段 ----"
-            grep -nE '3b/6|3c/6|3d/6|3e/6|och-fix|och-diag|调试信息|TEFLON_' "$L" || true
+            grep -nE '3b/6|3c/6|3d/6|3e/6|och-fix|och-diag|调试信息|strip|TEFLON_' "$L" || true
             exit 1
           fi
           echo "ALL SWITCH ASSERTIONS PASSED"
@@ -186,7 +204,8 @@ jobs:
             "$SR/lib/aarch64-linux-gnu/libc.so.6"
           readelf -h "$RUNNER_TEMP/teflon_dlopen" | grep Machine
 
-      - name: Verify artifact + embedded fix strings + debug sections
+      # ---- 产物核验 ----
+      - name: Verify artifact + embedded fix strings + DWARF gate
         run: |
           set -eux
           SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
@@ -200,24 +219,92 @@ jobs:
           readelf -d "$SO" | grep -E 'RUNPATH|RPATH' || true
           echo "=== delegate ABI ==="
           readelf -sW "$SO" | grep -E 'tflite_plugin_(create|destroy)_delegate'
-          echo "=== .debug_* sections（-g3 证据）==="
-          if readelf -S "$SO" | grep -q '\.debug_'; then
-            readelf -S "$SO" | grep -oE '\.debug_[a-z_]+' | sort -u | head -12
-            echo "DEBUG-SECTIONS: PRESENT"
-          else
-            echo "DEBUG-SECTIONS: ABSENT（strip --strip-unneeded 可能已移除）"
-          fi
-          echo "=== 修复代码是否真编进二进制 ==="
-          if strings -a "$SO" | grep -qF 'calc_bias_correction depthwise'; then
-            echo "STRING-CHECK: fix printf present  <- 修复代码已编入"
-          else
-            echo "STRING-CHECK: fix printf ABSENT"
-            echo "ERROR: 修复代码没有进入二进制，上机验证将毫无意义"
+          echo "=== .debug_* sections ==="
+          readelf -S "$SO" | grep -oE '\.debug_[a-z_]+' | sort -u | tr '\n' ' '; echo
+          # ★ 硬门：.debug_info 是**验收项**（och 第 23 轮），缺了这份产物就不能用。
+          if ! readelf -S "$SO" | grep -q '\.debug_info'; then
+            echo "ERROR: 产物没有 .debug_info —— addr2line 归因不可用，本产物作废"
             exit 1
           fi
-          if strings -a "$SO" | grep -qF 'still OOB after fix'; then
-            echo "STRING-CHECK: OOB warning string present"
-          fi
+          echo "DEBUG-SECTIONS: PRESENT (.debug_info 已确认)"
+          # .debug_line 也要有：addr2line 出文件:行靠的就是它
+          readelf -S "$SO" | grep -q '\.debug_line' \
+            || { echo "ERROR: 缺 .debug_line（addr2line 无法给出行号）"; exit 1; }
+          echo "DEBUG-LINE: PRESENT"
+          echo "=== 修复代码是否真编进二进制 ==="
+          strings -a "$SO" | grep -qF 'calc_bias_correction depthwise' \
+            || { echo "ERROR: 修复代码没有进入二进制，上机验证将毫无意义"; exit 1; }
+          echo "STRING-CHECK: fix printf present  <- 修复代码已编入"
+          strings -a "$SO" | grep -qF 'still OOB after fix' \
+            && echo "STRING-CHECK: OOB warning string present"
+
+      # ★ addr2line 归因：在 CI 里就把「哪个源码行」算出来。
+      #   动机：unstripped .so 体积是 stripped 的数倍，而 oca→och 的大文件传递
+      #   目前不通。与其传 100 MB 二进制，不如在这里出**几 KB 的结论**。
+      #   地址清单由 workflow_dispatch 输入 fault_addrs 给，改地址不必改 workflow。
+      - name: addr2line attribution for fault addresses
+        env:
+          ADDRS: ${{ github.event.inputs.fault_addrs }}
+        run: |
+          set -eu
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          MAP="$RUNNER_TEMP/addr2line-map.txt"
+          {
+            echo "### addr2line attribution"
+            echo "### so=$SO"
+            echo "### so_size=$(stat -c%s "$SO")"
+            echo "### so_sha256=$(sha256sum "$SO" | cut -d' ' -f1)"
+            echo
+            for a in $(echo "$ADDRS" | tr ',' ' '); do
+              echo "=== $a ==="
+              echo "-- addr2line -f -i -C:"
+              aarch64-linux-gnu-addr2line -f -i -C -e "$SO" "$a" || echo "  (addr2line failed)"
+              echo "-- nearest symbol (.symtab then .dynsym):"
+              python3 - "$SO" "$a" <<'PY'
+          import subprocess, sys
+          so, a = sys.argv[1], int(sys.argv[2], 16)
+          best = None
+          for flag in ('--defined-only', '-D --defined-only'):
+              cmd = ['aarch64-linux-gnu-nm', '-n'] + (['--defined-only'] if flag == '--defined-only'
+                                                       else ['-D', '--defined-only']) + [so]
+              try:
+                  out = subprocess.run(cmd, capture_output=True, text=True).stdout
+              except Exception:
+                  continue
+              for ln in out.splitlines():
+                  p = ln.split()
+                  if len(p) >= 3 and p[1].upper() in ('T', 'W'):
+                      v = int(p[0], 16)
+                      if v <= a and (best is None or v > best[0]):
+                          best = (v, p[2])
+              if best:
+                  break
+          print('   %s +0x%x  (delta=%d bytes)' % (best[1], best[0], a - best[0])
+                if best else '   (no symbol <= addr found)')
+          PY
+              echo
+            done
+          } | tee "$MAP"
+
+      # 反汇编 + **源码文本**窗口（-S 需要 Mesa 源码树在同一 comp_dir，故先 cd 过去）。
+      # 失败不致命：addr2line 的结论已经拿到了，这一段只是锦上添花。
+      - name: Disassembly window with interleaved source
+        env:
+          ADDRS: ${{ github.event.inputs.fault_addrs }}
+        run: |
+          set -eu
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          MAP="$RUNNER_TEMP/disasm-window.txt"
+          FIRST=$(echo "$ADDRS" | tr ',' ' ' | head -1)
+          START=$(python3 -c "print(hex(int('$FIRST',16)-0x40))")
+          STOP=$(python3 -c "print(hex(int('$FIRST',16)+0x60))")
+          {
+            echo "### objdump -dlS --start-address=$START --stop-address=$STOP"
+            cd "$RUNNER_TEMP/teflon-build/mesa"
+            aarch64-linux-gnu-objdump -dlS \
+              --start-address="$START" --stop-address="$STOP" "$SO" || \
+              echo "(objdump -S failed; DWARF comp_dir 与源码树不一致属正常)"
+          } | tee "$MAP"
 
       - name: Glibc symbol ceiling check (device = 2.36)
         run: |
@@ -242,7 +329,7 @@ jobs:
           [ $fail -eq 0 ] || exit 1
           echo "OK: 全部产物符号版本 <= 设备 glibc 2.36"
 
-      - name: Collect artifact (FIX_V7)
+      - name: Collect artifact (FIX_V7 + DWARF)
         run: |
           set -eux
           OUT="$RUNNER_TEMP/teflon-build/out"
@@ -252,12 +339,17 @@ jobs:
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           cp "$RUNNER_TEMP/teflon_dlopen" artifact/
           cp "$RUNNER_TEMP/build-diag.log" artifact/build-diag.log
+          cp "$RUNNER_TEMP/addr2line-map.txt" artifact/addr2line-map.txt
+          [ -f "$RUNNER_TEMP/disasm-window.txt" ] && cp "$RUNNER_TEMP/disasm-window.txt" artifact/
           {
-            echo "########## FIX_V7 BUILD - NOT a production artifact ##########"
+            echo "########## FIX_V7 + NO_STRIP BUILD - NOT a production artifact ##########"
             echo "purpose=backport v8 depthwise/addition guard into v7 calculate_bias_correction"
+            echo "purpose2=keep DWARF so addr2line can attribute the remaining SIGSEGV"
             echo "TEFLON_FIX_V7=${TEFLON_FIX_V7:-0}  TEFLON_DIAG=${TEFLON_DIAG:-0}"
             echo "teflon_debug_info=${TEFLON_DEBUG_INFO:-0}"
+            echo "teflon_no_strip=${TEFLON_NO_STRIP:-0}"
             echo "warning=the patched build CHANGES the scan length for DWCONV (this is the fix)"
+            echo "warning2=unstripped => large; never deploy this .so to a device"
             echo "mesa_tag_env=${MESA_TAG:-mesa-26.2.5}"
             BIN_TAG="$(strings -a "$OUT/libteflon.so" \
               | grep -oE '2[0-9]\.[0-9]+\.[0-9]+ \(git-[0-9a-f]+\)' \
@@ -266,6 +358,7 @@ jobs:
             echo "target=aarch64 / glibc 2.31 sysroot (Debian bullseye)"
             echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
             echo "device=Synology DSM 7.4.1-90080 / glibc 2.36 / A311D NPU"
+            echo "debug_sections=$(readelf -S "$OUT/libteflon.so" | grep -oE '\.debug_[a-z_]+' | sort -u | tr '\n' ' ')"
             echo "build_date=$(date -u +%FT%TZ)"
           } > artifact/BUILD-INFO.txt
           cat artifact/BUILD-INFO.txt
@@ -274,7 +367,7 @@ jobs:
           echo "=== size ==="
           ls -l artifact/libteflon.so
 
-      - name: Upload artifact (FIX_V7)
+      - name: Upload artifact (FIX_V7 + DWARF)
         uses: actions/upload-artifact@v4
         with:
           name: libteflon-diag
