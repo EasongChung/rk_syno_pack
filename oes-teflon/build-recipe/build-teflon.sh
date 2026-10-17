@@ -473,6 +473,23 @@ EXTRA_LINK="${EXTRA_LINK:+, $EXTRA_LINK}"
 #
 # 注意：heredoc 内不能出现未转义的 $ORIGIN，否则 set -u 会直接报错。
 
+# TEFLON_DEBUG_INFO=1 时追加 -g3（带调试信息，供 addr2line 定位源码行）。
+# 默认不带，保持干净产物体积；诊断构建建议与 TEFLON_DIAG=1 一起用。
+#
+# ⚠️ 这段 shell 逻辑**必须放在 heredoc 之前**。
+# 之前误写在 `cat > cross.ini <<EOF ... EOF` 内部，导致
+#   - shell 的 if/else/fi 被当成 cross.ini 的内容写进文件
+#   - meson 报 "Malformed machine file: [line 28]: 'else\n'"
+#   - 而 ninja 那步的失败被管道掩盖，构建"看似成功"
+#   （CI run 39036750234 实测）
+DBG_ARGS=""
+if [ "${TEFLON_DEBUG_INFO:-0}" = "1" ]; then
+	DBG_ARGS="-g3"
+	echo "    调试信息：开启（-g3）"
+else
+	echo "    调试信息：关闭（干净产物）"
+fi
+
 cat > "$BUILD_DIR/cross.ini" <<EOF
 [binaries]
 c         = '${CC_BIN}'
@@ -495,15 +512,6 @@ needs_exe_wrapper = true
 # 数组必须写成**单行**：meson 1.11 的 machine file 解析器不接受
 # 跨行数组（会在 ']' 处报 Malformed machine file）。
 # ${VAR:+...} 保证空值不产生多余空格/空元素（apt 模式无 multiarch 路径）。
-# TEFLON_DEBUG_INFO=1 时追加 -g3（带调试信息，供 addr2line 定位源码行）。
-# 默认不带，保持干净产物体积；诊断构建建议与 TEFLON_DIAG=1 一起用。
-DBG_ARGS=""
-if [ "${TEFLON_DEBUG_INFO:-0}" = "1" ]; then
-	DBG_ARGS="-g3"
-	echo "    调试信息：开启（-g3）"
-else
-	echo "    调试信息：关闭（干净产物）"
-fi
 c_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
 cpp_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
 c_link_args = ['--sysroot=$SR', '-Wl,-rpath-link,$SR_LIB', '-Wl,--enable-new-dtags,-rpath,\$ORIGIN'$EXTRA_LINK]
