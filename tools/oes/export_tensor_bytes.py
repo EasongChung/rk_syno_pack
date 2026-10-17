@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""导出一张评测图的原始张量字节，供 och 在设备上验 CPU 正确性。
+"""导出一张评测图的原始张量字节，供 och 在设备上验正确性。
 
-## 背景（och 第18轮）
-用户裁决 CPU 版先交付。要交付就必须证明**设备上对真实图片输出正确**，
-而 regress 跑在 CI（x86）上，**没有设备侧证据**。
-och 用合成输入（ramp）无法验正确性 —— 实测 CPU 输出几乎全饱和
-（mean=-127.68），据此完全无法判断真实图片上是否正确。
+## ⚠️ 两个基准，不要混（用户 2026-10-17 更正）
 
-## 交付物（och 指定）
-| 文件 | 内容 | 大小 |
-|---|---|---|
-| input_NNNN.bin | 该图**预处理后**的输入张量原始 INT8 字节 | 1x395x395x3 = 468075 B |
-| output_NNNN_cpu.bin | 参考输出张量原始 INT8 字节 | 1x335 = 335 B |
-外加两个文件的 SHA256。
+> 「CPU 跑的话直接使用原模型就可以，没必要用量化版，只有 NPU 才需要
+>   转量化模型」
+
+所以：
+
+| 路径 | 模型 | 输入 | 输出 |
+|---|---|---|---|
+| **CPU（交付版）** | `tools/oes/models/model_float16.tflite`（原模型） | **FLOAT32** 1x395x395x3 = 1872300 B | **FLOAT32** 1x335 = 1340 B |
+| NPU（在研） | `out/concept_int8_*.tflite`（量化版） | INT8 468075 B | INT8 335 B |
+
+**本脚本对两者都能导出**，文件名带 dtype 后缀（`_f32` / `_i8`）以免混淆。
+CPU 正确性验证应使用 **`_f32`** 那一对（原模型）；`_i8` 只服务 NPU 线。
 
 ## 为什么必须由本脚本导出
 预处理链在 regress.py 里已有一份且经过验证。**重新实现一遍**，
 正是最可能出现「两边都以为自己对齐了」的环节。故本脚本直接
 import regress.preprocess_input —— **单一真相源**。
 
-## 用哪个模型
-默认用 `out/concept_int8_fixed.tflite`（legacy 量化器 + PADV2 修复），
-因为它是**唯一 cos 可用的产物（0.8879）**。
-注意 `concept_int8_tf.tflite`（MLIR）cos=0.0021 **本身崩坏**，
-不能用它做参考 —— 若设备上跑的是它，两边输出必然对不上，
-那是模型本身的问题，不是本对齐流程的问题。
-
 用法：
-  python export_tensor_bytes.py --model out/concept_int8_fixed.tflite \\
+  # CPU 基准（原模型，交付用）
+  python export_tensor_bytes.py \\
+      --model tools/oes/models/model_float16.tflite \\
+      --image eval/oes-eval-0000.jpg --outdir out/tensors
+
+  # NPU 基准（量化模型）
+  python export_tensor_bytes.py \\
+      --model out/concept_int8_fixed.tflite \\
       --image eval/oes-eval-0000.jpg --outdir out/tensors
 """
 import argparse
@@ -81,7 +83,16 @@ def main():
     b = open(img, 'rb').read()
     # 与 regress 同一份预处理函数（单一真相源）
     t = R.preprocess_input(inp, b)
-    assert t.dtype == np.int8, 'expected int8 input, got %s' % t.dtype
+
+    # dtype 决定文件名后缀，避免把 int8 字节和 float32 字节混为一谈
+    # （用户更正：CPU 用原模型 = FLOAT32 I/O；量化模型只服务 NPU = INT8）
+    import numpy as _np
+    if t.dtype == _np.int8:
+        sfx = 'i8'
+    elif t.dtype == _np.uint8:
+        sfx = 'u8'
+    else:
+        sfx = 'f32'
     in_bytes = t.tobytes()
 
     it.set_tensor(inp['index'], t)
@@ -90,41 +101,37 @@ def main():
     out_bytes = raw.tobytes()
 
     os.makedirs(args.outdir, exist_ok=True)
-    ip = os.path.join(args.outdir, 'input_%s.bin' % stem.split('-')[-1])
-    op = os.path.join(args.outdir, 'output_%s_cpu.bin'
-                      % stem.split('-')[-1])
+    num = stem.split('-')[-1]
+    ip = os.path.join(args.outdir, 'input_%s_%s.bin' % (num, sfx))
+    op = os.path.join(args.outdir, 'output_%s_%s.bin' % (num, sfx))
     with open(ip, 'wb') as f:
         f.write(in_bytes)
     with open(op, 'wb') as f:
         f.write(out_bytes)
 
-    exp_in = int(np.prod(inp['shape']))
-    exp_out = int(np.prod(out['shape']))
+    exp_in = int(_np.prod(inp['shape'])) * t.dtype.itemsize
+    exp_out = int(_np.prod(out['shape'])) * raw.dtype.itemsize
     print()
-    print('=== exported ===')
-    print('%-34s %8d B (expect %d)  sha256=%s'
+    print('=== exported (%s path) ===' % sfx)
+    print('%-34s %9d B (expect %d)  sha256=%s'
           % (ip, len(in_bytes), exp_in, sha256_of(ip)))
-    print('%-34s %8d B (expect %d)  sha256=%s'
+    print('%-34s %9d B (expect %d)  sha256=%s'
           % (op, len(out_bytes), exp_out, sha256_of(op)))
     print()
-    print('input  stats: min=%d max=%d mean=%.3f  uniq=%d'
-          % (t.min(), t.max(), float(t.mean()),
-             len(np.unique(t))))
-    print('output stats: min=%d max=%d mean=%.3f  uniq=%d'
-          % (raw.min(), raw.max(), float(raw.mean()),
-             len(np.unique(raw))))
+    print('input  stats: min=%s max=%s mean=%.4f'
+          % (t.min(), t.max(), float(t.mean())))
+    print('output stats: min=%s max=%s mean=%.4f'
+          % (raw.min(), raw.max(), float(raw.mean())))
 
-    # 饱和检查：och 说他的合成输入导致 CPU 输出几乎全饱和
-    # （mean=-127.68, max=-55）—— 用真实图片必须不出现这种情况，
-    # 否则说明预处理链路仍有问题。
-    sat_lo = int((raw == -128).sum())
-    sat_hi = int((raw == 127).sum())
-    print('output saturation: -128 x %d (%.1f%%), +127 x %d (%.1f%%)'
-          % (sat_lo, 100.0 * sat_lo / raw.size,
-             sat_hi, 100.0 * sat_hi / raw.size))
-    if sat_lo + sat_hi > 0.5 * raw.size:
-        print('WARN: >50%% saturated -> preprocessing may still be off '
-              '(och saw this with synthetic input)')
+    if raw.dtype == _np.int8:
+        sat_lo = int((raw == -128).sum())
+        sat_hi = int((raw == 127).sum())
+        print('output saturation: -128 x %d (%.1f%%), +127 x %d (%.1f%%)'
+              % (sat_lo, 100.0 * sat_lo / raw.size,
+                 sat_hi, 100.0 * sat_hi / raw.size))
+        if sat_lo + sat_hi > 0.5 * raw.size:
+            print('WARN: >50%% saturated -> preprocessing may still be off '
+                  '(och saw this with synthetic input)')
 
     assert len(in_bytes) == exp_in, 'input byte count mismatch'
     assert len(out_bytes) == exp_out, 'output byte count mismatch'

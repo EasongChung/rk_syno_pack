@@ -290,27 +290,36 @@ jobs:
 
       # ★ 导出评测图的原始张量字节（och 第18轮任务 2）
       #
-      # 目的：用户在设备上要交付 CPU 版，必须证明**设备侧对真实图片输出正确**。
-      # regress 跑在 CI(x86)，没有设备侧证据；och 的合成输入（ramp）根本
-      # 不能验正确性（实测 CPU 输出几乎全饱和 mean=-127.68）。
+      # 目的：证明**设备侧对真实图片输出正确**。regress 跑在 CI(x86)，
+      # 没有设备侧证据；och 的合成输入（ramp）不能验正确性
+      # （实测 CPU 输出几乎全饱和 mean=-127.68）。
       #
-      # 用 concept_int8_fixed.tflite 作参考 —— 它是唯一 cos 可用的产物（0.8879）。
-      # 注意：concept_int8_tf.tflite（MLIR）cos=0.0021 本身崩坏，
-      # 若设备上跑的是它，两边输出必然对不上，那是模型的问题不是对齐的问题。
+      # ⚠️ 两个基准，不要混（用户 2026-10-17 更正）：
+      #   CPU 交付版 = 原模型 model_float16.tflite -> FLOAT32 I/O
+      #   NPU 在研   = 量化版 -> INT8 I/O
+      # 量化版只服务 NPU；CPU 没必要用量化版。两份都导出，文件名带
+      # dtype 后缀（_f32 / _i8），避免两边都以为自己对齐了。
       #
-      # 预处理直接 import regress.preprocess_input（单一真相源），
-      # 避免"重新实现一遍"引入两边都以为自己对齐的偏差。
-      - name: Export per-image raw tensor bytes for device-side CPU check
+      # 预处理直接 import regress.preprocess_input（单一真相源）。
+      - name: Export per-image raw tensor bytes (CPU=orig f32, NPU=quant i8)
         run: |
           set -euo pipefail
-          M=out/concept_int8_fixed.tflite
-          if [ ! -s "$M" ]; then
-            echo "EXPORT: $M missing, skip"; exit 0
-          fi
           mkdir -p out/tensors
+          echo "########## CPU baseline: ORIGINAL model (float32 I/O) ##########"
           python tools/oes/export_tensor_bytes.py \
-            --model "$M" --image eval/oes-eval-0000.jpg \
-            --outdir out/tensors 2>&1 | tee out/tensors/export_log.txt
+            --model tools/oes/models/model_float16.tflite \
+            --image eval/oes-eval-0000.jpg --outdir out/tensors \
+            2>&1 | tee out/tensors/export_cpu_log.txt || true
+          echo "########## NPU baseline: quantized model (int8 I/O) ##########"
+          M=out/concept_int8_fixed.tflite
+          if [ -s "$M" ]; then
+            python tools/oes/export_tensor_bytes.py \
+              --model "$M" --image eval/oes-eval-0000.jpg \
+              --outdir out/tensors \
+              2>&1 | tee out/tensors/export_npu_log.txt || true
+          else
+            echo "EXPORT: $M missing, NPU baseline skipped"
+          fi
           echo "=== sha256 (for och to cross-check) ==="
           (cd out/tensors && sha256sum *.bin) | tee out/tensors/sha256.txt
           ls -la out/tensors/
