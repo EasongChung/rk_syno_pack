@@ -405,7 +405,13 @@ jobs:
             if python tools/oes/input_sensitivity.py --model "$f"; then
               echo "SENS $b: PASS"
             else
-              echo "SENS $b: FAIL (constant output / input-insensitive)"
+              # 不要在这里断言原因：失败可能是「常量输出」，也可能是
+              # 「模型根本加载不了」（如 legacy 产物 pad.cc:230 拒绝 prepare）。
+              # 二者都不可用，但**原因不同**，混为一谈会误导归因。
+              # 判据以脚本自己的输出为准（它会明确打印 CONSTANT OUTPUT
+              # 或抛加载异常）。
+              echo "SENS $b: FAIL (unusable - see verdict above; could be"
+              echo "  constant-output OR load failure, they are NOT the same)"
               fail=$((fail+1))
             fi
           done

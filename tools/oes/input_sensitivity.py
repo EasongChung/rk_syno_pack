@@ -95,13 +95,16 @@ def main():
     uniq = len(set(hashes.values()))
     print('  distinct hashes: %d / %d' % (uniq, len(hashes)))
     if uniq <= 1:
-        print('  => CONSTANT OUTPUT: model ignores its input. '
-              'This is a BLOCKING failure.')
-        print('     (root cause: tensors with scale == FLT_MAX/255 = '
-              '1.3344405750530544e+36 from unobserved calibration ranges)')
+        print('  => VERDICT: CONSTANT OUTPUT - model ignores its input.')
+        print('     BLOCKING: must not be delivered or deployed.')
+        print('     (root cause seen here: tensors whose scale is')
+        print('      FLT_MAX/255 = 1.3344405750530544e+36, produced by')
+        print('      TF MinMax when a tensor is NEVER OBSERVED during')
+        print('      calibration -> requant multiplier ~= 0 -> output')
+        print('      collapses to zero_point -> constant everywhere.)')
         return 5
     if uniq < len(hashes):
-        print('  => PARTIAL: some inputs collide (uniq=%d of %d)'
+        print('  => VERDICT: PARTIAL - some inputs collide (uniq=%d of %d)'
               % (uniq, len(hashes)))
         if args.verbose:
             seen = {}
@@ -111,7 +114,7 @@ def main():
                 if len(ks) > 1:
                     print('     collide 0x%016x: %s' % (v, ks))
         return 5
-    print('  => PASS: output responds to input.')
+    print('  => VERDICT: PASS - output responds to input.')
     return 0
 
 
