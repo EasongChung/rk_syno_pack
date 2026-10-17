@@ -102,6 +102,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 #include <dlfcn.h>
@@ -155,14 +156,33 @@ static void print_shape(const TfLiteTensor* t) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "用法: %s <model.tflite> [libteflon.so]\n", argv[0]);
+    std::fprintf(stderr,
+                 "用法: %s <model.tflite> [libteflon.so] [--no-delegate]\n"
+                 "  --no-delegate  不挂 delegate，用于归因：\n"
+                 "                 能跑通 → 崩溃在 delegate（PrepareDelegate/fill_tensor）\n"
+                 "                 仍崩溃 → 崩溃在 TFLite 解释器本身\n",
+                 argv[0]);
     return 64;
   }
+
+  /* 解析 --no-delegate */
+  bool no_delegate = false;
+  const char* lib_path = nullptr;
+  for (int i = 2; i < argc; i++) {
+    if (std::strcmp(argv[i], "--no-delegate") == 0) {
+      no_delegate = true;
+    } else {
+      lib_path = argv[i];
+    }
+  }
+  if (lib_path == nullptr) lib_path = "./libteflon.so";
 
   std::fprintf(stderr, "=== tf_load_check ===\n");
   std::fprintf(stderr, "模型        : %s\n", argv[1]);
   std::fprintf(stderr, "TEFLON_DEBUG: %s\n",
                getenv("TEFLON_DEBUG") ? getenv("TEFLON_DEBUG") : "(未设置)");
+  std::fprintf(stderr, "delegate    : %s\n",
+               no_delegate ? "禁用（--no-delegate）" : lib_path);
 
   /* 1. 加载模型 —— tflite::FlatBufferModel，不是 TfLiteModel */
   std::unique_ptr<tflite::FlatBufferModel> model =
@@ -171,7 +191,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "结果: FAIL - 模型加载/校验失败\n");
     return 1;
   }
-  std::fprintf(stderr, "模型        : flatbuffer 解析并校验成功\n");
+  std::fprintf(stderr, "[1/4] 模型        : flatbuffer 解析并校验成功\n");
+  std::fflush(stderr);
 
   /* 2. 加载 delegate
    *
@@ -182,34 +203,36 @@ int main(int argc, char** argv) {
    *    所以：自己 create → 挂到 builder → 保持到解释器销毁之后 → 自己 destroy。
    *
    *    库路径默认 ./libteflon.so，可用第 2 个命令行参数覆盖。 */
-  const char* lib_path = (argc > 2) ? argv[2] : "./libteflon.so";
-  g_handle = dlopen(lib_path, RTLD_NOW | RTLD_LOCAL);
-  if (g_handle == nullptr) {
-    std::fprintf(stderr, "结果: FAIL - dlopen %s 失败: %s\n",
-                 lib_path, dlerror());
-    return 3;
-  }
-  std::fprintf(stderr, "delegate 库  : %s\n", lib_path);
+  TfLiteDelegate* delegate = nullptr;
+  if (!no_delegate) {
+    g_handle = dlopen(lib_path, RTLD_NOW | RTLD_LOCAL);
+    if (g_handle == nullptr) {
+      std::fprintf(stderr, "结果: FAIL - dlopen %s 失败: %s\n",
+                   lib_path, dlerror());
+      return 3;
+    }
+    std::fprintf(stderr, "[2/4] delegate 库  : %s 已加载\n", lib_path);
 
-  DelegateCreateFn create_delegate =
-      reinterpret_cast<DelegateCreateFn>(dlsym(g_handle, "tflite_plugin_create_delegate"));
-  g_destroy =
-      reinterpret_cast<DelegateDestroyFn>(dlsym(g_handle, "tflite_plugin_destroy_delegate"));
-  if (create_delegate == nullptr || g_destroy == nullptr) {
-    std::fprintf(stderr, "结果: FAIL - dlsym 失败: %s\n", dlerror());
-    dlclose(g_handle);
-    return 3;
-  }
-  std::fprintf(stderr, "delegate 符号: create=%p destroy=%p\n",
-               (void*)create_delegate, (void*)g_destroy);
+    DelegateCreateFn create_delegate = reinterpret_cast<DelegateCreateFn>(
+        dlsym(g_handle, "tflite_plugin_create_delegate"));
+    g_destroy = reinterpret_cast<DelegateDestroyFn>(
+        dlsym(g_handle, "tflite_plugin_destroy_delegate"));
+    if (create_delegate == nullptr || g_destroy == nullptr) {
+      std::fprintf(stderr, "结果: FAIL - dlsym 失败: %s\n", dlerror());
+      dlclose(g_handle);
+      return 3;
+    }
 
-  TfLiteDelegate* delegate = create_delegate(nullptr);
-  if (delegate == nullptr) {
-    std::fprintf(stderr, "结果: FAIL - tflite_plugin_create_delegate 返回 NULL\n");
-    dlclose(g_handle);
-    return 3;
+    delegate = create_delegate(nullptr);
+    if (delegate == nullptr) {
+      std::fprintf(stderr, "结果: FAIL - tflite_plugin_create_delegate 返回 NULL\n");
+      dlclose(g_handle);
+      return 3;
+    }
+    std::fprintf(stderr, "[2/4] delegate 符号: create=%p destroy=%p，实例已创建\n",
+                 (void*)create_delegate, (void*)g_destroy);
+    std::fflush(stderr);
   }
-  std::fprintf(stderr, "delegate    : 已创建\n");
 
   /* 3. 构造解释器 —— 必须走 InterpreterBuilder
    *
@@ -218,26 +241,30 @@ int main(int argc, char** argv) {
    *    不必再单独构造 InterpreterOptions。 */
   tflite::ops::builtin::BuiltinOpResolver resolver;
   tflite::InterpreterBuilder builder(*model, resolver);
-  builder.AddDelegate(delegate);
+  if (delegate != nullptr) builder.AddDelegate(delegate);
   builder.SetNumThreads(1);
+  std::fprintf(stderr, "[3/4] 即将构造解释器 InterpreterBuilder::operator() ...\n");
+  std::fflush(stderr);
   std::unique_ptr<tflite::Interpreter> interpreter;
   if (builder(&interpreter) != kTfLiteOk || !interpreter) {
     std::fprintf(stderr, "结果: FAIL - 解释器创建失败\n");
-    g_destroy(delegate);
-    dlclose(g_handle);
+    if (delegate) { g_destroy(delegate); dlclose(g_handle); }
     return 3;
   }
-  std::fprintf(stderr, "解释器      : 创建成功\n");
+  std::fprintf(stderr, "[3/4] 解释器创建成功\n");
+  std::fflush(stderr);
 
   /* 4. AllocateTensors —— 触发 PrepareDelegate，分区在这一步完成 */
+  std::fprintf(stderr, "[4/4] 即将 AllocateTensors（会触发 PrepareDelegate）...\n");
+  std::fflush(stderr);
   if (interpreter->AllocateTensors() != kTfLiteOk) {
     std::fprintf(stderr, "结果: FAIL - AllocateTensors 失败\n");
     interpreter.reset();
-    g_destroy(delegate);
-    dlclose(g_handle);
+    if (delegate) { g_destroy(delegate); dlclose(g_handle); }
     return 2;
   }
-  std::fprintf(stderr, "AllocateTensors: OK（delegate 分区已完成）\n");
+  std::fprintf(stderr, "[4/4] AllocateTensors OK（delegate 分区已完成）\n");
+  std::fflush(stderr);
 
   /* 5. 分区数 —— 接管是否发生的直接证据
    *    AllocateTensors 之后：
@@ -326,7 +353,9 @@ int main(int argc, char** argv) {
 
   /* 顺序重要：delegate 的生命周期必须长于 interpreter */
   interpreter.reset();
-  g_destroy(delegate);
+  if (delegate) {
+    g_destroy(delegate);
     dlclose(g_handle);
+  }
   return 0;
 }
