@@ -29,6 +29,7 @@ int8 卷积 requant 乘数 = in_scale * w_scale / out_scale ≈ 0
 """
 import argparse
 import hashlib
+import os
 import sys
 
 

@@ -137,6 +137,7 @@ def preprocess_input(inp, image_bytes):
 
 
 def run_once(interp, image_bytes):
+    import numpy as np
     inp = interp.get_input_details()[0]
     out = interp.get_output_details()[0]
     t = preprocess_input(inp, image_bytes)
