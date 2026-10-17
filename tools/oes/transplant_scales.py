@@ -122,14 +122,25 @@ def transplant(degen, source, out_path, dry_run=False):
         return q
 
     def set_q(idx, scale, zp):
+        """写 scale + zero_point。
+
+        ⚠️ TF 对象树的字段名是**驼峰**（`zeroPoint`），不是 snake_case
+        （`zero_point`）。只写 snake 版不会报错，但 Pack 时被静默忽略
+        -> 内核以 "non-null scale but null zero_point" 拒绝
+        （CI run 39029095469 实测：t127/131/133/139/140/141 全中）。
+        这与早前 `operator_codes` -> `operatorCodes` 是同一类错。
+        故两种拼写都设，不依赖对任一版本字段名的记忆。
+        """
         t = tensors[idx]
-        old = getattr(t, 'quantization', None)
         nq = fb.QuantizationParametersT()
         nq.scale = np.array([float(scale)], np.float32)
-        nq.zero_point = np.array([int(zp)], np.int64)
-        nq.quantizedDimension = 0
+        for attr in ('zero_point', 'zeroPoint'):
+            if hasattr(nq, attr):
+                setattr(nq, attr, np.array([int(zp)], np.int64))
+        nq.quantized_dimension = 0
+        if hasattr(nq, 'quantizedDimension'):
+            nq.quantizedDimension = 0
         t.quantization = nq
-        return old
 
     # ---- 0. 先把 PADV2 改成 PAD（删掉退化的 constant_values 引用）----
     pad_idx = None
@@ -270,15 +281,23 @@ def _revalidate(buf, expect_quant=None):
 
     degen, empty, pc = [], [], []
     n_quant = 0
+    bad_zp = []
     for t in range(g.TensorsLength()):
         tt = g.Tensors(t)
         q = tt.Quantization()
         ns = 0 if q is None else q.ScaleLength()
+        nz = 0 if q is None else q.ZeroPointLength()
         if ns:
             n_quant += 1
             s = q.Scale(0)
             if abs(s) > 1e10 or s <= 0:
                 degen.append((t, s))
+            elif nz == 0:
+                # 内核的真实判据（TFLite 的报错原文）：
+                # "Quantization parameters has non-null scale but null
+                #  zero_point" -> 直接拒载。
+                # 只查 ScaleLength 会漏掉它（control_allq 的教训同源）。
+                bad_zp.append(t)
         if tt.ShapeLength() == 0:
             empty.append(t)
     for i in range(g.OperatorsLength()):
@@ -293,15 +312,20 @@ def _revalidate(buf, expect_quant=None):
         if ns != 1 or nz != 1:
             pc.append((i, ns, nz))
     print('REVALIDATE: tensors=%d  quantized=%d  a)degenerate=%d  '
-          'b)empty_shape=%d  c)non-per-tensor-weights=%d'
-          % (g.TensorsLength(), n_quant, len(degen), len(empty), len(pc)),
-          flush=True)
+          'b)empty_shape=%d  c)non-per-tensor-weights=%d  '
+          'd)scale-without-zero_point=%d'
+          % (g.TensorsLength(), n_quant, len(degen), len(empty), len(pc),
+             len(bad_zp)), flush=True)
     if degen:
         raise RuntimeError('gate a FAIL: degenerate %s' % degen[:8])
     if empty:
         raise RuntimeError('gate b FAIL: empty shape %s' % empty[:8])
     if pc:
         raise RuntimeError('gate c FAIL: per-channel weights %s' % pc[:8])
+    if bad_zp:
+        raise RuntimeError(
+            'kernel rejects "non-null scale but null zero_point": %s'
+            % bad_zp[:8])
     if expect_quant is not None and n_quant != expect_quant:
         raise RuntimeError(
             'quantized tensor count CHANGED: %d -> %d. The transplant must '
