@@ -320,8 +320,22 @@ jobs:
 
           # driver 链接 tensorflow-lite → 自动获得 flatbuffers/absl 等 include 路径
           add_executable(tf_load_check ${CMAKE_CURRENT_SOURCE_DIR}/tf_load_check.cpp)
-          # dlopen/dlsym 需要 libdl（TFLite 未必已传递依赖）
-          target_link_libraries(tf_load_check PRIVATE tensorflow-lite ${CMAKE_DL_LIBS})
+          # ⚠️ 不能用 ${CMAKE_DL_LIBS}：在 Debian sysroot 下它解析到
+          #    libdl.a / libpthread.a **静态库**，而 dlopen/pthread 需要的
+          #    __dlopen / _dl_pagesize / _dl_init_static_tls / _dl_find_object
+          #    都是**动态 libc 的内部符号**，静态库里没有 → 链接失败：
+          #      libdl.a(dlopen.o): undefined reference to `__dlopen'
+          #      libpthread.a(nptl-init.o): undefined reference to `_dl_pagesize'
+          #      warning: Using 'dlopen' in statically linked applications...
+          #
+          # 解法：-Wl,-Bdynamic 强制后续 -l 解析到 .so，并显式给出库名。
+          # 已本地核实 sysroot 里软链链完整：
+          #   libdl.so      -> /lib/aarch64-linux-gnu/libdl.so.2 -> libdl-2.31.so  ✓
+          #   libpthread.so -> ...-> libpthread-2.31.so                              ✓
+          #   libc.so       -> ...-> libc-2.31.so                                   ✓
+          #   crt1.o / libc.so 链接脚本均在 sysroot 内                               ✓
+          target_link_options(tf_load_check PRIVATE -Wl,-Bdynamic)
+          target_link_libraries(tf_load_check PRIVATE tensorflow-lite dl pthread c m)
           DRVEOF
 
           cat > "$RUNNER_TEMP/tc.cmake" <<EOF
