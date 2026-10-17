@@ -17,6 +17,21 @@
 #   GLIBC_VER      sysroot glibc 版本，默认 2.31
 #   DEB_SUITE      Debian 套件，默认 bullseye
 #   CROSS_PREFIX   交叉前缀，默认 aarch64-linux-gnu-
+#
+# ── 诊断/修复开关（**默认全关**，不设时产物与生产构建完全一致）────────────
+#   TEFLON_DEBUG_INFO=1   c_args/cpp_args 追加 -g3（带调试信息）
+#   TEFLON_NO_STRIP=1     跳过 strip，保留 DWARF（.debug_info/.debug_line）
+#                         → addr2line 可直出源码行；产物明显变大且**不可交付**
+#   TEFLON_FIX_V7=1       打 v7 calculate_bias_correction 的 depthwise 特判补丁
+#                         （真实的上游不一致：v8 有、v7 没有）
+#   TEFLON_DIAG=1         打越界取证补丁（打印尺寸/指针 + 预测到越界时钳界）
+#                         ⚠️ 与 TEFLON_FIX_V7 语义互斥，只能二选一
+#
+#   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+#   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
+#   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
+#      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
+# ------------------------------------------------------------------------
 
 set -eu
 
