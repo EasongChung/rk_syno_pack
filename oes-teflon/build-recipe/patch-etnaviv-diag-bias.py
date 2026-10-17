@@ -38,14 +38,25 @@ for (unsigned i = 0; i < operation->weight_width * operation->weight_height * op
 
 ## 本补丁做什么
 
-在 `calculate_bias_correction()` 函数体开头插入一段诊断：
+在 `calculate_bias_correction()` 的循环**之前**插入诊断：
 
 1. 打印 `weight_width / weight_height / input_channels / weight_tensor_size /
    weight_tensor(指针) / depthwise / pointwise`；
 2. 计算 `bound = w*h*c`，若 `bound > weight_tensor_size` 则打印
    `*** OOB PREDICTED ***`（这就是越界的直接证据）；
-3. **把循环界钳到 `weight_tensor_size`**（仅在预测到越界时），让进程不再当场崩掉，
-   从而把**后续**是否还有别的问题也一并暴露出来。
+3. 钳界：算出安全的迭代上界 `diag_limit`，并把**原循环的终止条件**替换为
+   `i < (diag_limit < bound ? diag_limit : bound)`。
+
+## ⚠️ 两个曾让本补丁编译失败的坑（已修，勿回退）
+
+1. **不能写 `operation->input_channels = ...`**
+   `calculate_bias_correction()` 的参数是
+   `const struct etna_operation *operation`，赋值给 const 对象必然编译失败：
+   `error: assignment of member 'input_channels' in read-only object`
+   （CI run 39037044419 实测）。故改为局部 `diag_limit`。
+2. **布尔上下文不要用整数三元**
+   `depthwise ? 1 : 0` 触发 `-Wint-in-bool-context` 警告；改为
+   `operation->depthwise ? "yes" : "no"`（打印用）避免该告警。
 
 ## ⚠️ 产物限制
 
@@ -66,34 +77,61 @@ import sys
 
 MARKER = "och patch: bias-correction diagnostics"
 
-# 插入内容：C89 兼容（声明集中在块首），只依赖已有的 stdio（Mesa 本就用 fprintf）。
-# ⚠️ 标记必须是 **C 注释**：写成裸文本会直接让编译失败（已由本地纯文本自检抓到）。
-DIAG = """   /* %s */
-   {
-      unsigned diag_bound = operation->weight_width * operation->weight_height *
-                            operation->input_channels;
+# 注入位置：原循环语句之前。锚点是**原样的 for 语句**（含其后的函数体）。
+# 用完整 for 行做锚点，能同时保证：
+#   - 只匹配一次（该 for 在文件里唯一）
+#   - 我们能把它整体替换成「诊断 + 钳界后的 for」
+LOOP = ("   for (unsigned i = 0; i < operation->weight_width * "
+        "operation->weight_height *\n"
+        "                            operation->input_channels; i++)\n"
+        "      correction += (weights[i] - operation->weight_zero_point) *\n"
+        "                    operation->input_zero_point;")
+
+# 备用锚点：Mesa 各版本该 for 的缩进/换行可能不同，故再提供一种更宽松的形态。
+LOOP_ALT = ("   for (unsigned i = 0; i < operation->weight_width * "
+            "operation->weight_height *\n"
+            "                            operation->input_channels; i++)\n"
+            "      correction += (weights[i] - operation->weight_zero_point) *\n"
+            "                     operation->input_zero_point;")
+
+# 插入的诊断块（C89 兼容，声明集中在块首）。
+# 关键：只用局部变量，绝不写 operation 的 const 成员。
+DIAG = """   /* {marker} */
+   {{
+      const unsigned diag_bound = operation->weight_width *
+                                  operation->weight_height *
+                                  operation->input_channels;
+      unsigned diag_limit = diag_bound;
       fprintf(stderr,
-              "[och-diag] calc_bias_correction: w=%%u h=%%u ic=%%u bound=%%u "
-              "wt_size=%%u wt=%%p depthwise=%%d pointwise=%%u\\n",
+              "[och-diag] calc_bias_correction: w=%u h=%u ic=%u bound=%u "
+              "wt_size=%u wt=%p depthwise=%s pointwise=%u\\n",
               operation->weight_width, operation->weight_height,
               operation->input_channels, diag_bound,
               operation->weight_tensor_size, (void *)operation->weight_tensor,
-              operation->depthwise ? 1 : 0, operation->pointwise ? 1u : 0u);
-      if (diag_bound > operation->weight_tensor_size) {
+              operation->depthwise ? "yes" : "no",
+              (unsigned)(operation->pointwise ? 1 : 0));
+      if (diag_bound > operation->weight_tensor_size) {{
          fprintf(stderr,
-                 "[och-diag] *** OOB PREDICTED: bound(%%u) > wt_size(%%u) ===\\n",
+                 "[och-diag] *** OOB PREDICTED: bound(%u) > wt_size(%u) ***\\n",
                  diag_bound, operation->weight_tensor_size);
          fprintf(stderr,
-                 "[och-diag] *** 越界读已钳住，进程不会崩；这是诊断构建，产物不可交付 ===\\n");
-         operation->input_channels = operation->weight_tensor_size /
-                                     (operation->weight_width * operation->weight_height ?
-                                      operation->weight_width * operation->weight_height : 1);
-      }
-   }
-"""
+                 "[och-diag] *** OOB loop clamped; DIAGNOSTIC build, "
+                 "NOT deliverable ***\\n");
+         diag_limit = operation->weight_tensor_size;
+      }}
+   }}
 
-# 插入点：函数体第一行（`{` 之后的空行 + 第一条语句 `int32_t correction = 0;`）。
-ANCHOR = "   int32_t correction = 0;\n"
+   /* {marker}: loop bound uses diag_limit (clamped when OOB predicted) */
+   for (unsigned i = 0;
+        i < (diag_limit < operation->weight_width *
+                          operation->weight_height *
+                          operation->input_channels
+             ? diag_limit
+             : operation->weight_width * operation->weight_height *
+               operation->input_channels);
+        i++)
+      correction += (weights[i] - operation->weight_zero_point) *
+                    operation->input_zero_point;"""
 
 
 def main() -> int:
@@ -112,26 +150,49 @@ def main() -> int:
             f"ERROR: {args.path} 已包含本补丁（标记 \"{MARKER}\"），拒绝重复应用。\n")
         return 1
 
-    n = src.count(ANCHOR)
-    if n != 1:
-        sys.stderr.write(
-            f"ERROR: 在 {args.path} 中匹配到 {n} 处 \"{ANCHOR.strip()}\"，期望恰好 1 处。\n"
-            "       Mesa 可能已改动 calculate_bias_correction —— 请人工核对后更新本补丁，\n"
-            "       不要跳过校验（会静默产出未打补丁的 .so，诊断结论无效）。\n")
-        return 1
-
     if args.expect_symbol not in src:
         sys.stderr.write(
             f"ERROR: {args.path} 里找不到 {args.expect_symbol}，文件结构与预期不符。\n")
         return 1
 
-    # 注意：DIAG 模板用 %s 占位 + %% 转义，因此这里必须传**字符串**而不是 dict
-    # （传 dict 时 %s 不会替换，会把 "{'marker': ...}" 字面写进 C 注释 —— 已由自检抓到）。
-    src = src.replace(ANCHOR, ANCHOR + (DIAG % MARKER), 1)
+    # 依次尝试两个锚点，任一命中恰好 1 次即用。
+    hit, used = 0, None
+    for cand in (LOOP, LOOP_ALT):
+        n = src.count(cand)
+        if n == 1:
+            hit, used = 1, cand
+            break
+        if n > 1:
+            sys.stderr.write(
+                f"ERROR: 锚点在 {args.path} 中出现 {n} 次（期望 1 次）。\n"
+                "       Mesa 可能已改动 calculate_bias_correction —— 请人工核对后\n"
+                "       更新本补丁，不要跳过校验（会静默产出未打补丁的 .so）。\n")
+            return 1
 
-    # 自检：诊断块与原函数都还在。
-    if MARKER not in src or "int32_t correction = 0;" not in src:
-        sys.stderr.write("ERROR: 打完补丁后自检失败\n")
+    if not hit:
+        sys.stderr.write(
+            f"ERROR: 在 {args.path} 中匹配到 0 处目标 for 循环（已尝试 2 种形态），"
+            "期望恰好 1 处。\n"
+            "       Mesa 可能已改动 calculate_bias_correction —— 请人工核对后更新本补丁，\n"
+            "       不要跳过校验（会静默产出未打补丁的 .so，诊断结论无效）。\n")
+        return 1
+
+    src = src.replace(used, DIAG.format(marker=MARKER), 1)
+
+    # 自检：诊断块与函数都还在，且**没有**对 const 成员的赋值。
+    if MARKER not in src:
+        sys.stderr.write("ERROR: 打完补丁后自检失败（标记缺失）\n")
+        return 1
+    if args.expect_symbol not in src:
+        sys.stderr.write("ERROR: 打完补丁后自检失败（函数名丢失）\n")
+        return 1
+    if "operation->input_channels =" in src:
+        sys.stderr.write(
+            "ERROR: 补丁后仍存在对 operation->input_channels 的赋值 ——\n"
+            "       该参数是 const，会编译失败。请检查补丁模板。\n")
+        return 1
+    if "diag_limit" not in src:
+        sys.stderr.write("ERROR: 补丁后自检失败（无 diag_limit）\n")
         return 1
 
     with open(args.path, "w", encoding="utf-8") as f:
@@ -139,10 +200,9 @@ def main() -> int:
 
     print(f"  [och-diag] 已注入诊断: {args.path}")
     print("  [och-diag] 将在真机打印尺寸/指针，并在预测到越界时钳住循环")
-    # ⚠️ 提示语不带 emoji：Windows 的 GBK 控制台编码不了 U+26A0，
+    # 提示语不带 emoji：Windows 的 GBK 控制台编码不了 U+26A0，
     # 会在**注入成功之后**抛 UnicodeEncodeError 并以 rc=1 退出，
-    # 把成功误判成失败（本地自检实测）。CI 是 UTF-8 不受影响，
-    # 但工具行为不应依赖终端编码。
+    # 把成功误判成失败（本地自检实测）。CI 是 UTF-8 不受影响。
     print("  [och-diag] WARNING: 这是诊断构建，产物不可交付")
     return 0
 
