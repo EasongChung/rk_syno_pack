@@ -37,6 +37,13 @@ on:
       - 'oes-teflon/verify/teflon_dlopen.c'
     branches: [ main ]
 
+env:
+  # ⚠️ 必须是 **workflow 级**，不能只挂在 Build 步骤上。
+  #    之前只设在 Build 步骤，导致 Collect artifact 步骤里的
+  #    ${MESA_TAG:-mesa-24.3.0} 落进 fallback，给一份 mesa-26.2.5 的产物
+  #    写出了 mesa_tag=mesa-24.3.0 的假标签。
+  MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-24.3.0' }}
+
 jobs:
   build:
     name: build libteflon.so (aarch64-glibc)
@@ -97,8 +104,6 @@ jobs:
           python3 -c "import mako, yaml, pycparser; print('python deps OK')"
 
       - name: Build libteflon.so
-        env:
-          MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-24.3.0' }}
         run: |
           set -eux
           chmod +x oes-teflon/build-recipe/build-teflon.sh
@@ -175,7 +180,20 @@ jobs:
             || { echo "ERROR: 缺少 libdrm.so.2，产物在 DSM 上无法 dlopen"; exit 1; }
           cp "$RUNNER_TEMP/teflon_dlopen" artifact/
           {
-            echo "mesa_tag=${MESA_TAG:-mesa-24.3.0}"
+            # 从二进制自身的版本串反查真实 tag（Mesa 会把它编进去），
+            # 再与 env 声明断言一致 —— 二者不符直接失败，
+            # 杜绝「产物是 A、标签写 B」这类假绿。
+            BIN_TAG="$(strings -a "$OUT/libteflon.so" \
+              | grep -oE '2[0-9]\.[0-9]+\.[0-9]+ \(git-[0-9a-f]+\)' \
+              | head -1 | sed 's/ (git-/mesa-/; s/)$/-git/' || true)"
+            if [ -n "$BIN_TAG" ]; then
+              echo "  二进制内嵌版本: $BIN_TAG"
+            else
+              BIN_TAG="unknown-in-binary"
+              echo "  WARNING: 二进制内未找到版本串，无法交叉核对"
+            fi
+            echo "mesa_tag_env=${MESA_TAG:-mesa-24.3.0}"
+            echo "mesa_tag_binary=${BIN_TAG}"
             echo "target=aarch64 / glibc 2.31 sysroot (Debian bullseye)"
             echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
             echo "gcc=$(aarch64-linux-gnu-gcc --version | head -1)"
