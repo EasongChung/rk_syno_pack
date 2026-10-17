@@ -329,78 +329,78 @@ jobs:
           set -eu
           SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
           MAP="$RUNNER_TEMP/addr2line-map.txt"
-
-          # .text 的 [起始, 结束) —— 用来判断地址是否落在代码段内。
-          #
-          # 历史：第一版这里**内联了一段纯 Python ELF 头解析**，结果 format 串
-          # 写成 '<IIQQII'（少一个 Q，第 5 个码是 I(4B) 而非 Q(8B)），
-          # 读出 sh_size=0 → strtab 为空 → index() 抛 ValueError → 步骤失败。
-          # 且它是本地无 gcc/无 ELF 工具时**没能先跑一遍**的代码 —— 拿 CI 当调试器，
-          # 白烧一轮。教训：能用现成工具就别手写二进制解析。
-          #
-          # 现在只依赖 readelf -S 的字段顺序（第 4 列=Address，第 6 列=Size），
-          # 十六进制交给 bash 的 $((16#..))，**不需要 gawk 的 strtonum**
-          #（ubuntu 默认 mawk 没有 strtonum，这也是第一版的另一个坑）。
-          TEXT_HEX=$(readelf -S "$SO" | awk '$2==".text"{print $4, $6}')
-          [ -n "$TEXT_HEX" ] || { echo "ERROR: readelf -S 里找不到 .text"; exit 1; }
-          TEXT_START=$((16#$(echo "$TEXT_HEX" | cut -d' ' -f1)))
-          TEXT_SIZE=$((16#$(echo "$TEXT_HEX" | cut -d' ' -f2)))
-          TEXT_END=$((TEXT_START + TEXT_SIZE))
-          printf '### .text range: 0x%x .. 0x%x (size=0x%x)\n' \
-                 "$TEXT_START" "$TEXT_END" "$TEXT_SIZE"
-          [ "$TEXT_END" -gt "$TEXT_START" ] \
-            || { echo "ERROR: .text 范围不合理"; exit 1; }
-
+          
+          # .text 范围只作**参考信息**，不参与判定（见文件头注释里的两次翻车记录）。
+          # 改成「按名字找、再取其后第 2/第 4 个字段」，不依赖列号；
+          # 解析不到就留 unknown，绝不让参考信息变成失败原因。
+          TEXT_HEX=$(readelf -SW "$SO" 2>/dev/null | awk '
+            { for (i = 1; i <= NF; i++) if ($i == ".text") { print $(i+2), $(i+4); exit } }')
+          TEXT_RANGE="unknown"
+          if [ -n "$TEXT_HEX" ]; then
+            _a=$(echo "$TEXT_HEX" | cut -d' ' -f1)
+            _b=$(echo "$TEXT_HEX" | cut -d' ' -f2)
+            case "$_a$_b" in
+              ''|*[!0-9a-fA-F]*) ;;
+              *)  TEXT_RANGE=$(printf '0x%x..0x%x' "$((16#$_a))" "$((16#$_a + 16#$_b))") ;;
+            esac
+          fi
+          echo "### .text range: $TEXT_RANGE"
+          
+          # ★ 真正的门：**addr2line 自己必须解析得出这个地址**。
+          #   地址越界/无效时它返回 `??` 与 `??:0` —— 那就是「查了个错地址」的信号，
+          #   必须失败；绝不能让步骤 success 还带着一行 ?? 交差（这正是第 2 轮的假绿）。
+          ADDRS_OK=1
           {
             echo "### addr2line attribution"
             echo "### so=$SO"
             echo "### so_size=$(stat -c%s "$SO")"
             echo "### so_sha256=$(sha256sum "$SO" | cut -d' ' -f1)"
-            echo "### text_range=0x$TEXT_START..0x$TEXT_END"
+            echo "### text_range=$TEXT_RANGE"
             echo
-
+          
             for tok in $(echo "$ADDRS" | tr ',' ' '); do
-              # ★★ 格式契约：**必须带 0x 前缀**，否则立即失败。
-              #
-              # 为什么不「聪明地」兼容裸数字：本地反例测试证明那等于**门失效** ——
-              # PowerShell 把 `0x256a4c` 转成十进制 2452044 传进来，若把它
-              # `printf '%x'` 转回十六进制，得到的又是 0x256a4c，**仍在合法区间**，
-              # 于是变形后的输入被「洗白」通过。只能靠格式契约硬拒。
+              # ★★ 格式契约：**必须带 0x 前缀**。本地反例测试证明「兼容裸数字」等于门失效：
+              #   PowerShell 会把命令行里的 0x256a4c 转成十进制 2452044；若再 printf '%x'
+              #   转回去又是 0x256a4c，仍落在合法区间 —— 变形输入被「洗白」通过。
               case "$tok" in
                 0x*|0X*) HEXV="${tok#0x}" ;;
-                *)  echo "ERROR: 地址「$tok」缺少 0x 前缀。"
-                    echo "       若你传的是正确值却被拒，多半是调用方把 0x.. 转成了十进制："
-                    echo "       PowerShell 会把命令行里的 0x256a4c 当数字字面量转成 2452044。"
-                    echo "       请给 fault_addrs **整体加引号**："
-                    echo "         -f 'fault_addrs=0x256a60,0x256a4c'"
-                    echo "       收到的原始输入: $ADDRS"
-                    exit 1 ;;
+                *)  echo "ERROR: address lacks 0x prefix: $tok"
+                    echo "       raw input: $ADDRS"
+                    echo "       if you passed a correct address and got rejected, the caller likely"
+                    echo "       turned 0x.. into decimal (PowerShell does this on the command line)."
+                    echo "       Quote the whole value: -f 'fault_addrs=0x256a60,0x256a4c'"
+                    ADDRS_OK=0; break ;;
               esac
               case "$HEXV" in
                 *[!0-9a-fA-F]*|'')
-                  echo "ERROR: 地址「$tok」不是合法的十六进制数"; exit 1 ;;
+                  echo "ERROR: not a valid hex address: $tok"; ADDRS_OK=0; break ;;
               esac
-              # ★ 硬门：地址必须落在 .text 内。越界即失败，绝不查一个错地址
-              #   还返回 ??:0 让人以为「这段没有行号信息」。
-              if [ "$((16#$HEXV))" -lt "$TEXT_START" ] \
-                 || [ "$((16#$HEXV))" -ge "$TEXT_END" ]; then
-                echo "ERROR: 地址 0x$HEXV 不在 .text [0x$TEXT_START,0x$TEXT_END) 内"
-                echo "       收到的原始输入: $ADDRS"
-                exit 1
-              fi
               A="$HEXV"
               echo "=== 0x$A (decimal $((16#$A))) ==="
               echo "-- addr2line -f -i -C:"
-              aarch64-linux-gnu-addr2line -f -i -C -e "$SO" "0x$A" || echo "  (addr2line failed)"
+              # 抓输出再判定，而不是直接打 —— 只有拿到结果才能判断「解析不出来」
+              AL_OUT=$(aarch64-linux-gnu-addr2line -f -i -C -e "$SO" "0x$A" 2>&1) || true
+              printf '%s\n' "$AL_OUT" | sed 's/^/   /'
+              # addr2line 输出两行（函数名、文件:行）。两行都是 ?? 即视为无效地址。
+              if printf '%s\n' "$AL_OUT" | grep -qx '??' \
+                 && printf '%s\n' "$AL_OUT" | grep -q '^??:'; then
+                echo "ERROR: addr2line could not resolve 0x$A (returned ??) -- address is most"
+                echo "       likely outside .text (caller turned 0x.. into decimal, or this"
+                echo "       build's patch changed the code layout)."
+                echo "       raw input: $ADDRS"
+                ADDRS_OK=0; break
+              fi
               echo "-- nearest symbol (.symtab):"
-              python3 - "$SO" "$A" <<'PY'
+              # ⚠️ 这一段是**装饰性**的（DWARF 已经给出函数名）。若 nm 缺失或失败，
+              #   不该让 set -e 把整个步骤连同真正的门一起杀掉 —— 本机 harness 就撞到过。
+              python3 - "$SO" "$A" <<'PY' || echo "   (nearest-symbol lookup failed; non-fatal)"
           import subprocess, sys
           so = sys.argv[1]
           a = int(sys.argv[2], 16)
           best = None
           out = subprocess.run(['aarch64-linux-gnu-nm', '-n', '--defined-only', so],
-                             capture_output=True, text=True,
-                             encoding='utf-8', errors='replace').stdout
+                               capture_output=True, text=True,
+                               encoding='utf-8', errors='replace').stdout
           for ln in out.splitlines():
               p = ln.split()
               if len(p) >= 3 and p[1].upper() in ('T', 'W', 'I'):
@@ -412,9 +412,15 @@ jobs:
           PY
               echo
             done
-          } | tee "$MAP"
+          } > "$MAP"
+          
+          cat "$MAP"
           echo "WROTE $MAP ($(wc -l < "$MAP") lines)"
-
+          if [ "$ADDRS_OK" != 1 ]; then
+            echo "ADDRES GATE FAILED"
+            exit 1
+          fi
+          echo "ADDRES GATE PASSED"
       # 反汇编 + **源码文本**窗口（-S 需要 Mesa 源码树在同一 comp_dir，故先 cd 过去）。
       # ⚠️ continue-on-error: true —— 上一轮这一步因为地址格式崩掉，**连带把
       #    artifact 收集也带没了**（关键证据 addr2line 已到手却传不下去）。
