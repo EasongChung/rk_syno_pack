@@ -20,6 +20,11 @@
 
 set -eu
 
+# 脚本自身所在目录。**必须在任何 cd 之前捕获** —— 脚本后面会 `cd "$BUILD_DIR"`，
+# 而传入的 $0 通常是相对路径（如 ./oes-teflon/build-recipe/build-teflon.sh），
+# cd 之后再解析就找不到自己了（CI 上实测报 `can't cd to ./oes-teflon/build-recipe`）。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 BUILD_DIR="${1:-mesa-build}"
 MESA_TAG="${MESA_TAG:-mesa-24.3.0}"
 GLIBC_VER="${GLIBC_VER:-2.31}"
@@ -260,8 +265,7 @@ echo "    vendored TFLite 头就位 (来自 TF 2.13.0)"
 # 补丁脚本自带校验：匹配数不为 1 就**中止构建**，避免静默产出
 # 一个没打上补丁的 .so（那会表现为"换版本也没用"，很难查）。
 echo "==> [3b/6] 打 etnaviv NPU 识别补丁"
-# 用 $0 推导脚本所在目录，不依赖调用方的 cwd
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# SCRIPT_DIR 在脚本顶部（任何 cd 之前）已捕获，此处直接用
 PATCHER="$SCRIPT_DIR/patch-etnaviv-npu-detect.py"
 if [ ! -f "$PATCHER" ]; then
 	echo "ERROR: 缺 $PATCHER"
