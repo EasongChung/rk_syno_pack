@@ -229,7 +229,9 @@ static void run_invoke(tflite::Interpreter* interpreter, int invoke_n) {
 
   /* 确定性填充：两组必须完全一致，否则对比无意义 */
   {
-    std::uint8_t* p = static_cast<std::uint8_t*>(in->data.raw);
+    /* data.raw 是 char*，到 uint8_t* 必须 reinterpret_cast
+ * （static_cast 在 char*→unsigned char* 上非法，CI 实测报错）*/
+    std::uint8_t* p = reinterpret_cast<std::uint8_t*>(in->data.raw);
     for (std::size_t k = 0; k < in->bytes; k++)
       p[k] = static_cast<std::uint8_t>((k * 31u + 7u) & 0xFFu);
   }
@@ -270,7 +272,7 @@ static void run_invoke(tflite::Interpreter* interpreter, int invoke_n) {
   std::size_t out_bytes = 0;
   if (out != nullptr && out->data.raw != nullptr && out->bytes > 0) {
     out_bytes = out->bytes;
-    const std::int8_t* q = static_cast<const std::int8_t*>(out->data.raw);
+    const std::int8_t* q = reinterpret_cast<const std::int8_t*>(out->data.raw);
     for (std::size_t k = 0; k < out_bytes; k++) {
       h ^= static_cast<std::uint8_t>(q[k]);
       h *= 1099511628211ULL;
