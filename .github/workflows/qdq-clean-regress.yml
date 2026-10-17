@@ -296,6 +296,42 @@ jobs:
           fi
           ls -la "$DST" 2>/dev/null || echo "(no output model)"
 
+      # ★ 移植 legacy 的正确尺度到 per-tensor 模型的退化张量（och 第21轮）
+      #
+      # 三条依据全部经本地数据验证（不是猜）：
+      #  1. t139/t140/t141 名字+类型+形状与 legacy 完全匹配，源值 0.4730178415775299
+      #  2. bias_scale == in_scale * w_scale（legacy 57/57、per-tensor 57/57 成立）
+      #     -> t127/t131 是被退化输入"连坐"，可用公式重算
+      #  3. t133 空形状 + 被 PADV2->PAD 孤立 -> 给合法形状与中性尺度
+      #
+      # 已证伪：删掉 t133 不能治愈整条链（实测 6->6 不变，run 39009507872）。
+      - name: Transplant correct scales (legacy) into per-tensor degenerate tensors
+        run: |
+          set -euo pipefail
+          DEGEN=out/concept_int8_pertensor.tflite
+          SRC=out/concept_int8_fixed.tflite
+          OUT=out/concept_int8_art13.tflite
+          if [ ! -s "$DEGEN" ] || [ ! -s "$SRC" ]; then
+            echo "TRANSPLANT: missing input, skip"; exit 0
+          fi
+          echo "########## dry-run (pack + revalidate gates a,b,c) ##########"
+          if python tools/oes/transplant_scales.py \
+               --degen "$DEGEN" --source "$SRC" --out "$OUT" --dry-run; then
+            echo "TRANSPLANT: dry-run PASS"
+          else
+            echo "TRANSPLANT: dry-run FAILED - traceback above is authoritative"
+            exit 1
+          fi
+          python tools/oes/transplant_scales.py \
+            --degen "$DEGEN" --source "$SRC" --out "$OUT"
+          test -s "$OUT" || { echo "TRANSPLANT: no output"; exit 1; }
+          echo "=== gate c: conv weights still per-tensor? ==="
+          python tools/oes/check_pc.py --model "$OUT" --expect per-tensor || true
+          echo "=== gate a/b: degenerate + empty shape ==="
+          python tools/oes/tflite_fix_padv2.py --in "$OUT" \
+            --out /tmp/x.tflite --audit-only || true
+          sha256sum "$OUT" || true
+
       # ★ 关键变体：legacy 量化器 + per-tensor 权重 + PADV2 修复
       #
       # 为什么必须补这一个：上面那个 per-tensor 变体做在 **MLIR** 路径上，

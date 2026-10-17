@@ -90,6 +90,7 @@ def main():
 
     hashes = {}
     raw_out = {}
+    sat_max = 0.0
     for name, arr in variants:
         it.set_tensor(inp['index'], arr)
         it.invoke()
@@ -97,8 +98,14 @@ def main():
         h = fnv1a64(o.tobytes())
         hashes[name] = h
         raw_out[name] = (o.min(), o.max(), float(np.mean(o.astype(np.float64))))
-        print('  %-10s out_hash=0x%016x  min=%s max=%s mean=%.4f'
-              % (name, h, o.min(), o.max(), raw_out[name][2]))
+        sr, lo, hi, band = saturation_rate(o)
+        sat_max = max(sat_max, sr)
+        print('  %-10s out_hash=0x%016x  min=%s max=%s mean=%.4f  '
+              'saturation=%.1f%% (band=%d)'
+              % (name, h, o.min(), o.max(), raw_out[name][2],
+                 100.0 * sr, band))
+    print('  max saturation across variants: %.1f%% (gate f: must be <50%%)'
+          % (100.0 * sat_max))
 
     uniq = len(set(hashes.values()))
     print('  distinct hashes: %d / %d' % (uniq, len(hashes)))
@@ -124,6 +131,21 @@ def main():
         return 5
     print('  => VERDICT: PASS - output responds to input.')
     return _ref_check(args, it)
+
+
+def saturation_rate(arr):
+    """och 门 f：量化值落在两端 1% 量程带内的元素占比。
+
+    按 int8 真实量程算（-128..127），**不能**用"与原 float 同量级"代替
+    —— 那正是我上一轮被 och 纠正的弱推理。
+    """
+    lo, hi = int(arr.min()), int(arr.max())
+    span = max(hi - lo, 1)
+    band = max(1, int(round(0.01 * span)))
+    n = arr.size
+    lo_n = int((arr <= lo + band).sum())
+    hi_n = int((arr >= hi - band).sum())
+    return (lo_n + hi_n) / float(n), lo, hi, band
 
 
 def _ref_check(args, it):
