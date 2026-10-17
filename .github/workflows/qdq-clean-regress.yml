@@ -191,6 +191,46 @@ jobs:
           test -s "$DST" || { echo "FIX: $DST missing/empty"; exit 1; }
           ls -la out/*.tflite || true
 
+      # 对照实验：给全部未量化张量补量化参数，验证 och 的段错误根因。
+      #
+      # och 真机（EXIT=139）根因已源码确认：tfl_device.c L238-239 对
+      # **全部**张量无条件调 fill_tensor，而 fill_tensor 只跳过
+      # kTfLiteNoType，随后无条件解引用 quant->scale->data[0]。
+      # 模型有 20 个未量化 INT32 常量 -> quant==NULL -> 段错误。
+      #
+      # 本实验若成功（补全后 TFLite 能加载且 regress 不崩），
+      # 即反证根因成立。注意：这是**为迁就旧版 delegate 而改变模型形态**，
+      # 不是修复；它不改变 24.3.0 的接管率上限（仍 56/201 = 27.86%）。
+      # 正解仍是换 main 版 delegate（91.54%）。
+      #
+      # 两个变体用于隔离变量：
+      #   _allq        = 补量化参数 + PADV2->PAD
+      #   _allq_nopadv = 只补量化参数（PADV2 保持不变）
+      # 若只有 _allq 能加载，则 PADV2 的类型冲突仍是独立阻塞项。
+      - name: Control - quantize ALL tensors (root-cause control)
+        run: |
+          set -euo pipefail
+          for VARIANT in allq allq_nopadv; do
+            SRC=out/concept_int8_fixed.tflite
+            DST=out/control_${VARIANT}.tflite
+            test -s "$SRC" || { echo "CONTROL: no $SRC, skip"; exit 0; }
+            EXTRA="--no-fix-padv2"
+            [ "$VARIANT" = "allq" ] && EXTRA=""
+            echo "=== control variant: $VARIANT ($EXTRA) ==="
+            if python tools/oes/tflite_quant_all.py \
+                 --in "$SRC" --out "$DST" $EXTRA --dry-run; then
+              echo "CONTROL $VARIANT: dry-run OK"
+            else
+              echo "CONTROL $VARIANT: dry-run FAILED (expected if"
+              echo "  VerifyModel rejects INT32 tensors with quantization"
+              echo "  params - that itself is a finding). Not fatal here."
+            fi
+            python tools/oes/tflite_quant_all.py \
+              --in "$SRC" --out "$DST" $EXTRA \
+              || echo "CONTROL $VARIANT: rewrite failed (rc=$?)"
+          done
+          ls -la out/*.tflite || true
+
       # Route C/A（onnx2tf output_integer_quantized_tflite）已证死并删除：
       #   CI run 38900946439 实测其产物目录只有 float32 / float16 /
       #   dynamic_range_quant 三个文件，从不产出 _full_integer_quant.tflite。
