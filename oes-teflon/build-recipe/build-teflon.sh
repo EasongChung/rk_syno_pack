@@ -27,6 +27,13 @@
 #   TEFLON_DIAG=1         打越界取证补丁（打印尺寸/指针 + 预测到越界时钳界）
 #                         ⚠️ 与 TEFLON_FIX_V7 语义互斥，只能二选一
 #
+#   TEFLON_WCDIAG=1      在 write_core_interleaved() 写出权重前打印循环变量
+#                         （core/kernel/z/superblock/superblocks/kernels_* /
+#                          cores_used/out_channel/output_channels/w/h/wt_size），
+#                         out_channel >= output_channels 时追加 "*** OOB ***"。
+#                         锚点由 tools/gen-wcdiag-patch.py 从真实源码逐字生成。
+#                         ⚠️ 不改行为：崩溃行仍会照旧触发，但那一行已进日志
+#
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
@@ -358,6 +365,35 @@ if [ "${TEFLON_DIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3d/6] 诊断补丁：默认关闭（设 TEFLON_DIAG=1 启用）"
+fi
+
+# ── 3f. 【诊断】write_core_interleaved 的 out_channel 取证 ──────────────
+# addr2line（CI 390…，unstripped + -g3）已把崩溃定位到
+#   write_core_interleaved()  etnaviv_ml_nn_v7.c:345
+#   wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);
+# 而 weights_map 是把权重缓冲区强转成 [out_channel][z][x][y] 四维视图。
+# **待证伪/证实**：`out_channel` 是否会超过 `output_channels`。
+# 本补丁只打印数字、不改行为 —— 打印紧挨崩溃行，且 tf_load_check 日志无缓冲。
+#
+# ⚠️ 默认关闭。诊断产物不可交付。
+if [ "${TEFLON_WCDIAG:-0}" = "1" ]; then
+	echo "==> [3f/6] 打【诊断】write_core_interleaved out_channel 取证"
+	PATCHER5="$SCRIPT_DIR/patch-etnaviv-write-core-diag.py"
+	ML7C="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER5" ]; then
+		echo "ERROR: 设了 TEFLON_WCDIAG=1 却缺 $PATCHER5"
+		exit 1
+	fi
+	if [ ! -f "$ML7C" ]; then
+		echo "ERROR: 找不到 $ML7C"
+		exit 1
+	fi
+	python3 "$PATCHER5" "$ML7C" || {
+		echo "ERROR: out_channel 取证补丁应用失败 —— 请先跑 tools/gen-wcdiag-patch.py 重新生成锚点"
+		exit 1
+	}
+else
+	echo "==> [3f/6] out_channel 取证补丁：默认关闭（设 TEFLON_WCDIAG=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #

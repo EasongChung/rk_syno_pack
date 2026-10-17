@@ -1,4 +1,4 @@
-name: build-teflon-diag
+﻿name: build-teflon-diag
 
 # 【修复+调试专用】交叉编译带 v7 depthwise 修复、**保留 DWARF** 的 libteflon.so
 #
@@ -47,6 +47,7 @@ env:
   # 必须在 workflow 级：Collect artifact 步骤也要读它，否则会写出假标签。
   MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
   TEFLON_FIX_V7: '1'
+  TEFLON_WCDIAG: '1'
   TEFLON_DIAG: '0'
   TEFLON_DEBUG_INFO: '1'
   TEFLON_NO_STRIP: '1'
@@ -128,7 +129,7 @@ jobs:
           try:
               p = os.path.join(tmp, 'v7.c')
               open(p, 'w').write(FUNC)
-              r = subprocess.run([sys.executable, P, p], capture_output=True, text=True)
+              r = subprocess.run([sys.executable, P, p], capture_output=True, text=True, encoding='utf-8', errors='replace')
               assert r.returncode == 0, 'inject failed: %s' % (r.stdout + r.stderr)
               b = open(p).read()
               for needle in ('och patch: v7 calculate_bias_correction depthwise fix',
@@ -142,18 +143,83 @@ jobs:
                   s = ln.strip()
                   if s.startswith('operation->') and '=' in s and '==' not in s:
                       raise AssertionError('assigns const member: %s' % s)
-              r2 = subprocess.run([sys.executable, P, p], capture_output=True, text=True)
+              r2 = subprocess.run([sys.executable, P, p], capture_output=True, text=True, encoding='utf-8', errors='replace')
               assert r2.returncode == 1, 're-apply not rejected'
               pb = os.path.join(tmp, 'bad.c')
               open(pb, 'w').write(BAD)
-              r3 = subprocess.run([sys.executable, P, pb], capture_output=True, text=True)
+              r3 = subprocess.run([sys.executable, P, pb], capture_output=True, text=True, encoding='utf-8', errors='replace')
               assert r3.returncode == 1, 'anchor-miss not rejected'
               print('PREFLIGHT v7-biasfix OK (inject / no-const-write / reapply / anchor-miss)')
           finally:
               shutil.rmtree(tmp, ignore_errors=True)
           PY
 
-      - name: Build libteflon.so (FIX_V7 + NO_STRIP)
+      - name: Preflight - write_core_interleaved diag patcher self-test
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import importlib.util, os, re, shutil, subprocess, sys, tempfile
+
+          P = 'oes-teflon/build-recipe/patch-etnaviv-write-core-diag.py'
+          spec = importlib.util.spec_from_file_location('wcdiag', P)
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)          # 只定义 main()，不会自动执行
+          OLD, NEW, MARKER = m.OLD, m.NEW, m.MARKER
+
+          # 锚点必须是「两行」：for 头 + wb_stream_write
+          assert OLD.count('for (unsigned y = 0; y < stride; y++) {') == 1, OLD
+          assert OLD.count('wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);') == 1, OLD
+          assert OLD.endswith('\n') and OLD.count('\n') == 2, repr(OLD)
+
+          # NEW must insert before wb_stream_write and keep the crashing line verbatim
+          assert NEW.startswith(OLD.split('\n')[0] + '\n'), 'for 头被破坏'
+          assert 'wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);' in NEW
+          assert NEW.count('wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);') == 1
+          # the print must sit IMMEDIATELY before the crashing line, else the "logged before crash" premise breaks
+          pre, post = NEW.split('wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);')
+          assert pre.rstrip().endswith(': "");'), repr(pre[-48:])  # 插入块必须以三元 printf 收尾
+          assert '[och-wc]' in pre
+
+          # vararg 一致性：格式符个数 == 参数个数（差一个就读到垃圾值）
+          _close = ': "");'   # fprintf 收尾标记
+          fmts = NEW.count('%u') + NEW.count('%s')
+          _c = NEW.index('core, kernel')
+          _e = NEW.index(': "");', _c)   # 截止到 fprintf 收尾，别把后面的崩溃行算进来
+          tail = NEW[_c:_e]
+          args = tail.count(',') + 1
+          assert fmts == args, '格式符 %d != 参数 %d' % (fmts, args)
+          print('PREFLIGHT wcdiag: formats=%d args=%d OK' % (fmts, args))
+
+          # 括号/引号配平 —— 只在**插入段内**检查：NEW 是代码片段不是完整块，
+          # for 的收尾 } 在后面的崩溃行上，对整段数花括号必然假失衡。
+          _ins = NEW[NEW.index(MARKER):NEW.index(_close) + len(_close)]
+          for _a, _b in (('(', ')'), ('{', '}'), ('"', '"')):
+              assert _ins.count(_a) == _ins.count(_b), \
+                  'unbalanced %s%s in inserted block: %d vs %d' % (
+                      _a, _b, _ins.count(_a), _ins.count(_b))
+          assert '{' not in _ins, 'patch must not introduce braces'
+          assert '%%u' not in NEW, 'double-percent left in C string'
+
+          # 幂等 + 锚点缺失
+          tmp = tempfile.mkdtemp()
+          try:
+              p = os.path.join(tmp, 'v7.c')
+              open(p, 'w').write(OLD)
+              r = subprocess.run([sys.executable, P, p], capture_output=True, text=True, encoding='utf-8', errors='replace')
+              assert r.returncode == 0, 'inject failed: %s' % (r.stdout + r.stderr)
+              assert '[och-wc]' in open(p).read()
+              r2 = subprocess.run([sys.executable, P, p], capture_output=True, text=True, encoding='utf-8', errors='replace')
+              assert r2.returncode == 1, 're-apply not rejected'
+              pb = os.path.join(tmp, 'bad.c')
+              open(pb, 'w').write('static void f(void) { }\n')
+              r3 = subprocess.run([sys.executable, P, pb], capture_output=True, text=True, encoding='utf-8', errors='replace')
+              assert r3.returncode == 1, 'anchor-miss not rejected'
+              print('PREFLIGHT wcdiag OK (anchor / balanced / vararg / reapply / anchor-miss)')
+          finally:
+              shutil.rmtree(tmp, ignore_errors=True)
+          PY
+
+      - name: Build libteflon.so (FIX_V7 + WCDIAG + NO_STRIP)
         run: |
           set -eux
           chmod +x oes-teflon/build-recipe/build-teflon.sh
@@ -174,6 +240,8 @@ jobs:
           for pat in '调试信息：开启（-g3）' \
                      '[3e/6] 打【修复】v7' \
                      '[och-fix] 已修复 v7 calculate_bias_correction' \
+                     '[3f/6] 打【诊断】write_core_interleaved' \
+                     '[och-wc] 已注入 out_channel 诊断' \
                      'strip：跳过（保留调试段'; do
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
@@ -237,6 +305,10 @@ jobs:
           echo "STRING-CHECK: fix printf present  <- 修复代码已编入"
           strings -a "$SO" | grep -qF 'still OOB after fix' \
             && echo "STRING-CHECK: OOB warning string present"
+          # out_channel 取证补丁是否真进了二进制（日志能打出来也可能被后续步骤丢掉）
+          strings -a "$SO" | grep -qF '[och-wc]' \
+            || { echo "ERROR: out_channel 取证代码没有进入二进制，上机拿不到 [och-wc] 数字"; exit 1; }
+          echo "STRING-CHECK: [och-wc] present  <- out_channel 取证已编入"
 
       # ★ addr2line 归因：在 CI 里就把「哪个源码行」算出来。
       #   动机：unstripped .so 体积是 stripped 的数倍，而 oca→och 的大文件传递
@@ -259,27 +331,25 @@ jobs:
           MAP="$RUNNER_TEMP/addr2line-map.txt"
 
           # .text 的 [起始, 结束) —— 用来判断地址是否落在代码段内。
-          # 用 python3 而非 awk：ubuntu 默认是 mawk，**没有** strtonum/gawk 扩展
-          #（上一轮就用它翻过车）。只解析一次，打印 "start end"。
-          read -r TEXT_START TEXT_END <<< "$(python3 - "$SO" <<'PY'
-          import struct, sys
-          b = open(sys.argv[1], 'rb').read()
-          shoff, = struct.unpack_from('<Q', b, 0x28)
-          shent, shnum, shstrndx = struct.unpack_from('<HHH', b, 0x3a)
-          o = shoff + shstrndx * shent
-          _, _, _, _, stroff, strsize = struct.unpack_from('<IIQQII', b, o)[:6]
-          strtab = b[stroff:stroff + strsize]
-          for i in range(shnum):
-              o = shoff + i * shent
-              name, typ, flags, addr, off, size = struct.unpack_from('<IIQQQQ', b, o)[:6]
-              end = strtab.index(b'\x00', name)
-              if strtab[name:end] == b'.text':
-                  print(addr, addr + size)
-                  break
-          PY
-          )"
-          echo "### .text range: 0x$TEXT_START .. 0x$TEXT_END"
-          [ -n "$TEXT_START" ] || { echo "ERROR: 读不到 .text 段"; exit 1; }
+          #
+          # 历史：第一版这里**内联了一段纯 Python ELF 头解析**，结果 format 串
+          # 写成 '<IIQQII'（少一个 Q，第 5 个码是 I(4B) 而非 Q(8B)），
+          # 读出 sh_size=0 → strtab 为空 → index() 抛 ValueError → 步骤失败。
+          # 且它是本地无 gcc/无 ELF 工具时**没能先跑一遍**的代码 —— 拿 CI 当调试器，
+          # 白烧一轮。教训：能用现成工具就别手写二进制解析。
+          #
+          # 现在只依赖 readelf -S 的字段顺序（第 4 列=Address，第 6 列=Size），
+          # 十六进制交给 bash 的 $((16#..))，**不需要 gawk 的 strtonum**
+          #（ubuntu 默认 mawk 没有 strtonum，这也是第一版的另一个坑）。
+          TEXT_HEX=$(readelf -S "$SO" | awk '$2==".text"{print $4, $6}')
+          [ -n "$TEXT_HEX" ] || { echo "ERROR: readelf -S 里找不到 .text"; exit 1; }
+          TEXT_START=$((16#$(echo "$TEXT_HEX" | cut -d' ' -f1)))
+          TEXT_SIZE=$((16#$(echo "$TEXT_HEX" | cut -d' ' -f2)))
+          TEXT_END=$((TEXT_START + TEXT_SIZE))
+          printf '### .text range: 0x%x .. 0x%x (size=0x%x)\n' \
+                 "$TEXT_START" "$TEXT_END" "$TEXT_SIZE"
+          [ "$TEXT_END" -gt "$TEXT_START" ] \
+            || { echo "ERROR: .text 范围不合理"; exit 1; }
 
           {
             echo "### addr2line attribution"
@@ -290,21 +360,31 @@ jobs:
             echo
 
             for tok in $(echo "$ADDRS" | tr ',' ' '); do
-              # 统一归一为十六进制数值。带 0x 前缀按 hex 解释；不带前缀的按
-              # **十进制**解释（GitHub inputs 是字符串，不会自己转；只有调用方
-              # 传进来时就已变形的情形才会出现纯十进制 token）。
+              # ★★ 格式契约：**必须带 0x 前缀**，否则立即失败。
+              #
+              # 为什么不「聪明地」兼容裸数字：本地反例测试证明那等于**门失效** ——
+              # PowerShell 把 `0x256a4c` 转成十进制 2452044 传进来，若把它
+              # `printf '%x'` 转回十六进制，得到的又是 0x256a4c，**仍在合法区间**，
+              # 于是变形后的输入被「洗白」通过。只能靠格式契约硬拒。
               case "$tok" in
                 0x*|0X*) HEXV="${tok#0x}" ;;
-                *)       HEXV=$(printf '%x' "$tok") ;;
+                *)  echo "ERROR: 地址「$tok」缺少 0x 前缀。"
+                    echo "       若你传的是正确值却被拒，多半是调用方把 0x.. 转成了十进制："
+                    echo "       PowerShell 会把命令行里的 0x256a4c 当数字字面量转成 2452044。"
+                    echo "       请给 fault_addrs **整体加引号**："
+                    echo "         -f 'fault_addrs=0x256a60,0x256a4c'"
+                    echo "       收到的原始输入: $ADDRS"
+                    exit 1 ;;
               esac
-              # ★ 硬门：地址必须落在 .text 内。否则就是「查了错地址还返回 ??:0」
-              #   却看不出来 —— 这正是上一轮假绿的成因。
-              if [ "$((16#$HEXV))" -lt "$((16#$TEXT_START))" ] \
-                 || [ "$((16#$HEXV))" -ge "$((16#$TEXT_END))" ]; then
+              case "$HEXV" in
+                *[!0-9a-fA-F]*|'')
+                  echo "ERROR: 地址「$tok」不是合法的十六进制数"; exit 1 ;;
+              esac
+              # ★ 硬门：地址必须落在 .text 内。越界即失败，绝不查一个错地址
+              #   还返回 ??:0 让人以为「这段没有行号信息」。
+              if [ "$((16#$HEXV))" -lt "$TEXT_START" ] \
+                 || [ "$((16#$HEXV))" -ge "$TEXT_END" ]; then
                 echo "ERROR: 地址 0x$HEXV 不在 .text [0x$TEXT_START,0x$TEXT_END) 内"
-                echo "       说明 fault_addrs 被调用方变形了（PowerShell 会把 0x.. 转十进制）"
-                echo "       请把 fault_addrs **整体加引号**后重跑，例如："
-                echo "         -f 'fault_addrs=0x256a60,0x256a4c'"
                 echo "       收到的原始输入: $ADDRS"
                 exit 1
               fi
@@ -319,7 +399,8 @@ jobs:
           a = int(sys.argv[2], 16)
           best = None
           out = subprocess.run(['aarch64-linux-gnu-nm', '-n', '--defined-only', so],
-                               capture_output=True, text=True).stdout
+                             capture_output=True, text=True,
+                             encoding='utf-8', errors='replace').stdout
           for ln in out.splitlines():
               p = ln.split()
               if len(p) >= 3 and p[1].upper() in ('T', 'W', 'I'):
