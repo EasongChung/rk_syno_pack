@@ -168,6 +168,41 @@ def verify(path):
     return True
 
 
+def _revalidate(buf):
+    """用独立的 tflite 读 API 校验 Pack 出的字节流。
+
+    Pack 返回非空不代表字节流合法——flatbuffer 静默损坏时内核会在
+    很后面才炸，且报错位置与真正的错因无关。这里在落盘前就地拦截。
+    """
+    import tflite as T
+    try:
+        mo = T.Model.GetRootAsModel(buf, 0)
+        n_ops = mo.Subgraphs(0).OperatorsLength()
+        codes = {}
+        for i in range(mo.OperatorCodesLength()):
+            oc = mo.OperatorCodes(i)
+            bc = oc.BuiltinCode()
+            codes[i] = bc if bc < 127 else oc.DeprecatedBuiltinCode()
+        g = mo.Subgraphs(0)
+        n_pad = n_padv2 = 0
+        for i in range(n_ops):
+            if codes.get(g.Operators(i).OpcodeIndex()) == CODE_PAD:
+                n_pad += 1
+            elif codes.get(g.Operators(i).OpcodeIndex()) == CODE_PADV2:
+                n_padv2 += 1
+    except Exception as e:
+        raise RuntimeError('revalidate: tflite could not parse packed '
+                           'buffer: %s' % str(e)[:200])
+    assert n_padv2 == 0, ('revalidate: packed buffer still has %d PADV2 '
+                          '(flatbuffer union/offset mismatch?)' % n_padv2)
+    assert n_pad >= 4, ('revalidate: expected >=4 PAD after rewrite '
+                        '(3 original + 1 rewritten), got %d - graph '
+                        'corrupted' % n_pad)
+    print('REVALIDATE OK: ops=%d PAD=%d PADV2=%d' % (n_ops, n_pad, n_padv2),
+          flush=True)
+    return True
+
+
 def rewrite(src, dst, dry_run=False):
     raw = open(src, 'rb').read()
     fb, model = load_model_obj(raw)
@@ -281,11 +316,27 @@ def rewrite(src, dst, dry_run=False):
             ok = True
         print('  rewrote one PADV2 -> PAD (options=%s)' % ok, flush=True)
 
+    # 即使 --dry-run 也必须走完 Pack：Pack 才是最可能崩的一步
+    # （历史教训：dry-run 在写盘前 return，掩盖了 Pack 的 TypeError，
+    #  连续两轮 CI 都在这上面假绿）。
+    # TF 的对象树 API：Pack(builder) 必须显式传 builder
+    # （CI run 38992257089 实测 TypeError: missing 'builder'）。
+    import flatbuffers
+    builder = flatbuffers.Builder(1024 * 1024)
+    out = model.Pack(builder)
+    if not out:
+        raise RuntimeError('Pack(builder) returned empty buffer')
+    print('PACK OK: %d bytes' % len(out), flush=True)
+
+    # Pack 返回非空**不等于**字节流合法（flatbuffer 静默损坏的经典形态）。
+    # 立刻用独立的 tflite 读 API 回读校验：算子数 / PAD 分类 / opcode，
+    # 任何一项对不上就地失败，绝不落盘。
+    _revalidate(out)
+
     if dry_run:
-        print('dry-run: not writing', flush=True)
+        print('dry-run: not writing (pack + revalidate both OK)', flush=True)
         return len(targets)
 
-    out = model.Pack()
     with open(dst, 'wb') as f:
         f.write(out)
     print('WROTE %s (%d bytes, was %d)' % (dst, len(out), len(raw)),

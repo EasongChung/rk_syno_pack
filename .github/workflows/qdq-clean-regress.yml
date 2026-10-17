@@ -170,10 +170,25 @@ jobs:
           SRC=out/concept_int8_tf_legacy.tflite
           DST=out/concept_int8_fixed.tflite
           test -f "$SRC" || { echo "FIX: no legacy model"; exit 0; }
-          python tools/oes/tflite_fix_padv2.py \
-            --in "$SRC" --out "$DST" --dry-run || echo "FIX dry-run rc=$?"
-          python tools/oes/tflite_fix_padv2.py \
-            --in "$SRC" --out "$DST" || echo "FIX: rc=$?"
+          # 不用 `|| echo` 吞退出码：那样 traceback 会被掩盖，
+          # 步骤仍报 success，产物却根本没生成（run 38992257089 就是
+          # 这样假绿了两轮，真实错因是 ModelT.Pack() 缺 builder 参数）。
+          # 改写失败 = 无可交付产物，必须让步骤红。
+          if python tools/oes/tflite_fix_padv2.py \
+               --in "$SRC" --out "$DST" --dry-run; then
+            echo "FIX: dry-run passed (pack + revalidate OK)"
+          else
+            echo "FIX: dry-run FAILED - traceback above is authoritative"
+            exit 1
+          fi
+          if python tools/oes/tflite_fix_padv2.py --in "$SRC" --out "$DST"; then
+            echo "FIX: rewrite OK"
+          else
+            echo "FIX: rewrite FAILED - traceback above is authoritative"
+            exit 1
+          fi
+          # 硬门：产物必须真的存在且非空，否则后面 regress 会去测旧文件
+          test -s "$DST" || { echo "FIX: $DST missing/empty"; exit 1; }
           ls -la out/*.tflite || true
 
       # Route C/A（onnx2tf output_integer_quantized_tflite）已证死并删除：
