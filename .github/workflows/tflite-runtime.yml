@@ -320,7 +320,8 @@ jobs:
 
           # driver 链接 tensorflow-lite → 自动获得 flatbuffers/absl 等 include 路径
           add_executable(tf_load_check ${CMAKE_CURRENT_SOURCE_DIR}/tf_load_check.cpp)
-          target_link_libraries(tf_load_check PRIVATE tensorflow-lite)
+          # dlopen/dlsym 需要 libdl（TFLite 未必已传递依赖）
+          target_link_libraries(tf_load_check PRIVATE tensorflow-lite ${CMAKE_DL_LIBS})
           DRVEOF
 
           cat > "$RUNNER_TEMP/tc.cmake" <<EOF
