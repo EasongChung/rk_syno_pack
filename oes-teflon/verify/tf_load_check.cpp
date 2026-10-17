@@ -133,27 +133,44 @@ static DelegateDestroyFn g_destroy = nullptr;
 /* teflon 内部的 tflite_type_name 是 file-static 短名版本（L1370），
  * 与公开枚举名不同。这里用公开枚举打印，便于阅读。 */
 static const char* dtype_name(TfLiteType t) {
+  /* ⚠️ 本表**必须与 TFLite 2.13 的 TfLiteType 枚举逐项一致**，不要凭印象加。
+   * 权威来源：tensorflow/lite/core/c/c_api_types.h（v2.13.0，实测 19 个成员）：
+   *   kTfLiteNoType kTfLiteFloat32 kTfLiteInt32 kTfLiteUInt8 kTfLiteInt64
+   *   kTfLiteString kTfLiteBool kTfLiteInt16 kTfLiteComplex64 kTfLiteInt8
+   *   kTfLiteFloat16 kTfLiteFloat64 kTfLiteComplex128 kTfLiteUInt64
+   *   kTfLiteResource kTfLiteVariant kTfLiteUInt32 kTfLiteUInt16 kTfLiteInt4
+   *
+   * 注意：kTfLiteBFloat16 / kTfLiteUInt4 在 **2.13 中不存在**，
+   *       写了会编译失败（已实测）。新增成员前必须先查那个头文件。
+   *
+   * 为什么必须列全：teflon 的 create_resource() 对这些类型的处理**不同**——
+   *   - Int8/UInt8/Int16/UInt16/Float16 → bytes 1/2
+   *   - Int32/UInt32/Float32          → bytes 4
+   *   - Int64/UInt64/Float64/Complex64→ bytes 8
+   *   - String/Bool/Complex128/Resource/Variant/Int4 → **落进
+   *     default: unreachable("Unsupported TF type")**
+   * 若在驱动里把它们混成 "OTHER"，就无法判断崩因是不是这个 default 分支。 */
   switch (t) {
-    case kTfLiteFloat32: return "FLOAT32";
-    case kTfLiteInt32:   return "INT32";
-    case kTfLiteUInt8:   return "UINT8";
-    case kTfLiteInt64:   return "INT64";
-    case kTfLiteString:  return "STRING";
-    case kTfLiteBool:    return "BOOL";
-    case kTfLiteInt16:   return "INT16";
-    case kTfLiteComplex64:  return "COMPLEX64";
-    case kTfLiteInt8:    return "INT8";
-    case kTfLiteFloat16: return "FLOAT16";
-    case kTfLiteFloat64: return "FLOAT64";
-    /* 以下在 2.13 的 TensorType 里存在，但 delegate 的 create_resource()
-     * 会走 default: unreachable() —— 必须能显式打印出来，
-     * 否则会混在 "OTHER" 里看不出是哪几个。 */
-    case kTfLiteInt4:      return "INT4";
-    case kTfLiteBFloat16:  return "BFLOAT16";
-    case kTfLiteResource:  return "RESOURCE";
-    case kTfLiteVariant:   return "VARIANT";
-    case kTfLiteUInt4:     return "UINT4";
-    default:               return "OTHER";
+    case kTfLiteNoType:     return "NoType";     /* fill_tensor 会直接 return */
+    case kTfLiteFloat32:    return "Float32";
+    case kTfLiteInt32:      return "Int32";
+    case kTfLiteUInt8:      return "UInt8";
+    case kTfLiteInt64:      return "Int64";
+    case kTfLiteString:     return "String";     /* create_resource 不支持 */
+    case kTfLiteBool:       return "Bool";       /* create_resource 不支持 */
+    case kTfLiteInt16:      return "Int16";
+    case kTfLiteComplex64:  return "Complex64";
+    case kTfLiteInt8:       return "Int8";
+    case kTfLiteFloat16:    return "Float16";
+    case kTfLiteFloat64:    return "Float64";
+    case kTfLiteComplex128: return "Complex128"; /* create_resource 不支持 */
+    case kTfLiteUInt64:     return "UInt64";
+    case kTfLiteResource:   return "Resource";   /* create_resource 不支持 */
+    case kTfLiteVariant:    return "Variant";    /* create_resource 不支持 */
+    case kTfLiteUInt32:     return "UInt32";
+    case kTfLiteUInt16:     return "UInt16";
+    case kTfLiteInt4:       return "Int4";       /* create_resource 不支持 */
+    default:                return "UNKNOWN";    /* 出现即说明枚举表与头文件已不同步 */
   }
 }
 
