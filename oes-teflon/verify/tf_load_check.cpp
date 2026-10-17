@@ -70,8 +70,26 @@
  *     **不存在**（实测 tensorflow/lite/core/c/c_api.h 无这两个符号）。
  *     分区数改用 C++ 的 Interpreter::execution_plan()。
  *
- *  6. 模型类是 **tflite::FlatBufferModel**（tensorflow/lite/core/model_builder.h），
- *     用 LoadFromFile() + ok()，不是 TfLiteModel::CreateFromFile()。
+ *  6. 模型类是 **tflite::FlatBufferModel**（core/model_builder.h，
+ *     实为 `using FlatBufferModel = impl::FlatBufferModel`），
+ *     且**没有默认构造函数**（拷贝构造被 delete），
+ *     必须用静态工厂 VerifyAndBuildFromFile() / BuildFromFile()。
+ *
+ *  7. ⚠️ **AddDelegate 与 SetNumThreads 是 InterpreterBuilder 的成员，
+ *     不是 InterpreterOptions 的**：
+ *         class InterpreterBuilder {
+ *           InterpreterBuilder(const FlatBufferModel&, const OpResolver&,
+ *                              const InterpreterOptions* = nullptr);
+ *           void AddDelegate(TfLiteDelegate* delegate);
+ *           TfLiteStatus SetNumThreads(int);
+ *           TfLiteStatus operator()(std::unique_ptr<Interpreter>*);
+ *         };
+ *     没有必要单独构造 InterpreterOptions 对象。
+ *
+ *  8. Interpreter **没有 subgraph_count()**，别写。
+ *
+ *  9. lite/ 下的 model.h / interpreter.h 都是**转发 stub**，
+ *     真正有内容的是 lite/core/ 下的同名文件。
  *
  * ## 退出码
  *
@@ -87,10 +105,10 @@
 #include <memory>
 #include <vector>
 
-#include "tensorflow/lite/model.h"
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/interpreter_builder.h"
-#include "tensorflow/lite/kernels/register.h"
+#include "tensorflow/lite/core/model_builder.h"       // FlatBufferModel
+#include "tensorflow/lite/core/interpreter_builder.h" // InterpreterBuilder
+#include "tensorflow/lite/core/interpreter.h"         // Interpreter
+#include "tensorflow/lite/kernels/register.h"         // BuiltinOpResolver
 #include "tensorflow/lite/c/c_api_types.h"
 
 /* libteflon.so 导出的 external delegate 入口（Mesa teflon，旧式 C ABI） */
@@ -136,8 +154,9 @@ int main(int argc, char** argv) {
                getenv("TEFLON_DEBUG") ? getenv("TEFLON_DEBUG") : "(未设置)");
 
   /* 1. 加载模型 —— tflite::FlatBufferModel，不是 TfLiteModel */
-  tflite::FlatBufferModel model;
-  if (!model.LoadFromFile(argv[1]) || !model.ok()) {
+  std::unique_ptr<tflite::FlatBufferModel> model =
+      tflite::FlatBufferModel::VerifyAndBuildFromFile(argv[1]);
+  if (model == nullptr) {
     std::fprintf(stderr, "结果: FAIL - 模型加载/校验失败\n");
     return 1;
   }
@@ -153,13 +172,15 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "delegate    : 已创建\n");
 
-  tflite::InterpreterOptions options;
-  options.AddDelegate(delegate);
-  options.SetNumThreads(1);
-
-  /* 3. 构造解释器 —— 必须走 InterpreterBuilder */
+  /* 3. 构造解释器 —— 必须走 InterpreterBuilder
+   *
+   * ⚠️ 2.13 里 **AddDelegate 与 SetNumThreads 都是 InterpreterBuilder 的成员**，
+   *    不是 InterpreterOptions 的。选项对象只有一个，挂在 builder 上即可，
+   *    不必再单独构造 InterpreterOptions。 */
   tflite::ops::builtin::BuiltinOpResolver resolver;
-  tflite::InterpreterBuilder builder(model, resolver, &options);
+  tflite::InterpreterBuilder builder(*model, resolver);
+  builder.AddDelegate(delegate);
+  builder.SetNumThreads(1);
   std::unique_ptr<tflite::Interpreter> interpreter;
   if (builder(&interpreter) != kTfLiteOk || !interpreter) {
     std::fprintf(stderr, "结果: FAIL - 解释器创建失败\n");
@@ -211,32 +232,34 @@ int main(int argc, char** argv) {
     }
   }
 
-  /* 7. 输入/输出张量 —— 从主子图取，避开 Interpreter::inputs() 的签名差异 */
-  if (interpreter->subgraph_count() > 0) {
-    const tflite::Subgraph* sg = interpreter->subgraph(0);
-    if (sg != nullptr) {
-      const std::vector<int>& ins = sg->inputs();
-      const std::vector<int>& outs = sg->outputs();
-      std::fprintf(stderr, "输入张量数    : %d\n", static_cast<int>(ins.size()));
-      for (size_t i = 0; i < ins.size(); i++) {
-        const TfLiteTensor* t = interpreter->tensor(ins[i]);
-        if (t == nullptr) continue;
-        std::fprintf(stderr, "  输入[%d] dtype=%s scale=%g zp=%lld shape=",
-                     static_cast<int>(i), dtype_name(t->type),
-                     t->params.scale, (long long)t->params.zero_point);
-        print_shape(t);
-        std::fprintf(stderr, "\n");
-      }
-      std::fprintf(stderr, "输出张量数    : %d\n", static_cast<int>(outs.size()));
-      for (size_t i = 0; i < outs.size(); i++) {
-        const TfLiteTensor* t = interpreter->tensor(outs[i]);
-        if (t == nullptr) continue;
-        std::fprintf(stderr, "  输出[%d] dtype=%s scale=%g zp=%lld shape=",
-                     static_cast<int>(i), dtype_name(t->type),
-                     t->params.scale, (long long)t->params.zero_point);
-        print_shape(t);
-        std::fprintf(stderr, "\n");
-      }
+  /* 7. 输入/输出张量 —— Interpreter::inputs()/outputs() 返回 const std::vector<int>&
+   *    （头文件里 `return tensor(inputs()[index])` 佐证其可索引） */
+  {
+    const std::vector<int>& ins = interpreter->inputs();
+    const std::vector<int>& outs = interpreter->outputs();
+    std::fprintf(stderr, "输入张量数    : %d
+", static_cast<int>(ins.size()));
+    for (size_t i = 0; i < ins.size(); i++) {
+      const TfLiteTensor* t = interpreter->tensor(ins[i]);
+      if (t == nullptr) continue;
+      std::fprintf(stderr, "  输入[%d] dtype=%s scale=%g zp=%lld shape=",
+                   static_cast<int>(i), dtype_name(t->type), t->params.scale,
+                   (long long)t->params.zero_point);
+      print_shape(t);
+      std::fprintf(stderr, "
+");
+    }
+    std::fprintf(stderr, "输出张量数    : %d
+", static_cast<int>(outs.size()));
+    for (size_t i = 0; i < outs.size(); i++) {
+      const TfLiteTensor* t = interpreter->tensor(outs[i]);
+      if (t == nullptr) continue;
+      std::fprintf(stderr, "  输出[%d] dtype=%s scale=%g zp=%lld shape=",
+                   static_cast<int>(i), dtype_name(t->type), t->params.scale,
+                   (long long)t->params.zero_point);
+      print_shape(t);
+      std::fprintf(stderr, "
+");
     }
   }
 
