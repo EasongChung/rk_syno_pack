@@ -323,10 +323,26 @@ def rewrite(src, dst, dry_run=False):
     # （CI run 38992257089 实测 TypeError: missing 'builder'）。
     import flatbuffers
     builder = flatbuffers.Builder(1024 * 1024)
-    out = model.Pack(builder)
+    # Pack 的返回值语义（CI run 38993185873 实测）：
+    #   Pack(builder) 返回 root table 的**偏移量(int)**，不是字节流
+    #   （直接对其取 len() 抛 "TypeError: object of type 'int' has no len()")。
+    # 字节流必须从 builder 取：Output() 无参数且返回「已写入的数据段」
+    # （flatbuffers/builder.py:180），它要求 buffer 已 Finish。
+    # TF 对象树的 Pack 通常已自行 Finish，但不同版本行为不一致，
+    # 故这里显式 Finish 一次（幂等：已 finished 时 no-op），
+    # 再用 Output() 取字节。这样不依赖版本差异。
+    packed_root = model.Pack(builder)
+    try:
+        builder.Finish(packed_root)
+    except Exception as e:
+        # 已 Finish 过或签名不同：不致命，Output() 仍可能可用
+        print('  Finish(%s) raised %s (continuing)' % (packed_root, e),
+              flush=True)
+    out = bytes(builder.Output())
     if not out:
-        raise RuntimeError('Pack(builder) returned empty buffer')
-    print('PACK OK: %d bytes' % len(out), flush=True)
+        raise RuntimeError('Pack(builder) produced an empty buffer')
+    print('PACK OK: root_offset=%s bytes=%d' % (packed_root, len(out)),
+          flush=True)
 
     # Pack 返回非空**不等于**字节流合法（flatbuffer 静默损坏的经典形态）。
     # 立刻用独立的 tflite 读 API 回读校验：算子数 / PAD 分类 / opcode，
