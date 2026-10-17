@@ -173,6 +173,40 @@ jobs:
           done
           rm -f "$RUNNER_TEMP"/*.deb
 
+          # ---- 2b. 删除 sysroot 里的静态 glibc 归档（第27次的根因）----
+          #
+          # 现象：driver 链接时 ld 反复报
+          #     libdl.a(dlopen.o): undefined reference to `__dlopen'
+          #     libpthread.a(nptl-init.o): undefined reference to `_dl_pagesize'
+          #     warning: Using 'dlopen' in statically linked applications...
+          #
+          # 原因：sysroot 同时存在 libdl.so / libpthread.so / libc.so（动态）
+          # 和 libdl.a / libpthread.a / libc.a（静态）。
+          # TFLite 的 CMake 用 find_package/find_library 解析出的是 **.a 完整路径**，
+          # 并把它固化进 tensorflow-lite target 的 INTERFACE 链接接口。
+          # 对显式路径，`-Wl,-Bdynamic` 是**无效的**（它只影响 `-lfoo` 的解析），
+          # 所以上一轮加 -Bdynamic 没解决问题。
+          #
+          # 而 __dlopen / _dl_pagesize / _dl_init_static_tls / _dl_find_object
+          # 全是**动态 libc 的内部符号**，静态归档里根本没有 → 必然链接失败。
+          #
+          # 解法：把静态归档删掉，sysroot 里只剩动态版本，
+          #       任何 -ldl / -lpthread / -lc 都只能解析到 .so。
+          # 这些静态库在本项目里没有任何用途（我们只要动态链接 + 静态 libgcc）。
+          for a in libdl libpthread libc libm librt; do
+            rm -f "$SR/usr/lib/aarch64-linux-gnu/$a.a" \
+                  "$SR/lib/aarch64-linux-gnu/$a.a"
+          done
+          echo "=== sysroot 中剩余的静态归档（应为空）==="
+          find "$SR" -name '*.a' -not -path '*gcc-cross*' -not -path '*gcc/aarch64*' \
+               | head -10 || true
+          # 自检：动态 .so 必须还在
+          for so in libdl.so libpthread.so libc.so; do
+            [ -e "$SR/usr/lib/aarch64-linux-gnu/$so" ] \
+              || { echo "ERROR: 误删了 $so"; exit 1; }
+          done
+          echo "  ✓ 动态 .so 均保留"
+
           # ---- 3. 宿主运行时库路径（关键）----
           # Debian 交叉 binutils 的 as/ld 是 **宿主 x86_64 程序**，运行时需要
           #   libopcodes-2.35.2-arm64.so / libbfd-2.35.2-arm64.so
