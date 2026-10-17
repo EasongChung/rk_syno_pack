@@ -474,6 +474,23 @@ int main(int argc, char** argv) {
      * 有量化参数的标 *，无量化参数标 -（delegate 会跳过，见 fill_tensor 守卫）。 */
     if (dump_tensors) {
       const bool has_q = (t->quantization.type == kTfLiteAffineQuantization);
+      /* 量化粒度：scale 数组长度。这是「per-tensor 还是 per-channel」的**唯一权威判据**，
+       * 而且是从【解释器】**独立于文件侧**再数一遍 ——
+       * teflon 的准入条件就是看这个长度：
+       *   etnaviv_ml.c  tensor_quantization_supported():
+       *       return tensor->scales == NULL && tensor->zero_points == NULL;
+       *   而 fill_tensor() 恰在 scale->size > 1 时填 tensor->scales
+       *   → 即 **scale 长度 > 1 ⇒ 该张量所在算子被判 unsupported**
+       *
+       * 有两条独立路径确认同一件事（oca 的 check_pc.py 读 flatbuffer、
+       * 这里读解释器），避免单点误判。 */
+      int n_scale = 0, n_zp = 0;
+      if (has_q && t->quantization.params != nullptr) {
+        const TfLiteAffineQuantization* aq =
+            static_cast<const TfLiteAffineQuantization*>(t->quantization.params);
+        if (aq->scale != nullptr) n_scale = aq->scale->size;
+        if (aq->zero_point != nullptr) n_zp = aq->zero_point->size;
+      }
       char dims[96] = "?";
       if (t->dims != nullptr) {
         std::size_t off = 0;
@@ -485,17 +502,45 @@ int main(int argc, char** argv) {
           off += static_cast<std::size_t>(k);
         }
       }
-      std::fprintf(stderr, "TENSOR %4d %-9s %-22s data=%-3s %c scale=%-14g zp=%-5d %s\n",
+      /* qgran 列：per-tensor（scale 长度 1）/ per-channel（>1）/ 无量化（0）
+       * —— 这一列直接对应 teflon 的准入判据 */
+      const char* qgran = (n_scale == 0) ? "-"
+                        : (n_scale == 1) ? "PT"
+                                         : "PC";
+      std::fprintf(stderr,
+                   "TENSOR %4d %-9s %-22s data=%-3s %c scale=%-14g zp=%-5d "
+                   "qgran=%-3s n_scale=%-4d n_zp=%-4d %s\n",
                    i, dtype_name(t->type), dims,
                    t->data.data ? "yes" : "no",
                    has_q ? '*' : '-',
                    t->params.scale,
                    static_cast<int>(t->params.zero_point),
+                   qgran, n_scale, n_zp,
                    (t->name != nullptr) ? t->name : "");
     }
   }
   if (dump_tensors) {
     std::fprintf(stderr, "TENSOR_DUMP_END count=%d\n", n_tensors);
+  }
+
+  /* 量化粒度汇总：per-tensor / per-channel 各多少张量。
+   * 与 oca 侧 check_pc.py（读 flatbuffer）是**两条独立路径**，可交叉核对。 */
+  {
+    int pt = 0, pc = 0;
+    for (int i = 0; i < n_tensors; i++) {
+      const TfLiteTensor* t = interpreter->tensor(i);
+      if (t == nullptr || t->quantization.type != kTfLiteAffineQuantization) continue;
+      if (t->quantization.params == nullptr) continue;
+      const TfLiteAffineQuantization* aq =
+          static_cast<const TfLiteAffineQuantization*>(t->quantization.params);
+      if (aq->scale == nullptr) continue;
+      if (aq->scale->size == 1) pt++;
+      else pc++;
+    }
+    std::fprintf(stderr,
+                 "QGRAN per_tensor_tensors=%d per_channel_tensors=%d\n"
+                 "QGRAN 说明: teflon 准入要求 per-tensor（per-channel 会被判 unsupported）\n",
+                 pt, pc);
   }
 
   /* 7. 输入/输出张量 —— Interpreter::inputs()/outputs() 返回 const std::vector<int>&
