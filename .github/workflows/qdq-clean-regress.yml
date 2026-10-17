@@ -160,6 +160,22 @@ jobs:
             || echo "ROUTE-T-LEGACY: exit=$? (report kept)"
           ls -la out/*.tflite || true
 
+      # PADV2 -> PAD 改写（legacy 产物）：PADV2 的 constant_values 与
+      # 量化后的 int8 input 类型冲突，TFLite 内核拒绝 prepare
+      # （"pad.cc:230 ... INT8 != FLOAT32"）。PAD 固定 0 填充，与
+      # 本图 PADV2 的 constant_value=0 语义等价。
+      - name: Fix PADV2 -> PAD in legacy model
+        run: |
+          set -euo pipefail
+          SRC=out/concept_int8_tf_legacy.tflite
+          DST=out/concept_int8_fixed.tflite
+          test -f "$SRC" || { echo "FIX: no legacy model"; exit 0; }
+          python tools/oes/tflite_fix_padv2.py \
+            --in "$SRC" --out "$DST" --dry-run || echo "FIX dry-run rc=$?"
+          python tools/oes/tflite_fix_padv2.py \
+            --in "$SRC" --out "$DST" || echo "FIX: rc=$?"
+          ls -la out/*.tflite || true
+
       - name: Route C - QDQ to int8 TFLite via onnx2tf convert
         run: |
           set -euo pipefail
