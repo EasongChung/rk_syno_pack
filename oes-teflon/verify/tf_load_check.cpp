@@ -133,6 +133,20 @@ typedef void (*DelegateDestroyFn)(TfLiteDelegate*);
 static void* g_handle = nullptr;
 static DelegateDestroyFn g_destroy = nullptr;
 
+/* 真实数据通路：从文件读输入张量、把输出张量写文件。
+ *
+ * 为什么需要它：合成模式（ramp）只能测「通不通」，**不能验「对不对」** ——
+ * 而我们在这一点上吃过大亏：合成输入下 CPU 输出几乎全饱和（mean=-127.68），
+ * 据此完全无法判断模型在真实图片上是否正确。
+ *
+ * 设计要点：**两边喂完全相同的字节**，谁都不重新实现预处理 ——
+ * 「重新实现预处理」正是两边都会以为自己对的环节。
+ *   oca 侧导出某张评测图预处理后的 INT8 张量 → 本程序读入
+ *   → 输出张量写文件 → 两边比 FNV-1a 哈希。
+ */
+static const char* g_input_file = nullptr;
+static const char* g_output_dump = nullptr;
+
 /* teflon 内部的 tflite_type_name 是 file-static 短名版本（L1370），
  * 与公开枚举名不同。这里用公开枚举打印，便于阅读。 */
 static const char* dtype_name(TfLiteType t) {
@@ -227,16 +241,43 @@ static void run_invoke(tflite::Interpreter* interpreter, int invoke_n) {
     return;
   }
 
-  /* 确定性填充：两组必须完全一致，否则对比无意义 */
-  {
-    /* data.raw 是 char*，到 uint8_t* 必须 reinterpret_cast
- * （static_cast 在 char*→unsigned char* 上非法，CI 实测报错）*/
+  /* 输入来源：--input-file 优先，否则用确定性合成模式。
+   * 合成模式足以测性能与「通不通」，但**不能**验正确性。 */
+  if (g_input_file != nullptr) {
+    FILE* fi = std::fopen(g_input_file, "rb");
+    if (fi == nullptr) {
+      std::fprintf(stderr, "INVOKE 跳过: 打不开输入文件 %s\n", g_input_file);
+      return;
+    }
+    std::uint8_t* p = reinterpret_cast<std::uint8_t*>(in->data.raw);
+    const std::size_t rd = std::fread(p, 1, in->bytes, fi);
+    std::fclose(fi);
+    if (rd != in->bytes) {
+      std::fprintf(stderr,
+                   "INVOKE 跳过: 输入文件大小不符（读到 %zu，需要 %zu）\n",
+                   rd, in->bytes);
+      return;
+    }
+    /* 输入哈希：证明「我收到的字节」与「对方发出的字节」一致 */
+    std::uint64_t ih = 1469598103934665603ULL;
+    for (std::size_t k = 0; k < in->bytes; k++) {
+      ih ^= p[k];
+      ih *= 1099511628211ULL;
+    }
+    std::fprintf(stderr,
+                 "INVOKE 输入来源: 文件 %s bytes=%zu in_hash=0x%016llx\n",
+                 g_input_file, in->bytes,
+                 static_cast<unsigned long long>(ih));
+  } else {
+    /* 合成模式：确定性填充，保证同一轮内各组喂同一份数据。
+     * data.raw 是 char*，到 uint8_t* 必须 reinterpret_cast
+     * （static_cast 在 char*→unsigned char* 上非法，CI 实测报错）。 */
     std::uint8_t* p = reinterpret_cast<std::uint8_t*>(in->data.raw);
     for (std::size_t k = 0; k < in->bytes; k++)
       p[k] = static_cast<std::uint8_t>((k * 31u + 7u) & 0xFFu);
+    std::fprintf(stderr, "INVOKE 输入填充: bytes=%zu pattern=(i*31+7)&0xFF\n",
+                 in->bytes);
   }
-  std::fprintf(stderr, "INVOKE 输入填充: bytes=%zu pattern=(i*31+7)&0xFF\n",
-               in->bytes);
 
   const int warmup = 3;
   for (int w = 0; w < warmup; w++) {
@@ -281,6 +322,19 @@ static void run_invoke(tflite::Interpreter* interpreter, int invoke_n) {
       osum += q[k];
     }
   }
+  /* 输出转储：写原始字节，交给对方用相同的比较逻辑核对 */
+  if (g_output_dump != nullptr && out_bytes > 0) {
+    FILE* fo = std::fopen(g_output_dump, "wb");
+    if (fo == nullptr) {
+      std::fprintf(stderr, "OUTPUT-DUMP 失败: 无法写入 %s\n", g_output_dump);
+    } else {
+      const std::size_t wr = std::fwrite(out->data.raw, 1, out_bytes, fo);
+      std::fclose(fo);
+      std::fprintf(stderr, "OUTPUT-DUMP 已写入 %s bytes=%zu\n",
+                   g_output_dump, wr);
+    }
+  }
+
   std::fprintf(stderr,
                "INVOKE n=%d warmup=%d min_ms=%.3f median_ms=%.3f mean_ms=%.3f "
                "out_bytes=%zu out_hash=0x%016llx out_min=%d out_max=%d out_mean=%.4f\n",
@@ -305,6 +359,8 @@ int main(int argc, char** argv) {
                  "用法: %s <model.tflite> [libteflon.so] [--no-delegate] [--dump-tensors] [--invoke N]\n"
                  "  --no-delegate   不挂 delegate，用于归因（也用于取 CPU 基准耗时）\n"
                  "  --dump-tensors  逐张量转储 type/dims/量化参数/name\n"
+                 "  --input-file F  从文件读入输入张量原始字节（而非合成模式）\n"
+                 "  --output-dump F 把输出张量原始字节写入文件\n"
                  "  --invoke N      真实推理 N 次并计时（含 3 次预热）；\n"
                  "                  输入用确定性模式填充，输出打 FNV-1a 哈希，\n"
                  "                  所以「挂 delegate」与「--no-delegate」两组的\n"
@@ -323,6 +379,10 @@ int main(int argc, char** argv) {
       no_delegate = true;
     } else if (std::strcmp(argv[i], "--dump-tensors") == 0) {
       dump_tensors = true;
+    } else if (std::strcmp(argv[i], "--input-file") == 0 && i + 1 < argc) {
+      g_input_file = argv[++i];
+    } else if (std::strcmp(argv[i], "--output-dump") == 0 && i + 1 < argc) {
+      g_output_dump = argv[++i];
     } else if (std::strcmp(argv[i], "--invoke") == 0 && i + 1 < argc) {
       invoke_n = std::atoi(argv[++i]);
       if (invoke_n < 1) invoke_n = 1;
