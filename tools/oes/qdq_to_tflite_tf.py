@@ -91,6 +91,18 @@ def fix_pad_onnx(src, dst):
     if not changed:
         print('fix_pad: no 3-input Pad with constant_value=0 found',
               flush=True)
+        # 仍然必须产出 dst：调用方会无条件把 src_onnx 指向 dst，
+        # 这里若 return 0 而不写文件，onnx2tf 会报
+        #   "The specified *.onnx file does not exist. input_onnx_file_path:
+        #    work/concept_split_padsafe.onnx"
+        # 并让整条 Route T 失败（CI run 39000529388 实测：Route T /
+        # Route T-legacy / Route T-per-tensor 全线 exit=5，全部栽在这里）。
+        # 本 ONNX 图里确实只有 2 输入 Pad（无 3 输入 Pad 可改），
+        # 所以 changed==0 是**常态**，这条路径必须能正常产出文件。
+        import shutil
+        shutil.copyfile(src, dst)
+        print('fix_pad: copied source to %s unchanged (no rewrite needed)'
+              % os.path.basename(dst), flush=True)
         return 0
     keep = [i for i in g.initializer
             if not (i.name in remap and i.name not in used)]
@@ -318,11 +330,25 @@ def main():
     pad_fixed = os.path.join(args.workdir, 'concept_split_padsafe.onnx')
     print('=== TA3-pre: fixing Pad (3-input -> 2-input) ===', flush=True)
     try:
-        fix_pad_onnx(args.float_onnx, pad_fixed)
-        src_onnx = pad_fixed
+        n_padfix = fix_pad_onnx(args.float_onnx, pad_fixed)
+        # 不能只看有没有抛异常：fix_pad 返回 0 且不写文件时，
+        # src_onnx 会指向一个不存在的路径（CI run 39000529388 实测）。
+        # 所以按**产物是否存在**决定，而不是按返回值或异常。
+        if os.path.exists(pad_fixed):
+            src_onnx = pad_fixed
+            print('TA3-pre: using %s (%d Pad rewritten)'
+                  % (os.path.basename(pad_fixed), n_padfix), flush=True)
+        else:
+            print('TA3-pre: %s not produced; falling back to original ONNX'
+                  % os.path.basename(pad_fixed), flush=True)
+            src_onnx = args.float_onnx
     except Exception as e:
         print('fix_pad failed (%s); use original' % str(e)[:120], flush=True)
         src_onnx = args.float_onnx
+    if not os.path.exists(src_onnx):
+        raise RuntimeError('src_onnx does not exist: %s (this would make '
+                           'onnx2tf fail with a confusing message)'
+                           % src_onnx)
     _sys.stdout.flush()
 
     print('=== TA3a: onnx2tf.convert -> SavedModel (NHWC kept) ===',
