@@ -421,7 +421,8 @@ jobs:
           #   libpthread.so -> ...-> libpthread-2.31.so                              ✓
           #   libc.so       -> ...-> libc-2.31.so                                   ✓
           #   crt1.o / libc.so 链接脚本均在 sysroot 内                               ✓
-          target_link_options(tf_load_check PRIVATE -Wl,-Bdynamic)
+          # -rdynamic：让 backtrace_symbols_fd 能打印出函数名而不只是地址
+          target_link_options(tf_load_check PRIVATE -Wl,-Bdynamic -rdynamic)
           target_link_libraries(tf_load_check PRIVATE tensorflow-lite dl pthread c m)
           DRVEOF
 
