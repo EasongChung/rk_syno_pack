@@ -17,6 +17,12 @@
 #   GLIBC_VER      sysroot glibc 版本，默认 2.31
 #   DEB_SUITE      Debian 套件，默认 bullseye
 #   CROSS_PREFIX   交叉前缀，默认 aarch64-linux-gnu-
+#
+# 诊断/修复开关（默认全关，产物与生产完全一致）：
+#   TEFLON_DIAG=1        越界取证补丁（打印尺寸/指针 + 钳界；产物不可交付）
+#   TEFLON_FIX_V7=1      v7 calculate_bias_correction depthwise 修复
+#   TEFLON_DEBUG_INFO=1  c_args/cpp_args 追加 -g3
+#   ⚠️ TEFLON_DIAG 与 TEFLON_FIX_V7 互斥（改同一函数）。
 
 set -eu
 
@@ -314,8 +320,16 @@ fi
 # ⚠️ 设了 TEFLON_DIAG=1 的产物**只能用于诊断，不可交付**（会改变越界处行为）。
 #
 # 用法：TEFLON_DIAG=1 TEFLON_DEBUG_INFO=1 ./build-teflon.sh
+# 诊断补丁与修复补丁改的是**同一个函数**，因此互斥：
+#    诊断补丁会先插入诊断块（改动函数体），修复补丁要求原文精确匹配，
+#    两个一起开会以「匹配到 0 处」失败。所以这里硬拦。
+if [ "${TEFLON_DIAG:-0}" = "1" ] && [ "${TEFLON_FIX_V7:-0}" = "1" ]; then
+	echo "ERROR: TEFLON_DIAG 与 TEFLON_FIX_V7 互斥，只能二选一"
+	exit 1
+fi
+
 if [ "${TEFLON_DIAG:-0}" = "1" ]; then
-	echo "==> [3d/6] 打【诊断】越界取证补丁（⚠️ 该产物不可交付）"
+	echo "==> [3d/6] 打【诊断】越界取证补丁（该产物不可交付）"
 	PATCHER3="$SCRIPT_DIR/patch-etnaviv-diag-bias.py"
 	ML7="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
 	if [ ! -f "$PATCHER3" ]; then
@@ -332,6 +346,41 @@ if [ "${TEFLON_DIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3d/6] 诊断补丁：默认关闭（设 TEFLON_DIAG=1 启用）"
+fi
+
+# ---------------------------------------------------------------- #
+# 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
+# ---------------------------------------------------------------- #
+# 上游 Mesa 缺陷（已静态证明，见 verify/reports/05 与 06）：
+#   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 用 operation->input_channels
+#   决定扫描长度，**没有 depthwise 特判**；而同仓库的 calc_weight_quant /
+#   requantize_weights / v8 版同名函数**都有**。
+#   深度卷积权重形状是 [1,kh,kw,out_c]，每输出通道只有 W*H*1 个权重，
+#   于是 v7 按 W*H*in_c 扫描并以此步长 → 第 2 个输出通道起越界 → SIGSEGV，
+#   撞到哪页取决于堆布局（表现为非确定性）。
+# 本补丁把 v8 的特判逻辑 backport 到 v7，并打印 buggy_bound/fixed_bound 取证。
+#
+# ⚠️ 默认关闭：不设 TEFLON_FIX_V7 时本步整段跳过，构建流程与产物完全不变。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 ./build-teflon.sh
+if [ "${TEFLON_FIX_V7:-0}" = "1" ]; then
+	echo "==> [3e/6] 打【修复】v7 calculate_bias_correction depthwise 特判"
+	PATCHER4="$SCRIPT_DIR/patch-etnaviv-v7-biasfix.py"
+	ML7B="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER4" ]; then
+		echo "ERROR: 设了 TEFLON_FIX_V7=1 却缺 $PATCHER4"
+		exit 1
+	fi
+	if [ ! -f "$ML7B" ]; then
+		echo "ERROR: 找不到 $ML7B"
+		exit 1
+	fi
+	python3 "$PATCHER4" "$ML7B" || {
+		echo "ERROR: 修复补丁应用失败 —— 不要跳过（上游若已修请直接升级 Mesa）"
+		exit 1
+	}
+else
+	echo "==> [3e/6] v7 修复补丁：默认关闭（设 TEFLON_FIX_V7=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
@@ -473,15 +522,14 @@ EXTRA_LINK="${EXTRA_LINK:+, $EXTRA_LINK}"
 #
 # 注意：heredoc 内不能出现未转义的 $ORIGIN，否则 set -u 会直接报错。
 
+# ⚠️ 下面的 shell 控制流**必须在 heredoc 之外**。
+#    （踩过的坑：曾把 DBG_ARGS 的 if/else/fi 写在 `cat > cross.ini <<EOF … EOF` 内部，
+#      结果 shell 的 else/fi 被当成 cross.ini 的内容写进文件，
+#      meson 报 "Malformed machine file: [line 28]: 'else'"，
+#      而 ninja 那步的失败又被管道/|| 掩盖，整体看起来还是 success ——
+#      会拿着一个 cross.ini 损坏的产物上机，得到零信息。）
 # TEFLON_DEBUG_INFO=1 时追加 -g3（带调试信息，供 addr2line 定位源码行）。
-# 默认不带，保持干净产物体积；诊断构建建议与 TEFLON_DIAG=1 一起用。
-#
-# ⚠️ 这段 shell 逻辑**必须放在 heredoc 之前**。
-# 之前误写在 `cat > cross.ini <<EOF ... EOF` 内部，导致
-#   - shell 的 if/else/fi 被当成 cross.ini 的内容写进文件
-#   - meson 报 "Malformed machine file: [line 28]: 'else\n'"
-#   - 而 ninja 那步的失败被管道掩盖，构建"看似成功"
-#   （CI run 39036750234 实测）
+# 默认不带，保持干净产物体积；修复/诊断构建建议与 TEFLON_FIX_V7=1 一起用。
 DBG_ARGS=""
 if [ "${TEFLON_DEBUG_INFO:-0}" = "1" ]; then
 	DBG_ARGS="-g3"
@@ -512,6 +560,7 @@ needs_exe_wrapper = true
 # 数组必须写成**单行**：meson 1.11 的 machine file 解析器不接受
 # 跨行数组（会在 ']' 处报 Malformed machine file）。
 # ${VAR:+...} 保证空值不产生多余空格/空元素（apt 模式无 multiarch 路径）。
+# DBG_ARGS 的赋值与 echo 已挪到 heredoc 之外（见上方注释里的踩坑记录）。
 c_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
 cpp_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
 c_link_args = ['--sysroot=$SR', '-Wl,-rpath-link,$SR_LIB', '-Wl,--enable-new-dtags,-rpath,\$ORIGIN'$EXTRA_LINK]
