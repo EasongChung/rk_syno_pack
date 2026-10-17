@@ -39,6 +39,8 @@ import sys as _sys
 
 CODE_PAD = 34
 CODE_PADV2 = 60
+# TFLite root table 的 file_identifier，固定在 buffer 的 [4:8]
+FILE_IDENTIFIER = b'TFL3'
 
 
 def load_model_obj(raw):
@@ -175,6 +177,20 @@ def _revalidate(buf):
     很后面才炸，且报错位置与真正的错因无关。这里在落盘前就地拦截。
     """
     import tflite as T
+    # 先查 file_identifier：这是内核加载时第一个检查项，也是最容易在
+    # 重新 Pack 时丢失的东西（CI run 38994082814 实测踩过）。
+    if len(buf) < 8:
+        raise RuntimeError('revalidate: buffer too short (%d B) to carry '
+                           'file_identifier' % len(buf))
+    got_id = bytes(buf[4:8])
+    if got_id != FILE_IDENTIFIER:
+        raise RuntimeError(
+            'revalidate: file_identifier at [4:8] is %r, expected %r '
+            '(TFLite kernel would reject: "Model provided has model '
+            'identifier ... (expected \'TFL3\')")'
+            % (got_id, FILE_IDENTIFIER))
+    print('REVALIDATE: file_identifier=%r OK' % got_id, flush=True)
+
     try:
         mo = T.Model.GetRootAsModel(buf, 0)
         n_ops = mo.Subgraphs(0).OperatorsLength()
@@ -332,12 +348,22 @@ def rewrite(src, dst, dry_run=False):
     # 故这里显式 Finish 一次（幂等：已 finished 时 no-op），
     # 再用 Output() 取字节。这样不依赖版本差异。
     packed_root = model.Pack(builder)
+    # TFLite 的 root table 带 4 字节 file_identifier "TFL3"，位于
+    # buffer 的 [4:8]。不带它，内核会以
+    #   "Model provided has model identifier '...' (expected 'TFL3')"
+    # 拒绝加载（CI run 38994082814 实测）。
+    # 本地实证：Finish(root) -> [4:8]=b'\x08\x00\x0c\x00'（错）；
+    #           Finish(root, b'TFL3') -> [4:8]=b'TFL3'（对，多 4 字节）。
     try:
+        builder.Finish(packed_root, file_identifier=FILE_IDENTIFIER)
+    except TypeError:
+        # 老版 flatbuffers 的 Finish 只接受 rootTable，无 identifier 参数。
+        # 那种情况下无法补写标识，只能靠 _revalidate 拦下并明确报错。
         builder.Finish(packed_root)
-    except Exception as e:
-        # 已 Finish 过或签名不同：不致命，Output() 仍可能可用
-        print('  Finish(%s) raised %s (continuing)' % (packed_root, e),
-              flush=True)
+        raise RuntimeError(
+            'flatbuffers.Builder.Finish does not accept file_identifier; '
+            'TFLite requires %r at buffer[4:8]. Upgrade flatbuffers.'
+            % FILE_IDENTIFIER)
     out = bytes(builder.Output())
     if not out:
         raise RuntimeError('Pack(builder) produced an empty buffer')
