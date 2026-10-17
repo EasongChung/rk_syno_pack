@@ -303,6 +303,38 @@ else
 fi
 
 # ---------------------------------------------------------------- #
+# 3d. 【诊断专用】calculate_bias_correction 越界取证补丁
+# ---------------------------------------------------------------- #
+# 崩溃定位：PrepareDelegate 阶段 SIGSEGV，故障地址落在
+#   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 里逐字节读 weights[i]，
+#   越界条件 = 循环界(w*h*input_channels) > weight_tensor 实际分配字节数。
+# 本补丁上机打印尺寸/指针，并在预测到越界时钳住循环（让进程不崩，把后续问题也暴露）。
+#
+# ⚠️ 默认关闭：不设 TEFLON_DIAG 时本步整段跳过，**构建流程与产物完全不变**。
+# ⚠️ 设了 TEFLON_DIAG=1 的产物**只能用于诊断，不可交付**（会改变越界处行为）。
+#
+# 用法：TEFLON_DIAG=1 TEFLON_DEBUG_INFO=1 ./build-teflon.sh
+if [ "${TEFLON_DIAG:-0}" = "1" ]; then
+	echo "==> [3d/6] 打【诊断】越界取证补丁（⚠️ 该产物不可交付）"
+	PATCHER3="$SCRIPT_DIR/patch-etnaviv-diag-bias.py"
+	ML7="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER3" ]; then
+		echo "ERROR: 设了 TEFLON_DIAG=1 却缺 $PATCHER3"
+		exit 1
+	fi
+	if [ ! -f "$ML7" ]; then
+		echo "ERROR: 找不到 $ML7 —— Mesa 版本结构不同，诊断补丁无法定位目标"
+		exit 1
+	fi
+	python3 "$PATCHER3" "$ML7" || {
+		echo "ERROR: 诊断补丁应用失败 —— 诊断构建无意义，中止"
+		exit 1
+	}
+else
+	echo "==> [3d/6] 诊断补丁：默认关闭（设 TEFLON_DIAG=1 启用）"
+fi
+
+# ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #
 echo "==> [4/6] 生成 meson cross file"
@@ -463,8 +495,17 @@ needs_exe_wrapper = true
 # 数组必须写成**单行**：meson 1.11 的 machine file 解析器不接受
 # 跨行数组（会在 ']' 处报 Malformed machine file）。
 # ${VAR:+...} 保证空值不产生多余空格/空元素（apt 模式无 multiarch 路径）。
-c_args = ['--sysroot=$SR', ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
-cpp_args = ['--sysroot=$SR', ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
+# TEFLON_DEBUG_INFO=1 时追加 -g3（带调试信息，供 addr2line 定位源码行）。
+# 默认不带，保持干净产物体积；诊断构建建议与 TEFLON_DIAG=1 一起用。
+DBG_ARGS=""
+if [ "${TEFLON_DEBUG_INFO:-0}" = "1" ]; then
+	DBG_ARGS="-g3"
+	echo "    调试信息：开启（-g3）"
+else
+	echo "    调试信息：关闭（干净产物）"
+fi
+c_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
+cpp_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ${SR_INC_MULTI:+'-isystem', '$SR_INC_MULTI',} ${SR_INC_LIBDRM:+'-isystem', '$SR_INC_LIBDRM',} '-isystem', '$SR_INC', '-B', '$SR_LIB/', '-L', '$SR_LIB']
 c_link_args = ['--sysroot=$SR', '-Wl,-rpath-link,$SR_LIB', '-Wl,--enable-new-dtags,-rpath,\$ORIGIN'$EXTRA_LINK]
 cpp_link_args = ['--sysroot=$SR', '-Wl,-rpath-link,$SR_LIB', '-Wl,--enable-new-dtags,-rpath,\$ORIGIN'$EXTRA_LINK]
 EOF

@@ -1,0 +1,264 @@
+name: build-teflon-diag
+
+# 【诊断专用】交叉编译带越界取证补丁的 libteflon.so (aarch64 / glibc)
+#
+# ⚠️⚠️ 本 workflow 产出的 .so **绝不可交付/部署**：
+#   它给 etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 注入了钳界代码，
+#   越界时的行为被改变（数值与正常构建不同）。唯一用途是**真机取证**。
+#
+# 与生产构建的分工（必须保持分离，避免拿错产物）：
+#   build-teflon.yml       -> artifact `libteflon-aarch64-glibc`（生产，干净）
+#   build-teflon-diag.yml  -> artifact `libteflon-diag`           （诊断，带 -g3）
+#
+# 两个开关（默认关闭，只有本 workflow 打开）：
+#   TEFLON_DIAG=1        -> 打 patch-etnaviv-diag-bias.py（打印尺寸/指针 + 钳住越界）
+#   TEFLON_DEBUG_INFO=1  -> cross file 的 c_args/cpp_args 追加 -g3（供 addr2line）
+#
+# 本文件是 build-teflon.yml 的**复制**，不改动生产 workflow。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_tag:
+        description: 'Mesa tag（需带 vendored TFLite 头，最低 24.1.0）'
+        required: false
+        default: 'mesa-26.2.5'
+  push:
+    paths:
+      - '.github/workflows/build-teflon-diag.yml'
+      - 'oes-teflon/build-recipe/build-teflon.sh'
+      - 'oes-teflon/build-recipe/patch-etnaviv-diag-bias.py'
+    branches: [ main ]
+
+env:
+  # 必须在 workflow 级：Collect artifact 步骤也要读它，否则会写出假标签。
+  MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
+  # 诊断开关（全流程生效）
+  TEFLON_DIAG: '1'
+  TEFLON_DEBUG_INFO: '1'
+
+jobs:
+  build:
+    name: build libteflon.so DIAG (aarch64-glibc, NOT deliverable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps (amd64 only)
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            pkg-config \
+            meson ninja-build \
+            python3 python3-pip \
+            python3-mako python3-yaml \
+            bison flex \
+            patchelf \
+            ca-certificates curl wget git binutils
+
+      - name: Install meson >= 1.4 (Mesa 26.x requirement)
+        run: |
+          set -eux
+          python3 -m pip install --user --break-system-packages "meson>=1.4"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          meson --version
+
+      - name: Install pycparser
+        run: python3 -m pip install --break-system-packages "pycparser>=2.20"
+
+      - name: Verify toolchain
+        run: |
+          set -eux
+          aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-gcc -dumpmachine
+          meson --version
+          ninja --version
+          python3 -c "import mako, yaml, pycparser; print('python deps OK')"
+
+      # 预检：诊断补丁脚本的三种行为（正常/防重入/锚点缺失）必须全部符合预期。
+      # 这一层用伪造的 C 片段，不依赖 Mesa 源码，失败立刻可见。
+      - name: Preflight - diagnostic patcher self-test
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import os, shutil, subprocess, sys, tempfile
+          P = 'oes-teflon/build-recipe/patch-etnaviv-diag-bias.py'
+          GOOD = (
+              'static int32_t\n'
+              'calculate_bias_correction(struct etna_operation *operation)\n'
+              '{\n'
+              '   const uint8_t *weights = (const uint8_t *)operation->weight_tensor;\n'
+              '\n'
+              '   int32_t correction = 0;\n'
+              '   for (unsigned i = 0; i < 1; i++)\n'
+              '      correction += 1;\n'
+              '   return correction;\n'
+              '}\n')
+          BAD = ('static int32_t\ncalculate_bias_correction(struct op *o)\n{\n'
+                 '   int32_t c = 0;\n   return c;\n}\n')
+          tmp = tempfile.mkdtemp()
+          try:
+              p = os.path.join(tmp, 'good.c')
+              open(p, 'w').write(GOOD)
+              r = subprocess.run([sys.executable, P, p], capture_output=True, text=True)
+              assert r.returncode == 0, 'inject failed: %s' % (r.stdout + r.stderr)
+              body = open(p).read()
+              assert 'och patch: bias-correction diagnostics' in body
+              assert 'OOB PREDICTED' in body
+              assert 'int32_t correction = 0;' in body
+              assert '%%u' not in body, 'double-percent left in C string'
+              r2 = subprocess.run([sys.executable, P, p], capture_output=True, text=True)
+              assert r2.returncode == 1, 're-apply not rejected'
+              b = os.path.join(tmp, 'bad.c')
+              open(b, 'w').write(BAD)
+              r3 = subprocess.run([sys.executable, P, b], capture_output=True, text=True)
+              assert r3.returncode == 1, 'missing anchor not rejected'
+              print('PATCHER SELFTEST OK (inject / re-apply / anchor-miss)')
+          finally:
+              shutil.rmtree(tmp, ignore_errors=True)
+          PY
+
+      - name: Build libteflon.so (DIAG)
+        run: |
+          set -eux
+          chmod +x oes-teflon/build-recipe/build-teflon.sh
+          ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
+            | tee "$RUNNER_TEMP/build-diag.log"
+
+      # 硬门：三个开关生效证据必须出现，否则说明补丁/开关没真正起作用。
+      - name: Assert DIAG switches actually took effect
+        run: |
+          set -eux
+          L="$RUNNER_TEMP/build-diag.log"
+          for pat in '调试信息：开启（-g3）' \
+                     '[och-diag] 已注入诊断' \
+                     '[3d/6] 打【诊断】越界取证补丁'; do
+            if grep -qF "$pat" "$L"; then
+              echo "  OK: $pat"
+            else
+              echo "  ERROR: 构建日志里缺少「$pat」—— 诊断开关未生效"
+              echo "  ---- 相关日志片段 ----"
+              grep -nE '3d/6|och-diag|调试信息|TEFLON_DIAG' "$L" || true
+              exit 1
+            fi
+          done
+
+      - name: Build device-side dlopen tester
+        run: |
+          set -eux
+          SR="$RUNNER_TEMP/teflon-build/sysroot"
+          aarch64-linux-gnu-gcc -O2 --sysroot="$SR" \
+            -isystem "$SR/usr/include/aarch64-linux-gnu" \
+            -isystem "$SR/usr/include" \
+            -B "$SR/usr/lib/aarch64-linux-gnu/" \
+            -L "$SR/usr/lib/aarch64-linux-gnu" \
+            -o "$RUNNER_TEMP/teflon_dlopen" \
+            oes-teflon/verify/teflon_dlopen.c \
+            "$SR/lib/aarch64-linux-gnu/libdl.so.2" \
+            "$SR/lib/aarch64-linux-gnu/libc.so.6"
+          readelf -h "$RUNNER_TEMP/teflon_dlopen" | grep Machine
+
+      - name: Verify artifact + debug sections
+        run: |
+          set -eux
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          test -f "$SO"
+          echo "=== ELF header ==="
+          readelf -h "$SO" | grep -E 'Class|Type|Machine'
+          echo "=== NEEDED ==="
+          readelf -d "$SO" | grep NEEDED || true
+          readelf -d "$SO" | grep -q musl && { echo "ERROR: 有 musl 依赖"; exit 1; } || true
+          echo "=== RUNPATH ==="
+          readelf -d "$SO" | grep -E 'RUNPATH|RPATH' || true
+          echo "=== delegate ABI ==="
+          readelf -sW "$SO" | grep -E 'tflite_plugin_(create|destroy)_delegate'
+          echo "=== .debug_* sections（TEFLON_DEBUG_INFO=1 的证据）==="
+          if readelf -S "$SO" | grep -q '\.debug_'; then
+            readelf -S "$SO" | grep -oE '\.debug_[a-z_]+' | sort -u
+            echo "DEBUG-SECTIONS: PRESENT"
+          else
+            echo "DEBUG-SECTIONS: ABSENT"
+            echo "WARNING: -g3 未生效（strip 会移除调试段——本步骤在 strip 之前看，
+            若仍无则说明 c_args 没带上）"
+          fi
+          echo "=== 诊断字符串是否编进二进制（钳界提示语）==="
+          if strings -a "$SO" | grep -q 'OOB PREDICTED'; then
+            echo "STRING-CHECK: 'OOB PREDICTED' present in .so  <- 诊断代码已编入"
+          else
+            echo "STRING-CHECK: 'OOB PREDICTED' ABSENT in .so"
+            echo "ERROR: 诊断代码没有进入二进制，取证会一无所获"
+            exit 1
+          fi
+
+      - name: Glibc symbol ceiling check (device = 2.36)
+        run: |
+          set -eu
+          CEIL=36
+          fail=0
+          for f in "$RUNNER_TEMP/teflon-build/out/libteflon.so" \
+                   "$RUNNER_TEMP/teflon-build/out/libdrm.so.2" \
+                   "$RUNNER_TEMP/teflon_dlopen"; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            max=$(readelf -V "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' \
+                  | sort -uV | tail -1 | cut -d. -f2)
+            echo "  $name: 最高 GLIBC_2.${max:-?}  (上限 2.$CEIL)"
+            if [ -n "$max" ] && [ "$max" -gt "$CEIL" ]; then
+              echo "  ERROR: $name 使用 GLIBC_2.$max > 设备 2.$CEIL"
+              fail=1
+            fi
+            if readelf -sW "$f" 2>/dev/null | grep -q "__isoc23"; then
+              echo "  ERROR: $name 引用了 __isoc23_*（需 GLIBC_2.38+）"
+              fail=1
+            fi
+          done
+          [ $fail -eq 0 ] || exit 1
+          echo "OK: 全部产物符号版本 <= 设备 glibc 2.36"
+
+      - name: Collect artifact (DIAG)
+        run: |
+          set -eux
+          OUT="$RUNNER_TEMP/teflon-build/out"
+          mkdir -p artifact
+          cp "$OUT/libteflon.so" artifact/
+          [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
+            || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
+          cp "$RUNNER_TEMP/teflon_dlopen" artifact/
+          cp "$RUNNER_TEMP/build-diag.log" artifact/build-diag.log
+          {
+            echo "########## DIAGNOSTIC BUILD - DO NOT DEPLOY ##########"
+            echo "purpose=locate OOB in calculate_bias_correction() (etnaviv_ml_nn_v7.c:109)"
+            echo "TEFLON_DIAG=1 (patch-etnaviv-diag-bias.py applied)"
+            echo "TEFLON_DEBUG_INFO=1 (-g3)"
+            echo "warning=the patched build CLAMPS the out-of-bounds loop; numerics differ"
+            echo "mesa_tag_env=${MESA_TAG:-mesa-26.2.5}"
+            BIN_TAG="$(strings -a "$OUT/libteflon.so" \
+              | grep -oE '2[0-9]\.[0-9]+\.[0-9]+ \(git-[0-9a-f]+\)' \
+              | head -1 | sed 's/ (git-/mesa-/; s/)$/-git/' || true)"
+            echo "mesa_tag_binary=${BIN_TAG:-unknown-in-binary}"
+            echo "target=aarch64 / glibc 2.31 sysroot (Debian bullseye)"
+            echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
+            echo "device=Synology DSM 7.4.1-90080 / glibc 2.36 / A311D NPU"
+            echo "build_date=$(date -u +%FT%TZ)"
+          } > artifact/BUILD-INFO.txt
+          cat artifact/BUILD-INFO.txt
+          ( cd artifact && sha256sum libteflon.so libdrm.so.2 teflon_dlopen > SHA256SUMS )
+          cat artifact/SHA256SUMS
+          echo "=== size ==="
+          ls -l artifact/libteflon.so
+
+      - name: Upload artifact (DIAG)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libteflon-diag
+          path: artifact/
+          retention-days: 14
+          if-no-files-found: error
