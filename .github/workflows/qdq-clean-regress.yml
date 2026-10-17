@@ -381,6 +381,41 @@ jobs:
           fi
           echo "regress ran on $n candidate(s)"
 
+      # ★ 输入敏感性门（och 第19轮新增的**阻塞性**判据）
+      #
+      # 为什么必须有：concept_int8_tf.tflite 通过了全部既有检查
+      # （真 INT8 / dtype 直方图干净 / 量化 94.1% / 无 float32 假绿），
+      # **但它对任何输入都输出同一个常量**（och 真机 4 输入 1 哈希）。
+      # ⇒ dtype 检查不足以判定模型可用，必须直接验证输出随输入变化。
+      #
+      # 放在 regress 之后：regress 的数值先拿到，本门只负责判"能不能用"。
+      # 逐模型给判定（不隐藏任何一个），最后统一阻塞。
+      - name: Input-sensitivity gate on all candidates (BLOCKING)
+        if: always()
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in out/*.tflite; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f" .tflite)
+            case "$b" in
+              baseline_float_*) continue ;;   # float 对照不算候选
+            esac
+            echo "=== SENS $b ==="
+            if python tools/oes/input_sensitivity.py --model "$f"; then
+              echo "SENS $b: PASS"
+            else
+              echo "SENS $b: FAIL (constant output / input-insensitive)"
+              fail=$((fail+1))
+            fi
+          done
+          echo "SENS TOTAL FAILURES: $fail"
+          if [ "$fail" -gt 0 ]; then
+            echo "GATE ABORT: $fail candidate(s) ignore their input."
+            echo "These must NOT be delivered or deployed."
+            exit 9
+          fi
+
       - name: Diagnose QDQ->TFLite quantization loss
         if: always()
         run: |
