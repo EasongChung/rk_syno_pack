@@ -43,6 +43,13 @@ def fnv1a64(b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', required=True)
+    ap.add_argument('--ref', default='tools/oes/models/model_float16.tflite',
+                    help='float 参照模型；pass 空字符串则跳过')
+    ap.add_argument('--eval-dir', default='eval')
+    ap.add_argument('--n', type=int, default=50,
+                    help='与 float 参照比对的图数')
+    ap.add_argument('--min-cos', type=float, default=0.95)
+    ap.add_argument('--min-top1', type=float, default=0.90)
     ap.add_argument('--verbose', action='store_true')
     args = ap.parse_args()
 
@@ -115,6 +122,50 @@ def main():
                     print('     collide 0x%016x: %s' % (v, ks))
         return 5
     print('  => VERDICT: PASS - output responds to input.')
+    return _ref_check(args, it)
+
+
+def _ref_check(args, it):
+    """与 float 参照逐图比对（och 第20轮要求：这才是**充分**判据）。
+
+    为什么不能只靠「饱和率」判死：
+    本模型输出层 scale=0.00390625 / zp=-128，而 float 输出 max 仅 0.3157、
+    mean 0.0017 —— **绝大多数真值远小于半个 scale**，量化后必然舍入到
+    -128。所以「输出饱和率高」本身**不能**证明模型坏了；真正的失败信号是
+    top1 不一致 + 同图 cos 低。饱和率只作为诊断打印，不作硬阈值。
+    """
+    import glob
+    if not args.ref:
+        print('  (no --ref given; float-reference check skipped)')
+        return 0
+
+    files = sorted(glob.glob(os.path.join(args.eval_dir, '*')))
+    files = [f for f in files
+             if f.lower().endswith(('.jpg', '.jpeg', '.png'))][:args.n]
+    if not files:
+        print('  !! no eval images under %s' % args.eval_dir)
+        return 5
+
+    import regress as R
+    rit = R.load_interp(args.ref)
+    cos_list, agree = [], 0
+    print()
+    print('  --- vs float reference (%d imgs) ---' % len(files))
+    for fp in files:
+        b = open(fp, 'rb').read()
+        rv = R.run_once(rit, b)
+        qv = R.run_once(it, b)
+        cos_list.append(R.cos(rv, qv))
+        if R.topk(rv, 1)[0] == R.topk(qv, 1)[0]:
+            agree += 1
+    m = sum(cos_list) / len(cos_list)
+    t1 = float(agree) / len(files)
+    print('  cos_mean=%.4f  top1=%.4f  n=%d' % (m, t1, len(files)))
+    if m < args.min_cos or t1 < args.min_top1:
+        print('  => VERDICT: FAIL vs float reference '
+              '(need cos>=%.2f top1>=%.2f)' % (args.min_cos, args.min_top1))
+        return 5
+    print('  => VERDICT: PASS vs float reference')
     return 0
 
 

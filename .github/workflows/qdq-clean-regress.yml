@@ -353,6 +353,7 @@ jobs:
         run: |
           set -euo pipefail
           n=0
+          err=0
           for f in out/*.tflite; do
             [ -e "$f" ] || continue
             b=$(basename "$f" .tflite)
@@ -364,14 +365,27 @@ jobs:
                   --ref tools/oes/models/model_float16.tflite \
                   --quant "$f" --eval-dir eval --topk 1,5 \
                   --out "out/report_${b}.json" \
-                  || echo "REGRESS ${b}: exit=$? (baseline, expected float)"
+                  && true
+                rc=$?
+                [ "$rc" -eq 3 ] || { echo "REGRESS ERR ${b}: rc=$rc"; \
+                                     err=$((err+1)); }
                 ;;
               *)
                 python tools/oes/regress.py \
                   --ref tools/oes/models/model_float16.tflite \
                   --quant "$f" --eval-dir eval --topk 1,5 \
-                  --require-int8 --out "out/report_${b}.json" \
-                  || echo "REGRESS ${b}: exit=$? (report kept)"
+                  --require-int8 --out "out/report_${b}.json"
+                rc=$?
+                # exit 3 = 门限 MISS（可接受，报告已落盘）
+                # 其它非零 = **错误**（如 NameError / 加载失败）——必须红。
+                # 教训：run 39004180722 因 regress.py 的 NameError 而全部
+                # 失败，却因 `|| echo` 让步骤报 success，掩盖了一整轮。
+                if [ "$rc" -eq 3 ]; then
+                  echo "REGRESS ${b}: gate MISS (rc=3, expected)"
+                elif [ "$rc" -ne 0 ]; then
+                  echo "REGRESS ${b}: ERROR rc=$rc"
+                  err=$((err+1))
+                fi
                 ;;
             esac
             n=$((n+1))
@@ -379,7 +393,11 @@ jobs:
           if [ "$n" -eq 0 ]; then
             echo "GATE ABORT: no tflite candidate produced"; exit 9
           fi
-          echo "regress ran on $n candidate(s)"
+          if [ "$err" -gt 0 ]; then
+            echo "GATE ABORT: $err regress run(s) ERRORED (not merely missed)"
+            exit 9
+          fi
+          echo "regress ran on $n candidate(s), 0 errors"
 
       # ★ 输入敏感性门（och 第19轮新增的**阻塞性**判据）
       #

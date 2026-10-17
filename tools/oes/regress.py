@@ -161,7 +161,7 @@ def run_once(interp, image_bytes):
     if DEBUG['n'] < 2:
         DEBUG['n'] += 1
         print('DBG in: dtype=%s shape=%s quant=%s type=%s' % (
-            inp['dtype'], shape, inp.get('quantization'), type(
+            inp['dtype'], list(inp['shape']), inp.get('quantization'), type(
                 inp.get('quantization'))), flush=True)
         print('DBG in: fed range=[%.1f,%.1f] first8=%s' % (
             float(np.min(t)), float(np.max(t)),
