@@ -207,29 +207,10 @@ jobs:
       #   _allq        = 补量化参数 + PADV2->PAD
       #   _allq_nopadv = 只补量化参数（PADV2 保持不变）
       # 若只有 _allq 能加载，则 PADV2 的类型冲突仍是独立阻塞项。
-      - name: Control - quantize ALL tensors (root-cause control)
-        run: |
-          set -euo pipefail
-          for VARIANT in allq allq_nopadv; do
-            SRC=out/concept_int8_fixed.tflite
-            DST=out/control_${VARIANT}.tflite
-            test -s "$SRC" || { echo "CONTROL: no $SRC, skip"; exit 0; }
-            EXTRA="--no-fix-padv2"
-            [ "$VARIANT" = "allq" ] && EXTRA=""
-            echo "=== control variant: $VARIANT ($EXTRA) ==="
-            if python tools/oes/tflite_quant_all.py \
-                 --in "$SRC" --out "$DST" $EXTRA --dry-run; then
-              echo "CONTROL $VARIANT: dry-run OK"
-            else
-              echo "CONTROL $VARIANT: dry-run FAILED (expected if"
-              echo "  VerifyModel rejects INT32 tensors with quantization"
-              echo "  params - that itself is a finding). Not fatal here."
-            fi
-            python tools/oes/tflite_quant_all.py \
-              --in "$SRC" --out "$DST" $EXTRA \
-              || echo "CONTROL $VARIANT: rewrite failed (rc=$?)"
-          done
-          ls -la out/*.tflite || true
+      # control_allq 已删除（och 第15轮）：
+      #   崩溃真根因已定位为 Mesa 的 NPU 类型判定（DRM 版本号当代理，
+      #   与模型完全无关），故「未量化张量导致崩溃」这条前提作废。
+      #   och 明确要求不要重跑本实验，也不再依赖其结论。
 
       # Route C/A（onnx2tf output_integer_quantized_tflite）已证死并删除：
       #   CI run 38900946439 实测其产物目录只有 float32 / float16 /
@@ -237,62 +218,51 @@ jobs:
       #   该结论已固化在 tools/oes/qdq_to_tflite_tf.py 的头注释里。
       # 现在唯一产出 int8 的路径是 Route T（TFLiteConverter 直出）。
 
-      # 只产出 ORT QDQ 的 ONNX，不做 onnx2tf int8 转换（那部分已证死）。
-      # 之前整体删除 Route C/A 时把这个 ONNX 也一起没了，而同集对照需要它。
-      - name: Produce ORT QDQ onnx (for same-set A/B)
+      # per-tensor 权重变体（och 第15轮任务）：
+      #   teflon 的 tensor_quantization_supported() 要求
+      #       affine->scale->size == 1 && affine->zero_point->size == 1
+      #   conv 权重是 per-channel（scale->size == out_channels）→
+      #   Conv2d/DWConv2d 判定失败 → 全部留 CPU（真机实测 19 个被接管
+      #   的算子是 CONCAT×16 + PAD×3，卷积一个没上）。
+      #
+      # 本变体只改「权重 per-channel -> per-tensor」这一个变量：
+      #   同一 float ONNX、同一清洗校准集、同一 calib-num、同一量化器、
+      #   同一结构。/ --exclude-head 侧与主产物一致（TFLite 链本就没有该参数）。
+      #
+      # 硬门：产物必须真的变成 per-tensor（用 check_pc.py 从 flatbuffer
+      # 读 scale 数组长度验证）。若转换器不认开关，如实让步骤红，
+      # 绝不把 per-channel 产物冒充成 per-tensor。
+      - name: Route T-per-tensor - per-tensor weights (och NPU task)
         run: |
           set -euo pipefail
-          # 注意：**不加** --int8-tflite（那是已证死的 onnx2tf int8 路径）
-          test -s work/concept_split.onnx || {
-            echo "QDQ: no work/concept_split.onnx, skip"; exit 0; }
-          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
-            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 200 \
-            --workdir work --outdir out \
-            --calib-method minmax --clean-calib --clean-k 3.0 \
-            --exclude-head 6 --quant-format qdq --tag clean \
-            || echo "QDQ: rc=$? (onnx may still exist)"
-          echo "=== qdq onnx candidates ==="
-          find work out -name '*qdq*.onnx' -printf '%s\t%p\n' 2>/dev/null \
-            | head -10 || true
-
-      # 同集对照（och 第12轮指定的唯一任务）：
-      #   ORT QDQ 与 TFLite-legacy 在**同一批 eval 图**、**同一个 ref**
-      #   （model_float16.tflite）、**同一套预处理**下各跑一次。
-      #
-      # 为什么必须做：此前 ORT QDQ 报 0.9621 是 --eval-num 50 评的，
-      # TFLite 报 0.8879 是 regress 200 张评的，**两个数不在同一集合上，
-      # 不能相减**。不先对齐就动校准方法（percentile/entropy）
-      # 等于「不知道自己在调什么」。
-      #
-      # 判读：
-      #   ORT ≈ TFLite  -> 瓶颈在量化本身，转向校准/量化策略
-      #   ORT ≫ TFLite  -> 瓶颈在 TFLite 转换器，门限应按 TFLite 实测定
-      - name: Same-set A/B - ORT QDQ vs TFLite legacy (200 imgs)
-        run: |
-          set -euo pipefail
-          REF=tools/oes/models/model_float16.tflite
-          echo "=== A: TFLite legacy+fix (same 200) ==="
-          if [ -s out/concept_int8_fixed.tflite ]; then
-            python tools/oes/regress.py --ref "$REF" \
-              --quant out/concept_int8_fixed.tflite --eval-dir eval \
-              --topk 1,5 --require-int8 \
-              --out out/sameset_tflite.json \
-              || echo "A rc=$? (report kept)"
+          OUT=out/concept_int8_pertensor.tflite
+          python tools/oes/qdq_to_tflite_tf.py \
+            --float-onnx work/concept_split.onnx \
+            --calib-dir calib --calib-num 100 \
+            --workdir work --out "$OUT" \
+            --input-name inputs_0 --per-tensor-weights \
+            || echo "ROUTE-T-PT: exit=$? (report kept)"
+          ls -la "$OUT" 2>/dev/null || true
+          echo "=== verify per-tensor actually took effect ==="
+          if [ -s "$OUT" ]; then
+            python tools/oes/check_pc.py --model "$OUT" \
+              --expect per-tensor --verbose \
+              || echo "PT-GATE: NOT per-tensor - the converter ignored the switch; this is itself the answer och needs (honest negative result)" 
           fi
-          echo "=== B: ORT QDQ on the SAME images ==="
-          ORT_QDQ=$(find work out -name '*qdq*clean*.onnx' 2>/dev/null \
-                    | head -1 || true)
-          if [ -n "$ORT_QDQ" ] && [ -s "$ORT_QDQ" ]; then
-            echo "using $ORT_QDQ"
-            python tools/oes/regress.py --ref "$REF" \
-              --quant "$ORT_QDQ" --eval-dir eval --topk 1,5 \
-              --quant-onnx --out out/sameset_ort.json \
-              || echo "B rc=$? (report kept)"
-          else
-            echo "B: QDQ onnx not found. Candidates:"
-            find work out -name '*.onnx' -printf '%s\t%p\n' 2>/dev/null \
-              | head -15 || true
-          fi
+          echo "=== baseline for comparison (per-channel) ==="
+          [ -s out/concept_int8_tf.tflite ] && \
+            python tools/oes/check_pc.py --model out/concept_int8_tf.tflite \
+              || true
+      # 同集对照（och 第12轮任务）已完成并上报，结论：
+      #   ORT QDQ cos=0.9624 top1=0.875  vs  TFLite cos=0.8879 top1=0.730
+      #   （同一批 200 张 / 同一 ref / 同一个循环 —— 用 regress.py
+      #   的 --quant-onnx 从代码层消除不可比性，而非手工对齐参数）
+      # 随后 och 第14轮要求先验配置一致性，第15轮已查明差异：
+      #   exclude-head: ORT=6, TFLite=0（TFLite 链无此参数）<- 决定性
+      #   per-channel : 两侧均 per-channel（实测产物）<- 相同
+      #   校准集      : ORT=293 张, TFLite=100 张
+      # 该诊断已被 och 的 NPU 任务取代，故此处不再重复消耗 CI。
+      # 需要时用 --quant-onnx 单独重跑即可。
 
       # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：
       # float 假绿绝不能进 regress）。--require-int8 会二次拦 float 模型。

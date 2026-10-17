@@ -41,6 +41,68 @@ import sys as _sys
 
 import numpy as np
 
+def fix_pad_onnx(src, dst):
+    """把 3 输入 Pad（constant_value=0）改写为 2 输入 Pad。
+
+    ## 为什么必须改
+    两种 TFLite 量化器都在 Pad 上崩，但根因同一个：
+
+      MLIR   : constant_values=0 -> 0/0 退化出 scale=1.334441e+36，
+               沿图传染到 relu/Add -> PadV2 -> MaxPool2d（CI run 38940758759
+               实测 6 个退化张量）。
+      Legacy : constant_values 张量保持 FLOAT32，而 input 被量化成 INT8，
+               TFLite 内核直接拒绝 prepare：
+               "pad.cc:230 op_context.input->type !=
+                op_context.constant_values->type (INT8 != FLOAT32)
+                Node number 4 (PADV2) failed to prepare"。
+
+    ONNX 规范里 Pad 的 constant_value 默认为 0，所以 2 输入 Pad 与 3 输入
+    Pad（constant_value=0）语义完全等价；2 输入 Pad 经 onnx2tf 会生成
+    2 输入 TF Pad -> TFLite 的 PAD 算子（而非 PADV2），既没有
+    constant_values 类型冲突，也不给 MLIR 留退化常量。
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    m = onnx.load(src)
+    g = m.graph
+    used = set()
+    for n in g.node:
+        for i in n.input:
+            used.add(i)
+    remap = {}
+    changed = 0
+    for n in g.node:
+        if n.op_type != 'Pad' or len(n.input) != 3:
+            continue
+        cv = n.input[2]
+        # constant_value 必须存在且为 0
+        val = None
+        for init in g.initializer:
+            if init.name == cv:
+                val = numpy_helper.to_array(init)
+                break
+        if val is None or np.any(np.asarray(val) != 0):
+            continue                      # 非 0 不能删，保留 3 输入
+        n.input.remove(cv)
+        if cv not in used:
+            remap[cv] = True
+        changed += 1
+    if not changed:
+        print('fix_pad: no 3-input Pad with constant_value=0 found',
+              flush=True)
+        return 0
+    keep = [i for i in g.initializer
+            if not (i.name in remap and i.name not in used)]
+    del g.initializer[:]
+    g.initializer.extend(keep)
+    onnx.save(m, dst)
+    print('fix_pad: rewrote %d Pad node(s) 3-input -> 2-input (%s)'
+          % (changed, os.path.basename(dst)), flush=True)
+    _sys.stdout.flush()
+    return changed
+
+
 TFL_NAME = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8', 4: 'INT64',
             6: 'BOOL', 7: 'INT16', 9: 'INT8'}
 
@@ -149,6 +211,14 @@ def main():
     ap.add_argument('--clean-k', type=float, default=3.0,
                     help='校准集离群剔除阈值（mag > k * median）')
     ap.add_argument('--int16', action='store_true')
+    ap.add_argument('--per-tensor-weights', action='store_true',
+                    help='把 conv/dwconv/FC 权重从 per-channel 改成 '
+                         'per-tensor。动机：teflon 的 '
+                         'tensor_quantization_supported() 要求 '
+                         'scale->size==1 && zero_point->size==1，'
+                         'per-channel 权重导致 Conv/DWConv 全部留 CPU。'
+                         '本开关只改这一个变量，其余保持不变。'
+                         '注意 per-tensor 通常精度更低，如实报数。')
     ap.add_argument('--old-quantizer', action='store_true',
                     help='退回旧版 TFLite 量化器（experimental_new_quantizer'
                          '=False）。用于验证退化 scale 是否 MLIR 特有：'
@@ -242,11 +312,24 @@ def main():
     # 故走 API 直调，参数用真实签名（已 AST 校验）。
     sm_dir = os.path.join(args.workdir, 'sm_for_tf')
     os.makedirs(sm_dir, exist_ok=True)
+
+    # 先修 Pad（3 输入 -> 2 输入）。见 fix_pad_onnx docstring：
+    # 两种量化器都在 Pad 上崩，MLIR 退化 / Legacy 类型冲突，根因同一。
+    pad_fixed = os.path.join(args.workdir, 'concept_split_padsafe.onnx')
+    print('=== TA3-pre: fixing Pad (3-input -> 2-input) ===', flush=True)
+    try:
+        fix_pad_onnx(args.float_onnx, pad_fixed)
+        src_onnx = pad_fixed
+    except Exception as e:
+        print('fix_pad failed (%s); use original' % str(e)[:120], flush=True)
+        src_onnx = args.float_onnx
+    _sys.stdout.flush()
+
     print('=== TA3a: onnx2tf.convert -> SavedModel (NHWC kept) ===',
           flush=True)
     _sys.stdout.flush()
     try:
-        convert(input_onnx_file_path=args.float_onnx,
+        convert(input_onnx_file_path=src_onnx,
                 output_folder_path=sm_dir,
                 output_signaturedefs=False,
                 non_verbose=True,
@@ -295,6 +378,36 @@ def main():
             print('using LEGACY TFLite quantizer '
                   '(experimental_new_quantizer=False)', flush=True)
         conv.representative_dataset = rep_gen
+        if getattr(args, 'per_tensor_weights', False):
+            # 不凭印象断言开关名字：先列出该 TF 版本里所有相关属性，
+            # 再按优先级尝试设置，并把实际生效的那个名字打出来。
+            # （och 明确要求：以 CI 上的真实行为为准。）
+            cands = [a for a in dir(conv)
+                     if not a.startswith('__')
+                     and ('per_channel' in a.lower()
+                          or 'per_axis' in a.lower()
+                          or 'disable' in a.lower())]
+            print('PER-TENSOR: candidate attrs=%s' % cands, flush=True)
+            applied = None
+            for name in ('_experimental_disable_per_channel',
+                         '_experimental_disable_per_channel_quantization',
+                         'experimental_disable_per_channel'):
+                if hasattr(conv, name):
+                    try:
+                        setattr(conv, name, True)
+                        if getattr(conv, name) is True:
+                            applied = name
+                            break
+                    except Exception as e:                        # noqa: BLE001
+                        print('PER-TENSOR: set %s raised %s'
+                              % (name, str(e)[:80]), flush=True)
+            if applied is None:
+                print('PER-TENSOR: !! NO WORKING SWITCH FOUND in this TF '
+                      'version. The variant will still be produced, but if '
+                      'weights stay per-channel that is a REAL finding, not '
+                      'a silent failure.', flush=True)
+            else:
+                print('PER-TENSOR: applied %s=True' % applied, flush=True)
         if args.int16:
             conv.target_spec.supported_ops = [
                 tf.lite.OpsSet.TFLITE_BUILTINS_INT16]
