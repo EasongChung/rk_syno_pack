@@ -201,11 +201,20 @@ jobs:
           find "$SR" -name '*.a' -not -path '*gcc-cross*' -not -path '*gcc/aarch64*' \
                | head -10 || true
           # 自检：动态 .so 必须还在
-          for so in libdl.so libpthread.so libc.so; do
-            [ -e "$SR/usr/lib/aarch64-linux-gnu/$so" ] \
-              || { echo "ERROR: 误删了 $so"; exit 1; }
+          # ⚠️ 注意：libdl.so 等是指向 /lib/aarch64-linux-gnu/libdl.so.2 的
+          #    **绝对路径软链**，在 amd64 runner 上用 [ -e ] 会去解析宿主路径而
+          #    判定为不存在（上一轮误报「误删了 libdl.so」）。
+          #    所以要分两步查：
+          #      1. [ -L ] 确认软链本身还在
+          #      2. [ -e "$SR/lib/aarch64-linux-gnu/<真实名>" ] 确认 sysroot 内的目标存在
+          for pair in "libdl.so:libdl.so.2" "libpthread.so:libpthread.so.0" "libc.so:libc.so.6"; do
+            link="$SR/usr/lib/aarch64-linux-gnu/${pair%%:*}"
+            real="$SR/lib/aarch64-linux-gnu/${pair##*:}"
+            [ -L "$link" ] || { echo "ERROR: 软链丢失 $link"; exit 1; }
+            [ -e "$real" ] || { echo "ERROR: 目标丢失 $real"; exit 1; }
+            echo "  ✓ ${pair%%:*} → ${pair##*:} 解析正常"
           done
-          echo "  ✓ 动态 .so 均保留"
+          echo "  ✓ 动态 .so 均保留且可解析"
 
           # ---- 3. 宿主运行时库路径（关键）----
           # Debian 交叉 binutils 的 as/ld 是 **宿主 x86_64 程序**，运行时需要
