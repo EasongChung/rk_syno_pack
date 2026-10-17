@@ -67,6 +67,41 @@ def load_interp(path):
         return it
 
 
+def load_onnx(path):
+    """加载 ONNX QDQ 模型，返回 (sess, input_name, output_name)。
+
+    与 TFLite 侧共用同一套预处理、同一个 ref、同一批图，
+    确保「同集对照」是真的对照。
+
+    背景（och 第11轮指出的最大风险）：此前 ORT QDQ 的 0.9621 是
+    `--eval-num 50` 评的，TFLite 的 0.8879 是 regress 200 张评的，
+    **两个数不在同一集合上，不能相减**。本函数让 regress 能直接
+    评 ONNX 侧，从而消除这个不可比性。
+    """
+    import onnxruntime as ort
+    sess = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+    i0 = sess.get_inputs()[0]
+    o0 = sess.get_outputs()[0]
+    print('load_onnx: %s in=%s%s out=%s%s'
+          % (os.path.basename(path), i0.name, i0.shape, o0.name, o0.shape),
+          flush=True)
+    return sess, i0.name, o0.name
+
+
+def run_once_onnx(sess, in_name, out_name, image_bytes):
+    """与 run_once 逐字一致的预处理，只是执行器换成 ORT。"""
+    from PIL import Image
+    import numpy as np
+    shape = sess.get_inputs()[0].shape
+    net = int(shape[2]) if len(shape) == 4 else NET
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB').resize(
+        (net, net), Image.BILINEAR)
+    arr = np.frombuffer(img.tobytes(), dtype=np.uint8)
+    f = ((arr.astype(np.float32) - MEAN) * SCALE).reshape([1, net, net, 3])
+    o = sess.run([out_name], {in_name: f})[0]
+    return o.flatten().astype(float)
+
+
 DEBUG = {'n': 0}
 
 
@@ -181,20 +216,33 @@ def main():
     ap.add_argument('--require-int8', action='store_true',
                     help='quant 侧必须是真 INT8（输入 uint8/int8 且量化张量数>0），'
                          '否则 exit 4。防 float 模型冒充 INT8 过绿门。')
+    ap.add_argument('--quant-onnx', action='store_true',
+                    help='quant 侧是 ONNX QDQ 模型（而非 TFLite）。'
+                         '与 TFLite 侧共用同一 ref / 同一批图 / 同一预处理，'
+                         '用于消除「ORT 用 50 张、TFLite 用 200 张」'
+                         '导致的不可比（och 第11轮）。'
+                         'ONNX 侧不走 --require-int8：那是 TFLite 专有检查。')
     args = ap.parse_args()
+    if args.require_int8 and args.quant_onnx:
+        sys.exit('--require-int8 is TFLite-only; drop it with --quant-onnx')
     if args.require_int8:
         assert_int8(args.quant)
     ks = [int(x) for x in args.topk.split(',')]
     files = sorted(glob.glob(os.path.join(args.eval_dir, '*')))
     files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
     assert files, 'eval empty: %s' % args.eval_dir
-    ri, qi = load_interp(args.ref), load_interp(args.quant)
+    ri = load_interp(args.ref)
+    if args.quant_onnx:
+        sess, in_name, out_name = load_onnx(args.quant)
+    else:
+        qi = load_interp(args.quant)
     agree = {k: 0 for k in ks}
     coss, drifts, fails = [], [], []
     for f in files:
         b = open(f, 'rb').read()
         rv = run_once(ri, b)
-        qv = run_once(qi, b)
+        qv = (run_once_onnx(sess, in_name, out_name, b)
+              if args.quant_onnx else run_once(qi, b))
         assert len(rv) == 335 and len(qv) == 335, 'dims must be 335'
         c = cos(rv, qv)
         coss.append(c)

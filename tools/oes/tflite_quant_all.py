@@ -108,22 +108,34 @@ def _revalidate(buf, expect_padv2=0):
         n_padv2 = sum(1 for i in range(g.OperatorsLength())
                       if codes.get(g.Operators(i).OpcodeIndex()) == CODE_PADV2)
         n_noq = 0
+        bad_zp = []
         for t in range(g.TensorsLength()):
             q = g.Tensors(t).Quantization()
-            if q is None or q.ScaleLength() == 0:
+            ns = 0 if q is None else q.ScaleLength()
+            nz = 0 if q is None else q.ZeroPointLength()
+            if ns == 0:
                 n_noq += 1
+            elif nz == 0:
+                # 内核的真实判据：scale 与 zero_point 必须同时非空。
+                # （run 38995910572 教训：我只查 ScaleLength() 就放行，
+                #  结果内核以 "non-null scale but null zero_point" 拒收。）
+                bad_zp.append(t)
     except Exception as e:
         raise RuntimeError('revalidate: tflite cannot parse buffer: %s'
                            % str(e)[:200])
-    print('REVALIDATE OK: file_id=%r tensors=%d no_quant=%d PADV2=%d'
-          % (got, g.TensorsLength(), n_noq, n_padv2), flush=True)
+    print('REVALIDATE OK: file_id=%r tensors=%d no_scale=%d no_zp=%d PADV2=%d'
+          % (got, g.TensorsLength(), n_noq, len(bad_zp), n_padv2), flush=True)
     if expect_padv2 is not None and n_padv2 != expect_padv2:
         raise RuntimeError('revalidate: PADV2=%d, expected %d'
                            % (n_padv2, expect_padv2))
     if n_noq:
-        raise RuntimeError('revalidate: %d tensor(s) still lack quantization '
-                           'params -> fill_tensor would still segfault'
-                           % n_noq)
+        raise RuntimeError('revalidate: %d tensor(s) still lack scale '
+                           '-> fill_tensor would still segfault' % n_noq)
+    if bad_zp:
+        raise RuntimeError('revalidate: %d tensor(s) have scale but null '
+                           'zero_point -> TFLite rejects ("Quantization '
+                           'parameters has non-null scale but null '
+                           'zero_point"): %s' % (len(bad_zp), bad_zp[:10]))
     return True
 
 
@@ -171,21 +183,33 @@ def rewrite(src, dst, dry_run=False, also_fix_padv2=True):
         raise RuntimeError('schema lacks QuantizationParametersT')
     qattr = _attr(tensors[0], 'quantization', 'quantization')
 
+    # 必须用 numpy 数组而非 python list：flatbuffers 的 CreateNumpyVector
+    # 依赖 dtype，且 TFLite 要求 scale 与 zero_point **同时**非空。
+    # （CI run 38995910572 实测：用 list 写入后 TFLite 报
+    #  "Quantization parameters has non-null scale but null zero_point"
+    #  —— scale 进去了、zero_point 没进去；而我当时的 revalidate 只查了
+    #  ScaleLength()，恰好漏掉了内核真正校验的那一项。）
+    import numpy as np
+    nq_scale = np.array([NEUTRAL_SCALE], dtype=np.float32)
+    nq_zp = np.array([NEUTRAL_ZP], dtype=np.int64)
+
     filled = 0
     for tt in tensors:
         q = getattr(tt, qattr)
-        if q is not None and getattr(q, 'scale', None) is not None \
-                and len(q.scale) > 0:
+        sc = getattr(q, 'scale', None) if q is not None else None
+        zp = getattr(q, 'zero_point', None) if q is not None else None
+        if sc is not None and len(sc) > 0 and zp is not None \
+                and len(zp) > 0:
             continue
         nq = QT()
-        # numpy array 与 python list 都能被 flatbuffers 打包
-        nq.scale = [NEUTRAL_SCALE]
-        nq.zero_point = [NEUTRAL_ZP]
+        nq.scale = nq_scale
+        nq.zero_point = nq_zp
         nq.quantized_dimension = 0
         setattr(tt, qattr, nq)
         filled += 1
-    print('QUANT-PARAM: filled %d tensor(s) with scale=%g zp=%d'
-          % (filled, NEUTRAL_SCALE, NEUTRAL_ZP), flush=True)
+    print('QUANT-PARAM: filled %d tensor(s) with scale=%g zp=%d '
+          '(numpy float32/int64)' % (filled, NEUTRAL_SCALE, NEUTRAL_ZP),
+          flush=True)
     if filled == 0:
         print('WARNING: no tensor needed quantization params -- input model '
               'may already be fully quantized; the control experiment would '

@@ -237,6 +237,63 @@ jobs:
       #   该结论已固化在 tools/oes/qdq_to_tflite_tf.py 的头注释里。
       # 现在唯一产出 int8 的路径是 Route T（TFLiteConverter 直出）。
 
+      # 只产出 ORT QDQ 的 ONNX，不做 onnx2tf int8 转换（那部分已证死）。
+      # 之前整体删除 Route C/A 时把这个 ONNX 也一起没了，而同集对照需要它。
+      - name: Produce ORT QDQ onnx (for same-set A/B)
+        run: |
+          set -euo pipefail
+          # 注意：**不加** --int8-tflite（那是已证死的 onnx2tf int8 路径）
+          test -s work/concept_split.onnx || {
+            echo "QDQ: no work/concept_split.onnx, skip"; exit 0; }
+          python tools/oes/ort_quant.py --onnx work/concept_split.onnx \
+            --calib-dir calib --num-calib 300 --eval-dir eval --eval-num 200 \
+            --workdir work --outdir out \
+            --calib-method minmax --clean-calib --clean-k 3.0 \
+            --exclude-head 6 --quant-format qdq --tag clean \
+            || echo "QDQ: rc=$? (onnx may still exist)"
+          echo "=== qdq onnx candidates ==="
+          find work out -name '*qdq*.onnx' -printf '%s\t%p\n' 2>/dev/null \
+            | head -10 || true
+
+      # 同集对照（och 第12轮指定的唯一任务）：
+      #   ORT QDQ 与 TFLite-legacy 在**同一批 eval 图**、**同一个 ref**
+      #   （model_float16.tflite）、**同一套预处理**下各跑一次。
+      #
+      # 为什么必须做：此前 ORT QDQ 报 0.9621 是 --eval-num 50 评的，
+      # TFLite 报 0.8879 是 regress 200 张评的，**两个数不在同一集合上，
+      # 不能相减**。不先对齐就动校准方法（percentile/entropy）
+      # 等于「不知道自己在调什么」。
+      #
+      # 判读：
+      #   ORT ≈ TFLite  -> 瓶颈在量化本身，转向校准/量化策略
+      #   ORT ≫ TFLite  -> 瓶颈在 TFLite 转换器，门限应按 TFLite 实测定
+      - name: Same-set A/B - ORT QDQ vs TFLite legacy (200 imgs)
+        run: |
+          set -euo pipefail
+          REF=tools/oes/models/model_float16.tflite
+          echo "=== A: TFLite legacy+fix (same 200) ==="
+          if [ -s out/concept_int8_fixed.tflite ]; then
+            python tools/oes/regress.py --ref "$REF" \
+              --quant out/concept_int8_fixed.tflite --eval-dir eval \
+              --topk 1,5 --require-int8 \
+              --out out/sameset_tflite.json \
+              || echo "A rc=$? (report kept)"
+          fi
+          echo "=== B: ORT QDQ on the SAME images ==="
+          ORT_QDQ=$(find work out -name '*qdq*clean*.onnx' 2>/dev/null \
+                    | head -1 || true)
+          if [ -n "$ORT_QDQ" ] && [ -s "$ORT_QDQ" ]; then
+            echo "using $ORT_QDQ"
+            python tools/oes/regress.py --ref "$REF" \
+              --quant "$ORT_QDQ" --eval-dir eval --topk 1,5 \
+              --quant-onnx --out out/sameset_ort.json \
+              || echo "B rc=$? (report kept)"
+          else
+            echo "B: QDQ onnx not found. Candidates:"
+            find work out -name '*.onnx' -printf '%s\t%p\n' 2>/dev/null \
+              | head -15 || true
+          fi
+
       # 对每个产出的 tflite 跑 regress；无产物则硬失败（-oiqt 教训：
       # float 假绿绝不能进 regress）。--require-int8 会二次拦 float 模型。
       # float 基线必须跳过 --require-int8：它是 float 模型，本身就该被拒。
