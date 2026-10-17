@@ -193,7 +193,41 @@ jobs:
           # 解法：把静态归档删掉，sysroot 里只剩动态版本，
           #       任何 -ldl / -lpthread / -lc 都只能解析到 .so。
           # 这些静态库在本项目里没有任何用途（我们只要动态链接 + 静态 libgcc）。
-          for a in libdl libpthread libc libm librt; do
+          # 只删这两个 —— 它们是 undefined reference 的直接来源。
+          # 不删 libc.a / libm.a / librt.a：链 -lm 时若 .so 解析不到，
+          # 静态库还能兜底（上一轮误删 libm.a 导致 cannot find -lm）。
+          # ---- 2a. 把 sysroot 里所有绝对路径软链改写成相对路径（关键）----
+          #
+          # 现象：删掉 libm.a 后报 `ld: cannot find -lm`，但 libm.so 明明在。
+          # 原因：sysroot 里的 .so 是**绝对路径软链**：
+          #     libm.so -> /lib/aarch64-linux-gnu/libm.so.6
+          # **GNU ld 解析绝对路径软链时用的是宿主文件系统根，不是 --sysroot**，
+          # 所以它去找**宿主机**的 /lib/aarch64-linux-gnu/libm.so.6（不存在）
+          # → cannot find -lm。
+          # 这也解释了为什么 libdl/libpthread 之前表现「时好时坏」。
+          #
+          # 解法：把指向 /… 的软链改写成相对于自身所在目录的相对路径，
+          #       这样 ld 顺着 sysroot 内的真实文件走，不再碰宿主根。
+          echo "=== 改写绝对路径软链为相对路径 ==="
+          nfix=0
+          while IFS= read -r l; do
+            tgt=$(readlink "$l")
+            case "$tgt" in
+              /*)
+                dir=$(dirname "$l")
+                new=$(realpath -m -s --relative-to="$dir" "$SR$tgt" 2>/dev/null || true)
+                if [ -n "$new" ] && [ "$new" != "$tgt" ]; then
+                  ln -sfn "$new" "$l"
+                  nfix=$((nfix+1))
+                  echo "  $tgt → $new"
+                fi
+                ;;
+            esac
+          done <<< "$(find "$SR" -type l)"
+          echo "  共改写 $nfix 条"
+
+          # ---- 2b. 删除静态归档（只删引发 undefined reference 的两个）----
+          for a in libdl libpthread; do
             rm -f "$SR/usr/lib/aarch64-linux-gnu/$a.a" \
                   "$SR/lib/aarch64-linux-gnu/$a.a"
           done
