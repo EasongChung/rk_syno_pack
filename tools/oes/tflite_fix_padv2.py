@@ -102,23 +102,44 @@ def rewrite(src, dst, dry_run=False):
     fb, model = load_model_obj(raw)
     sub = model.subgraphs[0]
 
-    # 找到 PAD 的 opcode_index（复用，不新建 code）
+    # TF 的 schema_py_generated 用驼峰字段名（operatorCodes / opcodeIndex /
+    # builtinOptionsType / builtinOptions），不是 snake_case。
+    # 这里做一次自适应，避免再因字段名猜错浪费 CI 轮次。
+    def f(obj, snake, camel):
+        return camel if hasattr(obj, camel) else snake
+
+    codes = getattr(model, f(model, 'operator_codes', 'operatorCodes'))
+    subs = getattr(model, f(model, 'subgraphs', 'subgraphs'))
+    subs = getattr(model, 'subgraphs', None) or subs
+    sub = subs[0]
+    ops = getattr(sub, f(sub, 'operators', 'operators'))
+
+    print('API probe: n_opcodes=%d n_subgraphs=%d n_ops=%d'
+          % (len(codes), len(subs), len(ops)), flush=True)
+    oc0 = codes[0]
+    print('API probe: opcode[0] attrs=%s'
+          % [a for a in dir(oc0) if 'code' in a.lower()][:6], flush=True)
+
+    def eff_code(oc):
+        bc = getattr(oc, f(oc, 'builtin_code', 'builtinCode'))
+        dbc = getattr(oc, f(oc, 'deprecated_builtin_code',
+                             'deprecatedBuiltinCode'))
+        return bc if bc < 127 else dbc
+
+    # 找到 PAD 的 opcode index（复用，不新建 code）
     pad_idx = None
-    for i, oc in enumerate(model.operator_codes):
-        bc = oc.builtin_code
-        eff = bc if bc < 127 else oc.deprecated_builtin_code
-        if eff == CODE_PAD:
+    for i, oc in enumerate(codes):
+        if eff_code(oc) == CODE_PAD:
             pad_idx = i
             break
     if pad_idx is None:
         raise RuntimeError('model has no PAD opcode to reuse')
 
+    oi_attr = f(ops[0], 'opcode_index', 'opcodeIndex')
     targets = []
-    for op in sub.operators:
-        oc = model.operator_codes[op.opcode_index]
-        bc = oc.builtin_code
-        eff = bc if bc < 127 else oc.deprecated_builtin_code
-        if eff != CODE_PADV2:
+    for op in ops:
+        idx = getattr(op, oi_attr)
+        if eff_code(codes[idx]) != CODE_PADV2:
             continue
         if len(op.inputs) < 2:
             continue
@@ -130,16 +151,31 @@ def rewrite(src, dst, dry_run=False):
         print('nothing to do', flush=True)
         return 0
 
+    # BuiltinOptions union 的构造：不同 TF 版本略有差异，这里自适应。
+    bo_cls = fb.BuiltinOptions
+    union_tag = getattr(bo_cls, 'Pad')
+    print('API probe: BuiltinOptions.Pad=%r' % (union_tag,), flush=True)
+    pad_opts_t = getattr(fb, 'PadOptionsT', None)
+
     for op in targets:
-        # 1. 去掉 constant_values（PAD 固定 0 填充，语义等价）
         del op.inputs[2]
-        # 2. 换 opcode
-        op.opcode_index = pad_idx
-        # 3. 换 builtin_options 类型与内容（PadV2Options 有
-        #    constant_values_index 字段，PadOptions 没有，必须换类型，
-        #    否则字段错位会产出非法 flatbuffer）
-        op.builtin_options_type = fb.BuiltinOptions.Pad
-        op.builtin_options = fb.PadOptionsT()
+        setattr(op, oi_attr, pad_idx)
+        setattr(op, f(op, 'builtin_options_type', 'builtinOptionsType'),
+                union_tag)
+        try:
+            union_obj = union_tag()
+            if hasattr(union_obj, 'Type'):
+                union_obj.Type = union_tag
+            if hasattr(union_obj, 'Value') and pad_opts_t is not None:
+                union_obj.Value = pad_opts_t()
+            setattr(op, f(op, 'builtin_options', 'builtinOptions'),
+                    union_obj)
+        except Exception as e:
+            # 退化路径：直接把 PadOptionsT 挂在 builtin_options 上
+            print('  union ctor failed (%s); try plain PadOptionsT' % e,
+                  flush=True)
+            setattr(op, f(op, 'builtin_options', 'builtinOptions'),
+                    pad_opts_t() if pad_opts_t is not None else None)
         print('  rewrote one PADV2 -> PAD', flush=True)
 
     if dry_run:
