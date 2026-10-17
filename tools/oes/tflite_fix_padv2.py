@@ -89,11 +89,82 @@ def survey(path):
     return n_pad, n_padv2
 
 
+def audit(path):
+    """出件自检（针对 -oiqt 式 float 假绿）：量化张量数、dtype 直方图、
+    未量化 int8/uint8 张量、退化 scale，并区分「孤立 float32 残留」与
+    「被算子引用的 float32」——前者无害，后者是真问题。
+
+    返回 dict，供调用方断言。
+    """
+    import collections
+
+    import tflite as T
+    raw = open(path, 'rb').read()
+    mo = T.Model.GetRootAsModel(raw, 0)
+    g = mo.Subgraphs(0)
+
+    # 哪些张量被算子真实引用（孤立张量不会被内核读，但仍在模型里）
+    used = set()
+    for i in range(g.OperatorsLength()):
+        op = g.Operators(i)
+        for j in range(op.InputsLength()):
+            used.add(op.Inputs(j))
+        for j in range(op.OutputsLength()):
+            used.add(op.Outputs(j))
+
+    names = {0: 'FLOAT32', 1: 'FLOAT16', 2: 'INT32', 3: 'UINT8', 4: 'INT64',
+             6: 'BOOL', 9: 'INT8'}
+    hist = collections.Counter()
+    unq_int8, degen, f32_used, f32_orphan = [], [], [], []
+    n_quant = 0
+    for t in range(g.TensorsLength()):
+        tt = g.Tensors(t)
+        ty = tt.Type()
+        nm = names.get(ty, 'T%d' % ty)
+        hist[nm] += 1
+        q = tt.Quantization()
+        has_q = q is not None and q.ScaleLength() > 0
+        if has_q:
+            n_quant += 1
+            s = q.Scale(0)
+            zp = q.ZeroPoint(0) if q.ZeroPointLength() else 0
+            # 退化：零范围张量 (scale == zp*... ) 表现为 scale 极大
+            if s > 1e6 or s <= 0.0:
+                degen.append((t, nm, s, zp))
+        if ty in (9, 3) and not has_q:
+            unq_int8.append(t)
+        if ty == 0:
+            (f32_used if t in used else f32_orphan).append(t)
+
+    total = g.TensorsLength()
+    print('--- audit: %s (%d bytes) ---' % (path, len(raw)))
+    print('  tensors            : %d' % total)
+    print('  quantized tensors  : %d/%d (%.1f%%)'
+          % (n_quant, total, 100.0 * n_quant / max(total, 1)))
+    print('  dtype histogram    : %s' % dict(sorted(hist.items())))
+    print('  DEGENERATE scale   : %d  %s'
+          % (len(degen), ['t%d(%s,s=%.4g,zp=%d)' % d for d in degen[:8]]))
+    print('  int8/uint8 WITHOUT quantization : %d  %s'
+          % (len(unq_int8), unq_int8[:8]))
+    print('  FLOAT32 referenced by ops : %d  %s'
+          % (len(f32_used), f32_used[:8]))
+    print('  FLOAT32 orphaned (unused): %d  %s'
+          % (len(f32_orphan), f32_orphan[:8]))
+    print('  NOTE: orphaned tensors are never read by the kernel; they only'
+          ' inflate file size. -oiqt-style false-green is about *referenced*'
+          ' unquantized int8, which is %d here.' % len(unq_int8))
+
+    return {'total': total, 'quantized': n_quant, 'hist': dict(hist),
+            'degenerate': degen, 'unquantized_int8': unq_int8,
+            'float32_used': f32_used, 'float32_orphan': f32_orphan}
+
+
 def verify(path):
     """改写后校验：必须 0 个 PADV2，且 PAD 全是 2 输入。"""
     n_pad, n_padv2 = survey(path)
     assert n_padv2 == 0, 'PADV2 still present after rewrite'
     print('VERIFY: 0 PADV2, %d PAD remaining -> OK' % n_pad)
+    audit(path)
     return True
 
 
@@ -158,6 +229,24 @@ def rewrite(src, dst, dry_run=False):
     bo_attrs = sorted(a for a in dir(bo_cls) if not a.startswith('_'))
     print('API probe: BuiltinOptions attrs=%s' % bo_attrs, flush=True)
 
+    bt_attr = f(targets[0], 'builtin_options_type', 'builtinOptionsType')
+    bo_attr = f(targets[0], 'builtin_options', 'builtinOptions')
+
+    # --- 首选：抄现成的 PAD 算子的 options -------------------------------
+    # 模型里已有 3 个 PAD 算子被 TFLite 内核成功 prepare 过，它们的
+    # builtin_options_type / builtin_options 就是「合法 PAD」的权威样板。
+    # 照抄比猜 union tag 安全得多：改写后的算子与那 3 个结构完全一致。
+    ref = None
+    for op in ops:
+        if eff_code(codes[getattr(op, oi_attr)]) == CODE_PAD:
+            ref = op
+            break
+    if ref is not None:
+        ref_bt = getattr(ref, bt_attr)
+        ref_bo = getattr(ref, bo_attr)
+        print('API probe: reference PAD options type=%r options=%s'
+              % (ref_bt, type(ref_bo).__name__), flush=True)
+
     tag_name, union_tag = None, None
     for cand in ('PadOptions', 'Pad', 'PadV2Options', 'NONE', 'None'):
         if hasattr(bo_cls, cand):
@@ -170,28 +259,17 @@ def rewrite(src, dst, dry_run=False):
     print('API probe: PadOptionsT=%s' % (pad_opts_t is not None,),
           flush=True)
 
-    bt_attr = f(targets[0], 'builtin_options_type', 'builtinOptionsType')
-    bo_attr = f(targets[0], 'builtin_options', 'builtinOptions')
-
     for op in targets:
         # op.inputs 是 numpy array，不能用 del（ValueError: cannot delete
         # array elements），必须整体替换为切片。
         op.inputs = op.inputs[:2]
         setattr(op, oi_attr, pad_idx)
         ok = False
-        if union_tag is not None and not isinstance(union_tag, int):
-            # 真 union：构造 union 对象
-            try:
-                uo = union_tag()
-                if hasattr(uo, 'Type'):
-                    uo.Type = union_tag
-                if hasattr(uo, 'Value'):
-                    uo.Value = pad_opts_t() if pad_opts_t else None
-                setattr(op, bt_attr, union_tag)
-                setattr(op, bo_attr, uo)
-                ok = True
-            except Exception as e:
-                print('  union ctor failed: %s' % str(e)[:100], flush=True)
+        if ref is not None:
+            # 与已验证的 PAD 算子保持结构一致
+            setattr(op, bt_attr, ref_bt)
+            setattr(op, bo_attr, ref_bo)
+            ok = True
         if not ok and isinstance(union_tag, int):
             # NONE 之类的纯 tag：options 置空（PAD 无必填 options）
             setattr(op, bt_attr, union_tag)
