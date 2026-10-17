@@ -105,31 +105,41 @@ def run_once_onnx(sess, in_name, out_name, image_bytes):
 DEBUG = {'n': 0}
 
 
-def run_once(interp, image_bytes):
+def preprocess_input(inp, image_bytes):
+    """按输入张量的 dtype / 量化参数，生成喂给 set_tensor 的数组。
+
+    **单一真相源**：regress 与导出脚本（export_tensor_bytes.py）都调用
+    本函数，保证「CI 侧参考字节」与「设备侧输入字节」完全同源。
+    och 第18轮明确要求：宁可多传一个文件，不要多一个变量 ——
+    重新实现一遍预处理正是最可能出现「两边都以为自己对齐了」的环节。
+    """
     from PIL import Image
     import numpy as np
-    inp = interp.get_input_details()[0]
-    out = interp.get_output_details()[0]
     shape = [int(x) for x in inp['shape']]
     net = shape[2] if len(shape) == 4 else NET
     img = Image.open(io.BytesIO(image_bytes)).convert('RGB').resize(
         (net, net), Image.BILINEAR)
     arr = np.frombuffer(img.tobytes(), dtype=np.uint8)
     if inp['dtype'] == np.uint8:
-        t = arr.reshape(shape)
-    elif inp['dtype'] == np.int8:
+        return arr.reshape(shape)
+    if inp['dtype'] == np.int8:
         # int8 输入（TFLiteConverter 全整数量化产物，in_type=9）：
         # 必须按该张量的 scale/zero_point 把 float 归一化输入量化成 int8，
         # 否则会把 float32 塞进 int8 tensor 直接报类型错（exit=1）。
         isc, izp = inp.get('quantization', (0.0, 0))
         f = ((arr.astype(np.float32) - MEAN) * SCALE).reshape(shape)
         if isc:
-            t = np.clip(np.round(f / isc) + izp, -128, 127).astype(np.int8)
-        else:
-            t = f.astype(np.int8)
-    else:
-        t = (((arr.astype(np.float32) - MEAN) * SCALE)
-             .reshape(shape).astype(np.float32))
+            return np.clip(np.round(f / isc) + izp, -128,
+                           127).astype(np.int8)
+        return f.astype(np.int8)
+    return (((arr.astype(np.float32) - MEAN) * SCALE)
+            .reshape(shape).astype(np.float32))
+
+
+def run_once(interp, image_bytes):
+    inp = interp.get_input_details()[0]
+    out = interp.get_output_details()[0]
+    t = preprocess_input(inp, image_bytes)
     interp.set_tensor(inp['index'], t)
     interp.invoke()
     raw = interp.get_tensor(out['index']).flatten().astype(float)
