@@ -240,8 +240,16 @@ jobs:
 
       # ★ addr2line 归因：在 CI 里就把「哪个源码行」算出来。
       #   动机：unstripped .so 体积是 stripped 的数倍，而 oca→och 的大文件传递
-      #   目前不通。与其传 100 MB 二进制，不如在这里出**几 KB 的结论**。
+      #   目前不稳。与其传 100 MB 二进制，不如在这里出**几 KB 的结论**。
       #   地址清单由 workflow_dispatch 输入 fault_addrs 给，改地址不必改 workflow。
+      #
+      # ⚠️★ 血泪教训（2026-10-17 第一轮）：调用方（Windows PowerShell）会把命令行里
+      #   的 `0x256a4c` 当成**十六进制数字字面量**并转成十进制再传给 gh，
+      #   于是 12 个地址里只有第 1 个带 0x 前缀是对的，其余全查了错地址，
+      #   addr2line 老老实实返回 `??:0`，**步骤照样 success** —— 典型的假绿。
+      #   对策有两层：① 调用侧必须把 fault_addrs 整体加引号；
+      #              ② 本步骤**独立校验**每个地址都落在 .text 内，越界即失败。
+      #                 不依赖调用方传对 —— 这是本次唯一能防住复发的东西。
       - name: addr2line attribution for fault addresses
         env:
           ADDRS: ${{ github.event.inputs.fault_addrs }}
@@ -249,62 +257,107 @@ jobs:
           set -eu
           SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
           MAP="$RUNNER_TEMP/addr2line-map.txt"
+
+          # .text 的 [起始, 结束) —— 用来判断地址是否落在代码段内。
+          # 用 python3 而非 awk：ubuntu 默认是 mawk，**没有** strtonum/gawk 扩展
+          #（上一轮就用它翻过车）。只解析一次，打印 "start end"。
+          read -r TEXT_START TEXT_END <<< "$(python3 - "$SO" <<'PY'
+          import struct, sys
+          b = open(sys.argv[1], 'rb').read()
+          shoff, = struct.unpack_from('<Q', b, 0x28)
+          shent, shnum, shstrndx = struct.unpack_from('<HHH', b, 0x3a)
+          o = shoff + shstrndx * shent
+          _, _, _, _, stroff, strsize = struct.unpack_from('<IIQQII', b, o)[:6]
+          strtab = b[stroff:stroff + strsize]
+          for i in range(shnum):
+              o = shoff + i * shent
+              name, typ, flags, addr, off, size = struct.unpack_from('<IIQQQQ', b, o)[:6]
+              end = strtab.index(b'\x00', name)
+              if strtab[name:end] == b'.text':
+                  print(addr, addr + size)
+                  break
+          PY
+          )"
+          echo "### .text range: 0x$TEXT_START .. 0x$TEXT_END"
+          [ -n "$TEXT_START" ] || { echo "ERROR: 读不到 .text 段"; exit 1; }
+
           {
             echo "### addr2line attribution"
             echo "### so=$SO"
             echo "### so_size=$(stat -c%s "$SO")"
             echo "### so_sha256=$(sha256sum "$SO" | cut -d' ' -f1)"
+            echo "### text_range=0x$TEXT_START..0x$TEXT_END"
             echo
-            for a in $(echo "$ADDRS" | tr ',' ' '); do
-              echo "=== $a ==="
+
+            for tok in $(echo "$ADDRS" | tr ',' ' '); do
+              # 统一归一为十六进制数值。带 0x 前缀按 hex 解释；不带前缀的按
+              # **十进制**解释（GitHub inputs 是字符串，不会自己转；只有调用方
+              # 传进来时就已变形的情形才会出现纯十进制 token）。
+              case "$tok" in
+                0x*|0X*) HEXV="${tok#0x}" ;;
+                *)       HEXV=$(printf '%x' "$tok") ;;
+              esac
+              # ★ 硬门：地址必须落在 .text 内。否则就是「查了错地址还返回 ??:0」
+              #   却看不出来 —— 这正是上一轮假绿的成因。
+              if [ "$((16#$HEXV))" -lt "$((16#$TEXT_START))" ] \
+                 || [ "$((16#$HEXV))" -ge "$((16#$TEXT_END))" ]; then
+                echo "ERROR: 地址 0x$HEXV 不在 .text [0x$TEXT_START,0x$TEXT_END) 内"
+                echo "       说明 fault_addrs 被调用方变形了（PowerShell 会把 0x.. 转十进制）"
+                echo "       请把 fault_addrs **整体加引号**后重跑，例如："
+                echo "         -f 'fault_addrs=0x256a60,0x256a4c'"
+                echo "       收到的原始输入: $ADDRS"
+                exit 1
+              fi
+              A="$HEXV"
+              echo "=== 0x$A (decimal $((16#$A))) ==="
               echo "-- addr2line -f -i -C:"
-              aarch64-linux-gnu-addr2line -f -i -C -e "$SO" "$a" || echo "  (addr2line failed)"
-              echo "-- nearest symbol (.symtab then .dynsym):"
-              python3 - "$SO" "$a" <<'PY'
+              aarch64-linux-gnu-addr2line -f -i -C -e "$SO" "0x$A" || echo "  (addr2line failed)"
+              echo "-- nearest symbol (.symtab):"
+              python3 - "$SO" "$A" <<'PY'
           import subprocess, sys
-          so, a = sys.argv[1], int(sys.argv[2], 16)
+          so = sys.argv[1]
+          a = int(sys.argv[2], 16)
           best = None
-          for flag in ('--defined-only', '-D --defined-only'):
-              cmd = ['aarch64-linux-gnu-nm', '-n'] + (['--defined-only'] if flag == '--defined-only'
-                                                       else ['-D', '--defined-only']) + [so]
-              try:
-                  out = subprocess.run(cmd, capture_output=True, text=True).stdout
-              except Exception:
-                  continue
-              for ln in out.splitlines():
-                  p = ln.split()
-                  if len(p) >= 3 and p[1].upper() in ('T', 'W'):
-                      v = int(p[0], 16)
-                      if v <= a and (best is None or v > best[0]):
-                          best = (v, p[2])
-              if best:
-                  break
+          out = subprocess.run(['aarch64-linux-gnu-nm', '-n', '--defined-only', so],
+                               capture_output=True, text=True).stdout
+          for ln in out.splitlines():
+              p = ln.split()
+              if len(p) >= 3 and p[1].upper() in ('T', 'W', 'I'):
+                  v = int(p[0], 16)
+                  if v <= a and (best is None or v > best[0]):
+                      best = (v, p[2])
           print('   %s +0x%x  (delta=%d bytes)' % (best[1], best[0], a - best[0])
                 if best else '   (no symbol <= addr found)')
           PY
               echo
             done
           } | tee "$MAP"
+          echo "WROTE $MAP ($(wc -l < "$MAP") lines)"
 
       # 反汇编 + **源码文本**窗口（-S 需要 Mesa 源码树在同一 comp_dir，故先 cd 过去）。
-      # 失败不致命：addr2line 的结论已经拿到了，这一段只是锦上添花。
+      # ⚠️ continue-on-error: true —— 上一轮这一步因为地址格式崩掉，**连带把
+      #    artifact 收集也带没了**（关键证据 addr2line 已到手却传不下去）。
+      #    装饰性步骤绝不允许阻塞产物上传。
       - name: Disassembly window with interleaved source
+        continue-on-error: true
         env:
           ADDRS: ${{ github.event.inputs.fault_addrs }}
         run: |
-          set -eu
           SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
           MAP="$RUNNER_TEMP/disasm-window.txt"
-          FIRST=$(echo "$ADDRS" | tr ',' ' ' | head -1)
-          START=$(python3 -c "print(hex(int('$FIRST',16)-0x40))")
-          STOP=$(python3 -c "print(hex(int('$FIRST',16)+0x60))")
+          read -r TOKS <<< "$ADDRS"
+          TOK="${TOKS%%[ ,]*}"
+          case "$TOK" in 0x*|0X*) HEXV="${TOK#0x}" ;; *) HEXV=$(printf '%x' "$TOK") ;; esac
+          START=$(printf '0x%x' $((16#$HEXV - 0x40)))
+          STOP=$(printf '0x%x' $((16#$HEXV + 0x60)))
           {
-            echo "### objdump -dlS --start-address=$START --stop-address=$STOP"
-            cd "$RUNNER_TEMP/teflon-build/mesa"
+            echo "### objdump -dlS --start-address=$START --stop-address=$STOP  (center=0x$HEXV)"
+            cd "$RUNNER_TEMP/teflon-build/mesa" || exit 0
             aarch64-linux-gnu-objdump -dlS \
               --start-address="$START" --stop-address="$STOP" "$SO" || \
               echo "(objdump -S failed; DWARF comp_dir 与源码树不一致属正常)"
           } | tee "$MAP"
+          exit 0
 
       - name: Glibc symbol ceiling check (device = 2.36)
         run: |
