@@ -237,8 +237,7 @@ int main(int argc, char** argv) {
   {
     const std::vector<int>& ins = interpreter->inputs();
     const std::vector<int>& outs = interpreter->outputs();
-    std::fprintf(stderr, "输入张量数    : %d
-", static_cast<int>(ins.size()));
+    std::fprintf(stderr, "输入张量数    : %d\n", static_cast<int>(ins.size()));
     for (size_t i = 0; i < ins.size(); i++) {
       const TfLiteTensor* t = interpreter->tensor(ins[i]);
       if (t == nullptr) continue;
@@ -246,11 +245,9 @@ int main(int argc, char** argv) {
                    static_cast<int>(i), dtype_name(t->type), t->params.scale,
                    (long long)t->params.zero_point);
       print_shape(t);
-      std::fprintf(stderr, "
-");
+      std::fprintf(stderr, "\n");
     }
-    std::fprintf(stderr, "输出张量数    : %d
-", static_cast<int>(outs.size()));
+    std::fprintf(stderr, "输出张量数    : %d\n", static_cast<int>(outs.size()));
     for (size_t i = 0; i < outs.size(); i++) {
       const TfLiteTensor* t = interpreter->tensor(outs[i]);
       if (t == nullptr) continue;
@@ -258,8 +255,7 @@ int main(int argc, char** argv) {
                    static_cast<int>(i), dtype_name(t->type), t->params.scale,
                    (long long)t->params.zero_point);
       print_shape(t);
-      std::fprintf(stderr, "
-");
+      std::fprintf(stderr, "\n");
     }
   }
 
