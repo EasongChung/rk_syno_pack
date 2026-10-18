@@ -48,7 +48,11 @@ NEEDLES = [
     ("create_tensor 定义行", "etna_ml_create_tensor(struct etna_ml_subgraph"),
     ("destroy_tensor 定义行", "etna_ml_destroy_tensor(struct etna_ml_subgraph"),
     ("create 注入点", "och patch: create_tensor 分配取证"),
-    ("destroy 注入点", "och patch: create_tensor 分配取证 打到 destroy 侧"),
+    # ⚠️ needle 必须与 NEW_DESTROY 里的真实文字一致，否则这里会打出 -1（**假数据**）。
+    #    上一版我凭印象写成「…分配取证 打到 destroy 侧」，真文本是「… 取证 —— destroy 侧，
+    #    只加打印」⇒ run 39146418954 的留档里 destroy 注入点 = -1。
+    #    教训：留档位出现 -1 一律当作「needle 没命中」的错误处理，绝不能当行号用。
+    ("destroy 注入点", "destroy 侧，只加打印"),
     ("编译期标记", 'och_creatediag_marker[] = "och-patch-creatediag"'),
     ("native created resource 行", 'ML_DBG("created resource %p for tensor %d with size %d'),
     ("reference_tensor_with_offset 定义行", "reference_tensor_with_offset(struct etna_ml_subgraph"),
@@ -104,6 +108,15 @@ def main():
     for label, needle in NEEDLES:
         print("  %-28s %d" % (label, line_of(src, needle)))
     print("  （stripped 产物无 DWARF：偏移→行号必须靠**同构建**未 strip 副本重跑取）")
+
+    # ★ 留档位出现 -1 = needle 没命中 = **假数据**。上一版就因为凭印象写 needle
+    #   而打出 -1（run 39146418954）。留档是给人对着真机日志用的，错的行号比没有
+    #   更糟 ⇒ 这里直接硬失败，不允许把 -1 混进日志。
+    missing = [lb for lb, nd in NEEDLES if line_of(src, nd) < 0]
+    if missing:
+        print("\nRESULT: 1 FAIL —— 留档 needle 未命中（-1 是假数据，不得混进日志）: %s"
+              % "; ".join(missing))
+        return 1
 
     print()
     print("=== 1. 三口径体检 + 逆变换 ===")
