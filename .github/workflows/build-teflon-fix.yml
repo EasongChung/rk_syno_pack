@@ -269,13 +269,24 @@ jobs:
             exit 1
           fi
           echo "STRIPPED: OK (no .debug_info)"
-          # ★ 两处修复的标记必须在 .rodata 里（二进制门，比日志更硬）
-          strings -a "$SO" | grep -qF 'och patch: out_channel' \
-            || { echo "ERROR: out_channel 修复标记不在二进制里"; exit 1; }
-          echo "STRING-CHECK: och patch: out_channel present"
-          strings -a "$SO" | grep -qF 'och patch: v7 calculate_bias_correction' \
-            || { echo "ERROR: v7 修复标记不在二进制里"; exit 1; }
-          echo "STRING-CHECK: och patch: v7 present"
+          # ★ FIX_V7 的修复代码在二进制里：grep 的是 **printf 格式串**
+          #   "[och-fix] calc_bias_correction depthwise=..."，那是真正的字符串字面量，
+          #   会进 .rodata。
+          strings -a "$SO" | grep -qF 'calc_bias_correction depthwise' \
+            || { echo "ERROR: v7 修复代码不在二进制里"; exit 1; }
+          echo "STRING-CHECK: [och-fix] calc_bias_correction depthwise present"
+          # ⚠️ OCFIX **没有**可 grep 的二进制标记，这是事实不是遗漏：
+          #   patch-etnaviv-outchannel-fix.py 的 MARKER 只出现在 C 注释
+          #   `/* och patch: out_channel ... */` 里，而**注释不会进二进制**。
+          #   （我第一版在这里写了 `strings | grep -qF 'och patch: out_channel'`，
+          #    那道门永远不可能通过 —— 已删除。）
+          #   OCFIX 的二进制级证据改为「**编译通过**」：补丁注入的代码引用了
+          #   och_sb_base / kernels_per_core / output_channels，若补丁没打上或
+          #   结构不符，build-teflon.sh 会在 3g 步 exit 1（构建失败）。
+          #   + 日志门 "[och-ocfix] 已修正 out_channel 映射并加越界钳位"。
+          #   TODO(och): 若要在二进制里留可 grep 的标记，需在补丁里加一个
+          #   `__attribute__((used)) static const char ...[]` 之类的编译期标记；
+          #   本轮不动他的补丁文件。
           # ★ 反向门：诊断开关的字符串一个都不该在
           if strings -a "$SO" | grep -qF '[och-wc]'; then
             echo "ERROR: 产物里出现 [och-wc] —— WCDIAG 诊断开关误开，这不是交付产物"
