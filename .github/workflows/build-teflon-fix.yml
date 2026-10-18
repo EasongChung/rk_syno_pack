@@ -213,11 +213,11 @@ jobs:
           tmp = tempfile.mkdtemp()
           try:
               p = os.path.join(tmp, 'v7.c')
-              open(p, 'w').write(FUNC)
+              open(p, 'w', encoding='utf-8').write(FUNC)
               r = subprocess.run([sys.executable, P, p], capture_output=True,
                                  text=True, encoding='utf-8', errors='replace')
               assert r.returncode == 0, (r.stdout + r.stderr)[-400:]
-              b = open(p).read()
+              b = open(p, encoding='utf-8').read()
               for needle in ('och patch: v7 calculate_bias_correction depthwise fix',
                              'if (operation->depthwise)', 'operation->addition'):
                   assert needle in b, 'missing %r' % needle

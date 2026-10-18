@@ -105,7 +105,7 @@ def main() -> int:
     # 否则守卫会 fail-open（漏放行 = 崩溃照旧）。
     g_at = src.index(MARKER, src.index(TARGET_FN))
     g_end = src.index("}", g_at)
-    guard = src[g_at:g_end]
+    guard = src[g_at: g_end]
     if "return false;" not in guard:
         sys.stderr.write("ERROR: 守卫块内没有 return false —— 补丁形态不对\n")
         return 1

@@ -20,7 +20,6 @@ import io
 import os
 import sys
 import tempfile
-import tokenize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -76,21 +75,6 @@ etna_ml_operation_supported(struct pipe_ml_device *device,
 MOCK = MOCK_TPL % "\n".join(ANCHOR)
 
 FAILS = []
-GEN_WARN = []
-
-
-def toks(s):
-    """Python token 流：忽略纯格式差异，但保留缩进(INDENT/DEDENT)与字符串/注释内容。
-
-    比「折叠空白」准确：能看穿 `x: y` vs `x:y`，又能抓到缩进漂移与字符串改动。
-    """
-    out = []
-    drop = (tokenize.NL, tokenize.NEWLINE, tokenize.ENDMARKER)
-    for t in tokenize.generate_tokens(io.StringIO(s).readline):
-        if t.type in drop:
-            continue
-        out.append((t.type, t.string))
-    return out
 
 
 def run_patch(text, new_override=None):
@@ -247,32 +231,22 @@ else:
                     min(len(gen_new), len(PATCH.NEW)))))
     with open(PATCH_PATH, encoding="utf-8") as f:
         actual = f.read()
-    if gen_body == actual:
-        report("GEN  整份补丁文件与生成器输出逐字节一致", True)
+    # 硬门：逐字节一致，**只允许 CRLF/LF 这一种平台差异**。
+    # 上一轮我用了「token 流等价 → WARN 不阻塞」的兜底，结果把我自己誊写时
+    # 丢掉的一个空格降级成了告警，反而掩盖了「这份文件不是生成器产物」这个事实。
+    # 经验证逐字节可达成（生成器输出 LF 后 == och 送达版 6ba73573…），就该硬判。
+    gen_n = gen_body.replace("\r\n", "\n")
+    act_n = actual.replace("\r\n", "\n")
+    if gen_n == act_n:
+        report("GEN  整份补丁文件 == 生成器输出（逐字节，仅容 CRLF/LF）", True)
     else:
-        i = next((i for i, (a, b) in enumerate(zip(gen_body, actual)) if a != b),
-                 min(len(gen_body), len(actual)))
-        warn_byte = ("首个字节差异 @%d 生成=%r 文件=%r"
-                     % (i, gen_body[i:i + 48], actual[i:i + 48]))
-        try:
-            tg, ta = toks(gen_body), toks(actual)
-            same_tokens = tg == ta
-        except tokenize.TokenError as exc:
-            same_tokens = False
-            warn_byte += "（tokenize 失败: %s）" % exc
-        if same_tokens:
-            # 仅格式差异：不阻塞构建，但明确打印（说明两者未逐字节同步）
-            print("  %-44s WARN   <- 仅格式差异，token 流等价；%s" % ("GEN  逐字节一致", warn_byte))
-            GEN_WARN.append(warn_byte)
-        else:
-            report("GEN  整份补丁文件与生成器输出（token 流等价）", False, warn_byte)
+        i = next((i for i, (a, b) in enumerate(zip(gen_n, act_n)) if a != b),
+                 min(len(gen_n), len(act_n)))
+        report("GEN  整份补丁文件 == 生成器输出（逐字节，仅容 CRLF/LF）", False,
+               "首个差异 @%d 生成=%r 文件=%r" % (i, gen_n[i:i + 48], act_n[i:i + 48]))
 
 print()
-if GEN_WARN:
-    print("WARN: 生成器与补丁文件存在纯空白差异（不阻塞，但需 och 统一）:")
-    for w in GEN_WARN:
-        print("      " + w)
 if FAILS:
     print("RESULT: %d FAIL —— %s" % (len(FAILS), "; ".join(FAILS)))
     sys.exit(1)
-print("RESULT: ALL PASS" + ("（含 %d 条 GEN 空白告警）" % len(GEN_WARN) if GEN_WARN else ""))
+print("RESULT: ALL PASS")
