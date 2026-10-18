@@ -94,7 +94,7 @@ jobs:
           python3 - <<'PY'
           import importlib.util, os, shutil, subprocess, sys, tempfile
 
-          P = 'oes-teflon/build-recipe/patch-etnaviv-outchannel-fix.py'
+          P = 'oes-teflon/build-recipe/patch-etnaviv-outchannel-clamp.py'
           spec = importlib.util.spec_from_file_location('ocfix', P)
           m = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(m)
@@ -120,7 +120,9 @@ jobs:
               d = tempfile.mkdtemp()
               try:
                   p = os.path.join(d, 'v7.c')
-                  open(p, 'w').write(text)
+                  # ⚠️ 必须显式 encoding：补丁注入的 C 注释**含中文**，
+                  #    依赖 locale 会在非 UTF-8 环境（Windows GBK / POSIX C locale）炸掉。
+                  open(p, 'w', encoding='utf-8').write(text)
                   r = subprocess.run([sys.executable, P, p], capture_output=True,
                                      text=True, encoding='utf-8', errors='replace')
                   assert r.returncode == expect, \
@@ -146,13 +148,35 @@ jobs:
           run_case('target function absent',
                    GOOD.replace('write_core_interleaved(struct', 'zzz(struct'), 1)
           run_case('anchor appears twice', GOOD + GOOD, 1)
-          print('PREFLIGHT ocfix OK (inject / count-gate / anchor / reapply)')
+
+          # 注入结果的**内容纪律**：本补丁只允许加钳位，绝不改公式。
+          # （重映射版已被上游 v8 fill_weights() 否证并删除，见 BUILD-INFO。）
+          d = tempfile.mkdtemp()
+          try:
+              p = os.path.join(d, 'v7.c')
+              open(p, 'w', encoding='utf-8').write(GOOD)
+              r = subprocess.run([sys.executable, P, p], capture_output=True,
+                                 text=True, encoding='utf-8', errors='replace')
+              assert r.returncode == 0, r.stderr[-400:]
+              after = open(p, encoding='utf-8').read()
+              assert 'och-patch-v7-outchannel-clamp' in after, \
+                  'compile-time marker missing (strings gate would never pass)'
+              assert '__attribute__((used))' in after, 'marker may be optimised away'
+              assert m.FORMULA_LITERAL in after, 'original formula was modified!'
+              assert 'core * kernels_per_core + och_sb_base' not in after, \
+                  'remap leaked back in'
+              assert 'out_channel >= output_channels' in after
+              assert 'out_channel = output_channels - 1' in after
+              print('  ok: marker literal + formula preserved + no remap')
+          finally:
+              shutil.rmtree(d, ignore_errors=True)
+          print('PREFLIGHT ocfix-clamp OK (inject / count-gate / anchor / discipline)')
 
           # 幂等：同一文件再打一次必须被拒
           d = tempfile.mkdtemp()
           try:
               p = os.path.join(d, 'v7.c')
-              open(p, 'w').write(GOOD)
+              open(p, 'w', encoding='utf-8').write(GOOD)
               r1 = subprocess.run([sys.executable, P, p], capture_output=True,
                                   text=True, encoding='utf-8', errors='replace')
               assert r1.returncode == 0, r1.stderr[-300:]
@@ -204,6 +228,63 @@ jobs:
               print('PREFLIGHT v7-biasfix OK')
           finally:
               shutil.rmtree(tmp, ignore_errors=True)
+          PY
+
+      # ★ AST 级「未定义名」检查 —— 语法合法 ≠ 名字存在。
+      #   教训（两次，都是在门的错误分支上）：
+      #     ① 我誊写 ocfix remap 版时把 TARGET_FN 打成 args_fn_name_placeholder，
+      #        py_compile 通过、bash -n 通过，只有做名字解析才发现；
+      #     ② och 自己踩了同一类：FORMULA_LITERAL 只存在于生成器里、忘了注入模板，
+      #        py_compile 通过，正例却被全拒。
+      #   两者都会让「门触发时的错误信息」退化成 traceback。所以这道检查必须常驻。
+      - name: Static check - undefined names in python patchers
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import ast, builtins, sys, glob
+
+          BUILTINS = set(dir(builtins)) | {'__file__', '__name__', '__doc__', '__spec__'}
+
+          def defined(tree):
+              names = set()
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                      names.add(n.id)
+                  elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                      names.add(n.name)
+                  elif isinstance(n, ast.arg):
+                      names.add(n.arg)
+                  elif isinstance(n, ast.Import):
+                      names.update(a.asname or a.name.split('.')[0] for a in n.names)
+                  elif isinstance(n, ast.ImportFrom):
+                      names.update(a.asname or a.name for a in n.names)
+                  elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                      names.update(n.names)
+                  elif isinstance(n, ast.ExceptHandler) and n.name:
+                      names.add(n.name)
+                  elif isinstance(n, ast.comprehension):
+                      names.update(x.id for x in ast.walk(n.target) if isinstance(x, ast.Name))
+              return names
+
+          files = sorted(glob.glob('oes-teflon/build-recipe/*.py') +
+                         glob.glob('oes-teflon/tools/*.py'))
+          assert files, 'no python patchers found -- glob pattern broken?'
+          bad = 0
+          for f in files:
+              try:
+                  tree = ast.parse(open(f, encoding='utf-8').read(), filename=f)
+              except SyntaxError as e:
+                  print('  SYNTAX-ERROR %s: %s' % (f, e)); bad += 1; continue
+              dfn = defined(tree)
+              used = set(n.id for n in ast.walk(tree)
+                         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load))
+              u = sorted(n for n in used if n not in dfn and n not in BUILTINS)
+              if u:
+                  print('  UNDEFINED %s: %s' % (f, ', '.join(u))); bad += 1
+              else:
+                  print('  ok %s' % f)
+          assert bad == 0, '%d file(s) have undefined names' % bad
+          print('AST-NAME-CHECK: PASS (%d files)' % len(files))
           PY
 
       - name: Build libteflon.so (FIX_V7 + OCFIX, stripped)
@@ -269,12 +350,23 @@ jobs:
             exit 1
           fi
           echo "STRIPPED: OK (no .debug_info)"
-          # ★ FIX_V7 的修复代码在二进制里：grep 的是 **printf 格式串**
-          #   "[och-fix] calc_bias_correction depthwise=..."，那是真正的字符串字面量，
-          #   会进 .rodata。
+          # FIX_V7 的修复代码在二进制里：grep 的是 **printf 格式串**
+          #   "[och-fix] calc_bias_correction depthwise=..."，那是真正的字符串字面量。
           strings -a "$SO" | grep -qF 'calc_bias_correction depthwise' \
             || { echo "ERROR: v7 修复代码不在二进制里"; exit 1; }
           echo "STRING-CHECK: [och-fix] calc_bias_correction depthwise present"
+          # ★★ OCFIX 的**二进制级**硬门：编译期标记必须能在 .rodata 里被找到。
+          #   上一轮 remap 版我写了一道 `strings | grep 'och patch: out_channel'` 的门，
+          #   那串只在 C 注释里，物理上永远不存在 —— 一道永远红的门等于没有门。
+          #   现在补丁注入的是真字符串字面量（__attribute__((used)) 保住），
+          #   所以这道门能真正判定「这个 .so 里有没有钳位补丁」：
+          #   找不到 = 补丁没打进去 = 崩溃会照旧 = 必须当场失败。
+          if ! strings -a "$SO" | grep -q 'och-patch-v7-outchannel-clamp'; then
+            echo "ERROR: 产物里找不到 och-patch-v7-outchannel-clamp 编译期标记"
+            echo "       说明钳位补丁没有进入二进制 —— 上机仍会 SIGSEGV，这是必须拦的情况"
+            exit 1
+          fi
+          echo "STRING-CHECK: och-patch-v7-outchannel-clamp PRESENT (clamp really in .so)"
           # ⚠️ OCFIX **没有**可 grep 的二进制标记，这是事实不是遗漏：
           #   patch-etnaviv-outchannel-fix.py 的 MARKER 只出现在 C 注释
           #   `/* och patch: out_channel ... */` 里，而**注释不会进二进制**。
@@ -351,7 +443,13 @@ jobs:
           {
             echo "########## FIX_V7 + OCFIX BUILD - delivery candidate, NOT yet validated ##########"
             echo "purpose1=backport v8 depthwise/addition guard into v7 calculate_bias_correction"
-            echo "purpose2=fix write_core_interleaved out_channel mapping + clamp OOB"
+            echo "purpose2=clamp write_core_interleaved out_channel tail OOB (formula UNCHANGED)"
+            echo "void=patch-etnaviv-outchannel-fix.py (remap version) was DELETED from the repo:"
+            echo "      its 'core*kernels_per_core, drop * cores_used' remap was REFUTED by upstream"
+            echo "      etnaviv_ml_nn_v8.c fill_weights() (:726 keeps * cores_used, :754 advances by"
+            echo "      kernels_in_superblock); v7's real defect is the even DIV_ROUND_UP split"
+            echo "      (:729-731 in v8 distributes the remainder so slots == output_channels)"
+            echo "void_sha256=f9bf1d51156e372cd5cf76859f7c76808235fab052739ee39a32ea38a471e490 (remap build, VOID)"
             echo "TEFLON_FIX_V7=${TEFLON_FIX_V7:-0} TEFLON_OCFIX=${TEFLON_OCFIX:-0}"
             echo "TEFLON_DIAG=${TEFLON_DIAG:-0} TEFLON_WCDIAG=${TEFLON_WCDIAG:-0}"
             echo "teflon_debug_info=${TEFLON_DEBUG_INFO:-0} teflon_no_strip=${TEFLON_NO_STRIP:-0}"

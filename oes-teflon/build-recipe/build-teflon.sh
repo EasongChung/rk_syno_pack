@@ -408,16 +408,28 @@ else
 	echo "==> [3f/6] out_channel 取证补丁：默认关闭（设 TEFLON_WCDIAG=1 启用）"
 fi
 
-# ── 3g. 【修复】write_core_interleaved 的 out_channel 映射 + 越界钳位 ──────
-# 【机制已由真机数据证实，不是推理】
+# ── 3g. 【修复】write_core_interleaved 的 out_channel 尾部越界钳位 ──────
+# 【机制已由真机数据证实】
 #   取证产物（TEFLON_WCDIAG=1，真机 per-tensor 模型）打出 136 个独立组合，
-#   现用公式 core*kernels_in_superblock + kernel
-#              + superblock*DIV_ROUND_UP(kernels_per_core,superblocks)*cores_used
+#   原式 core*kernels_in_superblock + kernel
+#          + superblock*DIV_ROUND_UP(kernels_per_core,superblocks)*cores_used
 #   **0 个反例地复现了全部实测 out_ch**，并确实出现 out_ch >= output_channels
 #   （实测 122 / 123，而 output_channels = 122）→ weights_map[out_channel]
 #   与 biases[out_channel] 越界读 → SIGSEGV。
-# 本补丁做两件事：修正映射（core*kernels_per_core + 前序 superblock 累计偏移 +
-# kernel，去掉多余的 * cores_used）；越界时钳位到 output_channels-1。
+#
+# ⚠️⚠️ 本补丁**只加钳位，绝不改公式**。理由（来自上游自己的 v8 实现）：
+#   etnaviv_ml_nn_v8.c:715-760 的 fill_weights() 是同源实现，它
+#     :726  channel_per_superblock[superblock] = superblock * full_superblock * cores_used;
+#          —— **原样保留**了 v7 末尾那个 `* cores_used`（曾被误判为「多余」）；
+#     :754  channel_per_superblock[superblock] += kernels_in_superblock;
+#          —— 逐 core 推进 kernels_in_superblock，**不是** kernels_per_core；
+#     :729-731 kernels_per_core = output_channels/cores_used (+1 给前 core<余数)
+#          —— v8 把余数分给前几个 core，于是槽位总数恰为 output_channels，
+#             **没有幽灵槽**；这才是 v7 缺的修复（v7 用 DIV_ROUND_UP 均分，
+#             实测 8*16=128 > 122 才产生越界槽）。
+#   所以原式结构是有意的：多出来的槽对应的通道根本不存在（输出会被丢弃），
+#   钳位到 output_channels-1 后写的是同一个通道的同样权重 —— 幂等且无害，
+#   通道 0..output_channels-1 的权重与上游意图逐字节一致。
 #
 # 护栏用**钳位**而非 continue：函数内 append_bits(kernels_per_core, 16, ...)
 # 已把「每 core 槽位数」写进位流头，跳过会让位流少槽而整体错位。
@@ -431,8 +443,8 @@ fi
 #
 # 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 ./build-teflon.sh
 if [ "${TEFLON_OCFIX:-0}" = "1" ]; then
-	echo "==> [3g/6] 打【修复】write_core_interleaved out_channel 映射修正 + 越界钳位"
-	PATCHER6="$SCRIPT_DIR/patch-etnaviv-outchannel-fix.py"
+	echo "==> [3g/6] 打【修复】write_core_interleaved out_channel 尾部越界钳位"
+	PATCHER6="$SCRIPT_DIR/patch-etnaviv-outchannel-clamp.py"
 	ML7O="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
 	if [ ! -f "$PATCHER6" ]; then
 		echo "ERROR: 设了 TEFLON_OCFIX=1 却缺 $PATCHER6"
@@ -443,13 +455,13 @@ if [ "${TEFLON_OCFIX:-0}" = "1" ]; then
 		exit 1
 	fi
 	python3 "$PATCHER6" "$ML7O" || {
-		echo "ERROR: out_channel 修复补丁应用失败 —— 不要跳过校验"
+		echo "ERROR: out_channel 钳位补丁应用失败 —— 不要跳过校验"
 		echo "       （会静默产出未修复的 .so，崩溃会照旧）。"
 		echo "       请跑 tools/gen-ocfix-patch.py 从真实源码重新生成锚点。"
 		exit 1
 	}
 else
-	echo "==> [3g/6] out_channel 修复补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
+	echo "==> [3g/6] out_channel 钳位补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
