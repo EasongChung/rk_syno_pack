@@ -49,10 +49,17 @@
 #                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
 #                            不崩只说明越界消失，不代表系数排布正确。
 #
-#   TEFLON_FSGUARD=1      不接管「filter.in_c ≠ 输入通道数」的卷积，回退 CPU。
+#   TEFLON_RODIAG=1       【诊断】read_outputs 越界取证：打印 idx / n_tensors / 槽 / res /
+#                         tsize / toff / bsize / src_map，用于区分 H1(idx 越界) /
+#                         H2(bsize != tsize) / H3(resource 跨 context 失效)。
+#                         目标文件 etnaviv_ml.c（3i 步，在 3h 之后）。
+#                         ⚠️ 该产物不可交付；上机必须同时设 ETNA_MESA_DEBUG=ml_msgs，
+#                            否则 ML_DBG 不打印（DBG_ENABLED 是运行期判断）。
+#                         锚点由 tools/gen-rodiag-patch.py 从真实源码逐字生成。
+#   TEFLON_FSGUARD=1      不接管「filter 深度 ≠ 输入通道数」的卷积，回退 CPU。
 #                         根因：真机 +0x22fda0 SIGSEGV → addr2line → subsample:424
-#                         → 崩溃算子 op#58 filter=[244,3,3,1]：filter.in_c = 1，而 input
-#                           有 244 通道（op#153 同型，filter=[488,3,3,1] / input 488 通道）
+#                         → 崩溃算子 op#58 filter=[244,3,3,1] 但 input 有 244 通道
+#                         （op#153 同型，filter=[488,3,3,1] / input 488 通道）
 #                         → map_in 步长按 244 算而张量只有 2196 字节 → out_channel>=1 越界。
 #                         改法是**不接管**而非改系数排布：整条 coeff 路径都建立在
 #                         「filter 深度 == 输入通道」这个不成立的前提上，改单点只会把
@@ -63,6 +70,7 @@
 #
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
+#   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -481,9 +489,7 @@ else
 	echo "==> [3g/6] out_channel 钳位补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
 fi
 
-# ---------------------------------------------------------------- #
-# 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
-# ---------------------------------------------------------------- #
+# ── 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
 # 上游 Mesa 缺陷（已静态证明，见 verify/reports/05 与 06）：
 #   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 用 operation->input_channels
 #   决定扫描长度，**没有 depthwise 特判**；而同仓库的 calc_weight_quant /
@@ -524,12 +530,10 @@ fi
 #   离线审计定位到崩溃分区里的算子：
 #     op#58   CONV_2D input=[1,52,52,244] filter=[244,3,3,1] stride=2
 #     op#153  CONV_2D input=[1,25,25,488] filter=[488,3,3,1] stride=2
-#     **filter.in_c（最后一维）= 1，输入张量通道数 = 244 / 488**
+#     **filter 的 in_c（最后一维）= 1，输入张量通道数 = 244 / 488**
 #   算术：input_channels 取自输入张量 = 244 → wdims_in[3]=244
 #         → map_in = input + out_channel*3*3*244 = input + out_channel*2196
 #         而权重张量只有 244*3*3*1 = 2196 字节 → out_channel>=1 必然越界读。
-#         ⚠️ 越界**不在 in_z**（wdims_in 在乘法之前初始化，本来就拿到原值），
-#            而在 map_in 的**步长**用了 input_channels —— 与 filter.in_c 不是同一个量。
 #
 # 为什么是「不接管」而不是「改系数排布」：
 #   从 coeff 构造（weights_map[input_channels][w][h]）到 strided_to_normal 的整条路径
@@ -540,7 +544,6 @@ fi
 #   depthwise 的 filter 布局是 [1,h,w,out_c]，dims[3] 是输出通道，豁免。
 #
 # 预期效果：不崩 + 接管数下降（那 2 个算子回退 CPU）+ 第 ④ 级逐字节比对应通过。
-# ⚠️ 接管数下降 2 个是**预期行为**，不是回归 —— 那两个算子本就不该被接管。
 #
 # ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
 # ⚠️ 目标文件是 etnaviv_ml.c（不是 ml_nn*.c）。
@@ -566,6 +569,58 @@ if [ "${TEFLON_FSGUARD:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3h/6] filter 形状守卫：默认关闭（设 TEFLON_FSGUARD=1 启用）"
+fi
+
+# ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────
+# 【目的：区分三条静态层面都能自洽的假说，必须用运行时数据】
+#   真机现象（675a1091 / c8e8e658 均复现）：
+#     Invoke 阶段 SIGSEGV，回溯 etna_ml_subgraph_read_outputs+0x188
+#       ← +0x8564c == partition_invoke（frontends/teflon/tfl_device.c:702）
+#     addr2line（CI 与本地复核一致）：0x2307e8 → etnaviv_ml.c:1076
+#       （FSGUARD 净增 23 行 ⇒ 干净源码 1053 行 =
+#        `((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;`）
+#     反汇编：ldrb w0,[x24,w26]（src_map[k]），且 NULL 分支走 __assert_fail
+#       ⇒ **src_map 非 NULL 但是野指针**
+#
+#   H1 output_idxs[i] 越界索引 subgraph->tensors dynarray
+#      —— 本地已算：partition 1 输出 tensor=139、dynarray 大小=140，**不越界**
+#   H2 pipe_buffer_size(res) != tensor->size
+#      —— read_outputs 绕过 tensor->offset 直接 map 整个 resource，
+#         循环上界却用 tensor->size
+#   H3 resource 跨 context 失效
+#      —— subgraph 是 device 级（tfl_device.c:603），context 每次 invoke 新建（:666）
+#
+#   本补丁打印：i / idx / n_tensors / IN|OOB / 槽指针 / res / tsize / toff
+#                + map 后的 bsize 与 src_map
+#   自我保护：只读 util_dynarray_element 的槽值，**不调 etna_ml_get_tensor**
+#   （它在槽为 NULL 时会 calloc 并写入，idx 越界时等于往野地址写，会掩盖现场）。
+#
+# ⚠️ 该产物含取证打印，**不可交付**。
+# ⚠️ 目标文件 etnaviv_ml.c（与 3h 同一文件，顺序在 3h 之后）。
+# ⚠️ 默认关闭。⚠️ **上机必须同时设 ETNA_MESA_DEBUG=ml_msgs**，
+#    否则 ML_DBG 不打印（格式串进 .rodata，但 DBG_ENABLED 是运行期判断）。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_RODIAG=1
+if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
+	echo "==> [3i/6] 打【诊断】read_outputs 越界取证（该产物不可交付）"
+	PATCHER9="$SCRIPT_DIR/patch-etnaviv-readout-diag.py"
+	MLRD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER9" ]; then
+		echo "ERROR: 设了 TEFLON_RODIAG=1 却缺 $PATCHER9"
+		exit 1
+	fi
+	if [ ! -f "$MLRD" ]; then
+		echo "ERROR: 找不到 $MLRD"
+		exit 1
+	fi
+	python3 "$PATCHER9" "$MLRD" || {
+		echo "ERROR: read_outputs 取证补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出无取证的 .so，白跑一轮真机验证）。"
+		echo "       请跑 tools/gen-rodiag-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3i/6] read_outputs 取证：默认关闭（设 TEFLON_RODIAG=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
@@ -805,7 +860,7 @@ echo "    选项定义文件: $OPT_FILE"
 # 对 26.2.5 会把**所有**选项都误判为不存在（已实测踩过）。
 extract_opts() {
 	awk '
-/^[[:space:]]*option\([[:space:]]*$/ { want=1; next }
+	/^[[:space:]]*option\([[:space:]]*$/ { want=1; next }
 /^[[:space:]]*option\(/              { want=0
 	    if (match($0, /'"'"'[^'"'"']+'"'"'/)) print substr($0, RSTART+1, RLENGTH-2); next }
 	want && match($0, /'"'"'[^'"'"']+'"'"'/) { print substr($0, RSTART+1, RLENGTH-2); want=0 }

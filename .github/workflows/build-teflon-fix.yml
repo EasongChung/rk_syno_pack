@@ -358,7 +358,11 @@ jobs:
 
       # ★ FSGUARD 文档一致性门：注释描述必须与代码实际做的事对齐。
       #   基准（och 指定）：头部 TEFLON_FSGUARD 段 **与** 3h 步注释都必须出现
-      #   `op#58` 与 `filter.in_c`；作废方案（SNFIX / strided-normal）不得残留。
+      #   `op#58`，并且必须出现「filter 深度（= in_c）≠ 输入通道数」的表述；
+      #   作废方案（SNFIX / strided-normal）不得残留。
+      #   ⚠️ 措辞允许三种写法：`filter.in_c`（旧版）/ `filter 的 in_c` / `filter 深度`
+      #      （och 版 build-teflon.sh 用后两种）。三者语义相同，门不该因措辞分歧判红；
+      #      但**必须至少命中一种** —— 放宽的只是措辞，不是「必须写清」这件事。
       #   ⚠️ 只扫 oes-teflon/**，**不扫本 workflow 自己** —— 否则断言里的字面量
       #      会把自己判红（上一轮踩过的自指陷阱）。
       - name: Static check - FSGUARD docs consistency
@@ -387,9 +391,20 @@ jobs:
               else:
                   fail.append('%s 缺少「%s」' % (where, pat))
 
-          for pat in ('op#58', 'filter.in_c'):
+          for pat in ('op#58',):
               need('头部', head, pat)
               need('3h', sec, pat)
+
+          # 「filter 深度（= in_c）≠ 输入通道数」的表述：三种写法任一即可（见上方说明）
+          for where, text in (('头部', head), ('3h', sec)):
+              hits = [a for a in ('filter.in_c', 'filter 的 in_c', 'filter 深度')
+                      if a in text]
+              if hits:
+                  print('  ok(%s): filter 深度/in_c 表述命中 %r' % (where, hits))
+              else:
+                  fail.append('%s 缺少「filter 深度（= in_c）≠ 输入通道数」的表述'
+                              '（接受 filter.in_c / filter 的 in_c / filter 深度）'
+                              % where)
 
           print('=== 作废方案不得残留 ===')
           for f in sorted(glob.glob('oes-teflon/**/*.py', recursive=True) +
@@ -515,6 +530,13 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: [och-wc] absent (diag switch really off)"
+          # ★ 反向门：RODIAG（read_outputs 越界取证）的字符串也一个都不该在 ——
+          #   它是本轮新增的第三个诊断开关，误开会让交付产物多出运行期打印与体积。
+          if strings -a "$SO" | grep -qF '[och-ro]'; then
+            echo "ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物"
+            exit 1
+          fi
+          echo "STRING-CHECK: [och-ro] absent (RODIAG switch really off)"
 
       # 失败时把「出错现场」一次性打印出来，省掉一轮往返。
       # 起因：ocfix 的结构门用 `src.find("\nstatic", fn_at)` 划函数体边界 ——
