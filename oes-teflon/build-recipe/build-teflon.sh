@@ -34,7 +34,18 @@
 #                         锚点由 tools/gen-wcdiag-patch.py 从真实源码逐字生成。
 #                         ⚠️ 不改行为：崩溃行仍会照旧触发，但那一行已进日志
 #
+#   TEFLON_OCFIX=1       修正 write_core_interleaved() 的 out_channel 映射
+#                         （core*kernels_per_core + 前序 superblock 累计偏移 + kernel，
+#                          去掉多余的 * cores_used），并加越界钳位护栏。
+#                         根因已由真机 [och-wc] 日志证实：136 组合 0 反例地复现公式，
+#                         且出现 out_channel >= output_channels（实测 123 vs 122）→ SIGSEGV。
+#                         锚点由 tools/gen-ocfix-patch.py 从真实源码逐字生成，
+#                         自带精确计数门 + 10 个反例测试。
+#                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
+#                            不崩只说明越界消失，不代表系数排布正确。
+#
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+#   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -372,7 +383,8 @@ fi
 #   write_core_interleaved()  etnaviv_ml_nn_v7.c:345
 #   wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);
 # 而 weights_map 是把权重缓冲区强转成 [out_channel][z][x][y] 四维视图。
-# **待证伪/证实**：`out_channel` 是否会超过 `output_channels`。
+# **已证实**（真机取证产物，见 3g）：`out_channel` 确实会超过 `output_channels`
+#   —— 136 个独立组合 0 反例地复现公式，且出现 out_ch=123 > output_channels=122。
 # 本补丁只打印数字、不改行为 —— 打印紧挨崩溃行，且 tf_load_check 日志无缓冲。
 #
 # ⚠️ 默认关闭。诊断产物不可交付。
@@ -394,6 +406,50 @@ if [ "${TEFLON_WCDIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3f/6] out_channel 取证补丁：默认关闭（设 TEFLON_WCDIAG=1 启用）"
+fi
+
+# ── 3g. 【修复】write_core_interleaved 的 out_channel 映射 + 越界钳位 ──────
+# 【机制已由真机数据证实，不是推理】
+#   取证产物（TEFLON_WCDIAG=1，真机 per-tensor 模型）打出 136 个独立组合，
+#   现用公式 core*kernels_in_superblock + kernel
+#              + superblock*DIV_ROUND_UP(kernels_per_core,superblocks)*cores_used
+#   **0 个反例地复现了全部实测 out_ch**，并确实出现 out_ch >= output_channels
+#   （实测 122 / 123，而 output_channels = 122）→ weights_map[out_channel]
+#   与 biases[out_channel] 越界读 → SIGSEGV。
+# 本补丁做两件事：修正映射（core*kernels_per_core + 前序 superblock 累计偏移 +
+# kernel，去掉多余的 * cores_used）；越界时钳位到 output_channels-1。
+#
+# 护栏用**钳位**而非 continue：函数内 append_bits(kernels_per_core, 16, ...)
+# 已把「每 core 槽位数」写进位流头，跳过会让位流少槽而整体错位。
+#
+# ⚠️ 只修 write_core_interleaved 一处：同款公式在文件里另有 3 处
+#    （write_core_6 ×2、write_core_sequential），属同一缺陷类但**无真机证据**，
+#    不把未验证的改动混进交付产物。已记录为待修项。
+#
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+# ⚠️ 产物仍须过四级判据第 ④ 级（与 x86 基准逐字节一致）才算「能用」。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 ./build-teflon.sh
+if [ "${TEFLON_OCFIX:-0}" = "1" ]; then
+	echo "==> [3g/6] 打【修复】write_core_interleaved out_channel 映射修正 + 越界钳位"
+	PATCHER6="$SCRIPT_DIR/patch-etnaviv-outchannel-fix.py"
+	ML7O="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER6" ]; then
+		echo "ERROR: 设了 TEFLON_OCFIX=1 却缺 $PATCHER6"
+		exit 1
+	fi
+	if [ ! -f "$ML7O" ]; then
+		echo "ERROR: 找不到 $ML7O"
+		exit 1
+	fi
+	python3 "$PATCHER6" "$ML7O" || {
+		echo "ERROR: out_channel 修复补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未修复的 .so，崩溃会照旧）。"
+		echo "       请跑 tools/gen-ocfix-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3g/6] out_channel 修复补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
