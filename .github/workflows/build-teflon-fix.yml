@@ -304,7 +304,8 @@ jobs:
           for pat in '[3e/6] 打【修复】v7' \
                      '[och-fix] 已修复 v7 calculate_bias_correction' \
                      '[3g/6] 打【修复】write_core_interleaved' \
-                     '[och-ocfix] 已修正 out_channel 映射并加越界钳位'; do
+                     '[och-ocfix] 已加 out_channel 尾部越界钳位' \
+                     '[och-ocfix] 原式保留未动'; do
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
             else
