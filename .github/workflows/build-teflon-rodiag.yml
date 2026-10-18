@@ -620,13 +620,8 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: [och-wc] absent (diag switch really off)"
-          # ★ 反向门：RODIAG（read_outputs 越界取证）的字符串也一个都不该在 ——
-          #   它是本轮新增的第三个诊断开关，误开会让交付产物多出运行期打印与体积。
-          if strings -a "$SO" | grep -qF '[och-ro]'; then
-            echo "ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物"
-            exit 1
-          fi
-          echo "STRING-CHECK: [och-ro] absent (RODIAG switch really off)"
+          # （原交付候选里的 [och-ro] 反向门已由派生脚本删除：本构建**就该有** [och-ro]，
+          #   正门在上面。两道门同时存在 = 必然假红 —— 09:21 那次已经踩过一次，别再加回来。）
 
       # ★ 本轮的取证靠**运行期输出**，不靠地址；但产物带 DWARF，顺手把新布局记进日志。
       #   RODIAG 改写了 read_outputs 自身 ⇒ 其内部偏移与后续函数（含 tfl_device.o 里的
