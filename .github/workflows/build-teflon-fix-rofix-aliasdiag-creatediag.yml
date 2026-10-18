@@ -850,6 +850,16 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: [och-create] PRESENT (CREATEDIAG really in .so)"
+          # ★★ 字节直查（**不是** strings）：探针含中文，GNU strings 默认 7-bit，
+          #   会在 UTF-8 字节处把串切断 ⇒ `strings | grep` 必然漏检（假绿）。
+          #   实测过：64933494 / 39146418954 上 `strings | grep '*** size 不一致'`
+          #   判 absent，而字节直查 FOUND @0x31521c。凡含非 ASCII 的探针一律走这里。
+          if ! python3 -c "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if '*** size 不一致'.encode('utf-8') in b else 1)" "$SO"; then
+            echo "ERROR: 字节直查找不到「*** size 不一致」标记 —— CREATEDIAG 的不一致标记没进二进制"
+            echo "       （注意：不能用 strings|grep 查这一条，7-bit 会漏检）"
+            exit 1
+          fi
+          echo "BYTE-CHECK: '*** size 不一致' PRESENT (byte-level; strings would MISS it)"
           # ★ 反向门：诊断开关的字符串一个都不该在
           if strings -a "$SO" | grep -qF '[och-wc]'; then
             echo "ERROR: 产物里出现 [och-wc] —— WCDIAG 诊断开关误开，这不是交付产物"
@@ -872,6 +882,18 @@ jobs:
       #   ALIASDIAG 把代码插在文件前部（:198/:226 两个函数），
       #   6acfef1f 的 read_outputs 地址（0x230660/0x2307e8/0x8561c）**按设计作废**，
       #   不跨构建对账；这里 nm/addr2line 现取，供真机若再崩时对照。
+      # ★ 负控制：字节直查门必须能变红。做法：对当前 .so 查一个**保证不存在**的中文
+      #   探针，python 必须以非 0 退出。若这一步意外通过，说明字节直查实现有 bug。
+      - name: Negative control - byte-level probe gate can go red
+        run: |
+          set -eu
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          if python3 -c "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if '这个探针一定不存在-och-neg-ctrl'.encode('utf-8') in b else 1)" "$SO"; then
+            echo 'ERROR: 负控制反了 —— 不存在的中文探针竟被判存在，字节直查实现有 bug'
+            exit 1
+          fi
+          echo 'NEG-CTRL: byte-level probe correctly reports MISS (gate can go red)'
+
       # ★ 本轮产物带 DWARF：顺手把**四个目标函数的新地址**记进日志 ——
       #   ALIASDIAG 插在 :198/:226，CREATEDIAG 插在 :70/:92（更靠前），
       #   6acfef1f / 64933494 的 read_outputs 地址**按设计作废**，不跨构建对账；
@@ -986,6 +1008,8 @@ jobs:
             echo "expect1=NO fix is claimed this round; the assert may still fire (that is the point)"
             echo "known_open=why etna_ml_create_resource() allocated 5000 for a 610000-byte tensor is NOT fixed here; this build only collects evidence"
             echo "caveat=none known: the patch is print-only and every gate is green; this build only collects evidence and claims no fix"
+            echo "device_log_tip=pipe the device log into `python3 oes-teflon/tools/check-create-log.py -` to get the accounting done: per-shape line counts, side-by-side req_size/actual counts, per-idx timeline, alias size-overwrite detection. It flags internal contradictions (e.g. counting req_size=5000 as absent while counting actual=5000 as present)"
+            echo "strings_pitfall=GNU strings is 7-bit by default: a probe containing non-ASCII (e.g. the *** size 不一致 marker) is CUT at the UTF-8 bytes and `strings | grep` silently MISSES it (measured on 64933494/39146418954). Any probe with non-ASCII must be checked byte-wise in python, never via strings"
             echo "why=ROFIX turned the wild-pointer SIGSEGV into an observable assert: pipe_buffer_map_range: offset + length <= buffer->width0 failed"
             echo "     => tensor metadata (offset/size) disagrees with the real resource size"
             echo "purpose5=alias evidence: print reference_tensor_with_offset / recreate_tensor params + per-tensor migration BEFORE-state (etnaviv_ml.c step 3k)"
