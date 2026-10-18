@@ -395,9 +395,47 @@ def run_seq(text, seq):
     return text, None
 
 
+def run_seq_override(text, seq, new_mark=None):
+    """按 seq 打补丁，并可覆盖 CREATEDIAG 的 NEW_MARK（用于构造「旧形态」负控制）。"""
+    for name in seq:
+        path = {"create": P_CREATE, "alias": P_ALIAS, "rofix": P_ROFIX}[name]
+        ov = {"NEW_MARK": new_mark} if (name == "create" and new_mark) else None
+        rc, _o, err, text = run_patch(text, patcher_path=path, overrides=ov)
+        if rc != 0:
+            return None, (name, rc, err.strip()[-140:])
+    return text, None
+
+
+def coexist_problems(text):
+    """共存门：除了 marker 在场，还必须断言**每个补丁器自己的 NEW_* / ANCHOR_MARK
+    仍是连续文本且各恰好 1 处** —— 那正是各自构建后锚点门依赖的不变量。
+
+    ⚠️ 第一版共存门只查「marker 字符串在不在 / 某处 NEW 是不是 1 份」，
+       于是 run 39145972254 的真实失败（ALIASDIAG 的 NEW_MARK 被 CREATEDIAG
+       从中间劈开 ⇒ **它的**构建后锚点门红）在我这里**显示为绿**。
+       教训：共存门必须断言每个补丁器**自己的**锚点不变量，而不是「打进去了没有」。
+    """
+    bad = []
+    for nm, blocks, anchor in (("CREATEDIAG",
+                                (P.NEW_CREATE, P.NEW_DESTROY, P.NEW_MARK), P.ANCHOR_MARK),
+                               ("ALIASDIAG", (A.NEW_REF, A.NEW_REC, A.NEW_MARK),
+                                A.ANCHOR_MARK),
+                               ("ROFIX", (R.NEW,), None)):
+        for i, blk in enumerate(blocks):
+            n = text.count(blk)
+            if n != 1:
+                bad.append("%s 的第 %d 个 NEW_* 命中 %d（须恰好 1：块被别的补丁劈开了）"
+                           % (nm, i + 1, n))
+        if anchor is not None and text.count(anchor) != 1:
+            bad.append("%s 的 ANCHOR_MARK 命中 %d（须 1）" % (nm, text.count(anchor)))
+    if text.count("{") != text.count("}"):
+        bad.append("括号不配平")
+    return bad
+
+
 for seq, label in ((("create", "alias", "rofix"), "CREATEDIAG→ALIASDIAG→ROFIX"),
                    (("rofix", "alias", "create"), "ROFIX→ALIASDIAG→CREATEDIAG"),
-                   (("alias", "rofix", "create"), "ALIASDIAG→ROFIX→CREATEDIAG")):
+                   (("rofix", "create", "alias"), "ROFIX→CREATEDIAG→ALIASDIAG")):
     text, failinfo = run_seq(MOCK_ALL, seq)
     if failinfo:
         report("共存  " + label, False, "%s rc=%s %s" % failinfo)
@@ -409,11 +447,25 @@ for seq, label in ((("create", "alias", "rofix"), "CREATEDIAG→ALIASDIAG→ROFI
     for c in (P.COMPILE_MARK, A.COMPILE_MARK):
         if c not in text:
             bad.append("缺编译期标记 %r" % c)
-    if text.count("{") != text.count("}"):
-        bad.append("括号不配平")
-    if text.count(P.NEW_CREATE) != 1 or text.count(A.NEW_REF) != 1 or text.count(R.NEW) != 1:
-        bad.append("某处 NEW 不是恰好 1 份")
+    bad += coexist_problems(text)
     report("共存  " + label, not bad, "; ".join(bad))
+
+# ── 共存门的负控制：把 NEW_MARK 换回「插在锚点之后」的旧形态 ──────────
+# 这一步证明共存门**真能**抓到 run 39145972254 那类劈开；否则上面的「全绿」又是假绿。
+print()
+if P.NEW_MARK.endswith(P.ANCHOR_MARK):
+    INJ = P.NEW_MARK[:-len(P.ANCHOR_MARK)]
+    OLD_MARK = P.ANCHOR_MARK + INJ                    # 旧形态：锚点在前、块在后
+    after_old, fail_old = run_seq_override(MOCK_ALL, ("rofix", "alias", "create"),
+                                           new_mark=OLD_MARK)
+    n_alias = after_old.count(A.NEW_MARK) if after_old else -1
+    report("负控  旧形态共存必须被判红（否则共存门是假绿）",
+           bool(after_old) and n_alias != 1,
+           "打补丁 %s；ALIASDIAG.NEW_MARK 命中 %d（应 !=1）" % (fail_old or "成功", n_alias))
+    if after_old and n_alias != 1:
+        print("        ⇒ 旧形态下 ALIASDIAG 的构建后锚点门必红 —— 这就是 run 39145972254 的成因")
+else:
+    report("负控  旧形态共存必须被判红", False, "NEW_MARK 不以 ANCHOR_MARK 结尾，无法构造旧形态")
 
 # ── 生成器一致性 ────────────────────────────────────────────────────
 print()

@@ -401,7 +401,22 @@ def _extract(src):
     if i3 < 0:
         die("找不到 `#include <stdio.h>`")
     anchor_mark = lines[i3] + "\n"
-    new_mark = lines[i3] + "\n" + INJ_MARK
+    # ★ 标记块必须插在锚点行**之前**（INJ_MARK + 锚点），不能插在之后。
+    #
+    # 原因（run 39145972254 真实失败 + 本地两向复现）：ALIASDIAG 与 CREATEDIAG
+    # 共用同一行锚点 `#include <stdio.h>`，而且两边都是「锚点 + 自己的块」形态。
+    #   先应用的那个块会被后一个**从中间劈开**（劈在 include 行与自己的注释之间），
+    #   于是**先应用**者的 `NEW_MARK` 不再是连续文本 ⇒ 它自己的构建后保真逆变换
+    #   前提不成立 ⇒ 那个锚点门必红（实测：ALIAS 先则 ALIAS 门红；CREATED 先则
+    #   CREATED 门红）。**与顺序无关，两个里必红一个。**
+    #
+    # 插在之前则顺序无关地都成立：无论谁先谁后，最终文本都是
+    #   [created 块] #include <stdio.h> \n\n [alias 块]
+    # 两边的 `NEW_MARK` 都保持连续，`ANCHOR_MARK` 也都恰好 1 处。
+    #
+    # 前向检查不受影响：`ANCHOR_MARK` 在任一时刻只出现 1 次（另一家的块里那 1 次
+    # 就是它自己 NEW_MARK 的组成部分），所以 `n != 1` 的拒绝逻辑照样成立。
+    new_mark = INJ_MARK + lines[i3] + "\n"
 
     globals()["_EQ_PAIRS"] = (("create", old_create, full),
                               ("destroy", old_destroy, old_destroy.replace(

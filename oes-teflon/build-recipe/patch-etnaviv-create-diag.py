@@ -50,7 +50,7 @@ NEW_CREATE = 'etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned 
 OLD_DESTROY = '   pipe_resource_reference(&tensor->resource, NULL);\n'
 NEW_DESTROY = '   /* och patch: create_tensor 取证 —— destroy 侧，只加打印 */\n   ML_DBG("[och-create]   destroy   idx=%u res=%p actual=%u\\n",\n          idx, (void *)tensor->resource,\n          tensor->resource ? pipe_buffer_size(tensor->resource) : 0u);\n   pipe_resource_reference(&tensor->resource, NULL);\n'
 ANCHOR_MARK = '#include <stdio.h>\n'
-NEW_MARK = '#include <stdio.h>\n\n/* och patch: create_tensor 分配取证 —— 编译期标记 */\n__attribute__((used)) static const char och_creatediag_marker[] = "och-patch-creatediag";\n'
+NEW_MARK = '\n/* och patch: create_tensor 分配取证 —— 编译期标记 */\n__attribute__((used)) static const char och_creatediag_marker[] = "och-patch-creatediag";\n#include <stdio.h>\n'
 # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
 
