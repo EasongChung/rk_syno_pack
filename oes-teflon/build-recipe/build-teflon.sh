@@ -49,6 +49,17 @@
 #                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
 #                            不崩只说明越界消失，不代表系数排布正确。
 #
+#   TEFLON_ROFIX=1        【修复】read_outputs 映射范围与读取范围对齐。
+#                         根因（真机 RODIAG 取证 0078f5b2，三条假说一次性判定）：
+#                         H1 idx 越界**排除**；H2 pipe_buffer_size(res)!=tensor->size
+#                         **确认**（致命组 bsize=5000 vs tsize=610000，
+#                         越界读 605000 字节）；H3 跨 context 资源失效**排除**。
+#                         改法：map 参数与 invoke(:908) 同构 (tensor->offset, tensor->size)
+#                         + idx 边界检查。不加 min() 截断（会把越界换成静默错误数值）。
+#                         目标文件 etnaviv_ml.c（3j 步，在 3i 之后）。
+#                         ⚠️ 与 TEFLON_RODIAG=1 互斥（都改这个循环体）。
+#                         ⚠️ 只针对崩溃；tensor->size 被批量改写的更深问题未处理。
+#                         锚点由 tools/gen-rofix-patch.py 从真实源码逐字生成。
 #   TEFLON_RODIAG=1       【诊断】read_outputs 越界取证：打印 idx / n_tensors / 槽 / res /
 #                         tsize / toff / bsize / src_map，用于区分 H1(idx 越界) /
 #                         H2(bsize != tsize) / H3(resource 跨 context 失效)。
@@ -71,6 +82,7 @@
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
+#   本轮修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -621,6 +633,59 @@ if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3i/6] read_outputs 取证：默认关闭（设 TEFLON_RODIAG=1 启用）"
+fi
+
+# ── 3j. 【修复】read_outputs 映射范围与读取范围对齐 ───────────────────────
+# 【根因：真机运行时数据，RODIAG 取证（0078f5b2），三条假说一次性判定】
+#   崩溃点（新产物重取，旧偏移已作废）：
+#     etna_ml_subgraph_read_outputs+0x220 → etnaviv_ml.c:1095
+#       = `((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;`
+#   [och-ro] 逐行：
+#     idx=139 n_tensors=141 IN  bsize=940896 off_expected=940896   一致
+#     idx=149 n_tensors=152 IN  bsize=610000 off_expected=305000   bsize=2×tsize
+#     idx=151 n_tensors=152 IN  bsize=5000   off_expected=610000   ★ 致命
+#
+#   H1 idx 越界  → 排除（三组全部 IN）
+#   H2 bsize≠tsize → **确认**：map 长度用 pipe_buffer_size(res)=5000，
+#                     循环上界用 tensor->size=610000 ⇒ 越界读 605000 字节
+#   H3 跨 context 资源失效 → 排除（src_map 均为合法 mmap 地址）
+#
+# 修法：map 参数改成与 invoke（etnaviv_ml.c:908）完全同构 ——
+#       (tensor->offset, tensor->size)，并加 idx 边界检查。
+#   不加 min() 截断：前两处的教训是「改单点会把越界换成静默错误数值」。
+#   resource 真不够大时 map 返回 NULL → assert 明确失败（可观测）。
+#
+# ⚠️ 与 TEFLON_RODIAG=1 互斥（都改这个循环体）。
+# ⚠️ 该修复只针对**崩溃**；tsize 被 etna_ml_tensor_offset 批量改写的更深问题未处理。
+# ⚠️ 默认关闭。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+if [ "${TEFLON_ROFIX:-0}" = "1" ]; then
+	if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
+		echo "ERROR: TEFLON_ROFIX 与 TEFLON_RODIAG 互斥"
+		echo "       （两者都改 etna_ml_subgraph_read_outputs 的循环体，锚点会冲突）"
+		echo "       交付构建请只开 TEFLON_ROFIX=1。"
+		exit 1
+	fi
+	echo "==> [3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查"
+	PATCHER10="$SCRIPT_DIR/patch-etnaviv-readout-offset-fix.py"
+	MLRF="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER10" ]; then
+		echo "ERROR: 设了 TEFLON_ROFIX=1 却缺 $PATCHER10"
+		exit 1
+	fi
+	if [ ! -f "$MLRF" ]; then
+		echo "ERROR: 找不到 $MLRF"
+		exit 1
+	fi
+	python3 "$PATCHER10" "$MLRF" || {
+		echo "ERROR: read_outputs 范围修复补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未修复的 .so，崩溃会照旧）。"
+		echo "       请跑 tools/gen-rofix-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3j/6] read_outputs 范围修复：默认关闭（设 TEFLON_ROFIX=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
