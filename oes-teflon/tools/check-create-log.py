@@ -32,16 +32,26 @@
 import re
 import sys
 
+# ⚠️ `(?:sg=\d+\s+)?` 是**可选**的子图标识前缀（下一轮取证要求带），且**必须完全
+#    非捕获**：写成 `(?:sg=(\d+)\s+)?` 会把后面所有组号右移一位，下面的 m.group(N)
+#    就全错位了 —— 我第一版就这么写错了，当场发现。子图号另用 sg_of(line) 取。
 RE_ENTER = re.compile(
-    r"\[och-create\] enter\s+idx=(\d+) req_size=(\d+) have_res=(\S+) "
+    r"\[och-create\] enter\s+(?:sg=\d+\s+)?idx=(\d+) req_size=(\d+) have_res=(\S+) "
     r"have_size=(\d+) have_actual=(\d+)")
 RE_EARLY = re.compile(
-    r"\[och-create\]\s+EARLY-RETURN idx=(\d+) req_size=(\d+) tensor_size=(\d+) "
-    r"res=(\S+) actual=(\d+)\s*(.*)$")
+    r"\[och-create\]\s+EARLY-RETURN\s+(?:sg=\d+\s+)?idx=(\d+) req_size=(\d+) "
+    r"tensor_size=(\d+) res=(\S+) actual=(\d+)\s*(.*)$")
 RE_CREATED = re.compile(
-    r"\[och-create\]\s+created\s+idx=(\d+) req_size=(\d+) res=(\S+) actual=(\d+)")
+    r"\[och-create\]\s+created\s+(?:sg=\d+\s+)?idx=(\d+) req_size=(\d+) res=(\S+) actual=(\d+)")
 RE_DESTROY = re.compile(
-    r"\[och-create\]\s+destroy\s+idx=(\d+) res=(\S+) actual=(\d+)")
+    r"\[och-create\]\s+destroy\s+(?:sg=\d+\s+)?idx=(\d+) res=(\S+) actual=(\d+)")
+
+_SG_RE = re.compile(r"\bsg=(\d+)")
+
+
+def sg_of(line):
+    m = _SG_RE.search(line)
+    return int(m.group(1)) if m else None
 RE_REF = re.compile(
     r"\[och-alias\] ref\s+src=(\d+) dst=(\d+) offset=(\d+) size=(\d+) "
     r"old_res=(\S+) new_res=(\S+)")
@@ -77,7 +87,16 @@ def main():
 
     ev = []            # (lineno, kind, payload)
     counts = {}
+    sg_by_line = {}
+    sg_wanted = None
+    if "--sg" in sys.argv and sys.argv[sys.argv.index("--sg") + 1].isdigit():
+        sg_wanted = int(sys.argv[sys.argv.index("--sg") + 1])
     for no, line in enumerate(lines, 1):
+        sg_by_line[no] = sg_of(line)
+        if sg_wanted is not None:
+            s = sg_of(line)
+            if s is not None and s != sg_wanted:
+                continue
         for kind, rx in (("enter", RE_ENTER), ("early", RE_EARLY),
                          ("created", RE_CREATED), ("destroy", RE_DESTROY),
                          ("ref", RE_REF), ("migrate", RE_MIGRATE),
@@ -87,6 +106,12 @@ def main():
                 counts[kind] = counts.get(kind, 0) + 1
                 ev.append((no, kind, m))
                 break
+
+    def key(no, idx):
+        """按 (子图, idx) 分组。idx 是子图局部编号 ⇒ 不带 sg 分组就会把不同子图的
+        同一个 idx 混成同一个张量。**这条是被 sg 用例当场抓出来的**：sg=7 与 sg=9
+        各有一次 created idx=151，不分组就会被误判成「重复创建且无解释」。"""
+        return (sg_by_line.get(no), idx)
 
     print("=== 0. 行数统计 ===")
     for k in ("enter", "early", "created", "destroy", "ref", "migrate", "recreate"):
@@ -98,6 +123,18 @@ def main():
     if not ev:
         print("\nRESULT: 日志里没有任何 [och-*] 行 —— 是不是忘了 ETNA_MESA_DEBUG=ml_msgs？")
         return 1
+
+    print()
+    print("=== 0b. ★ 子图局部性警告（读下面任何 per-idx 结论前必读）===")
+    has_sg = any("[och-create]" in l and " sg=" in l for l in lines)
+    if not has_sg:
+        print("  ⚠️ 本日志**没有子图标识**（形如 `sg=`）。`etna_ml_tensor` 的 idx 是")
+        print("     **子图局部**编号：每个 partition 各建一张表，同一个 idx 在不同")
+        print("     partition 里指的是**不同张量**。⇒ 第 4/5 节的「per-idx 时间线」")
+        print("     与「alias 改写 size」在跨 partition 的行上**不成立**，只能当线索。")
+        print("     下一轮取证务必带子图标识（本工具已支持 `sg=` 字段，见 --sg）。")
+    else:
+        print("  日志带子图标识 ⇒ per-idx 结论可在本子图内成立（用 --sg <id> 限定）")
 
     print()
     print("=== 1. created 行的 req_size vs actual（必须逐行相等）===")
@@ -151,12 +188,13 @@ def main():
     tl = {}
     for no, kind, m in ev:
         if kind in ("enter", "early", "created", "destroy"):
-            tl.setdefault(int(m.group(1)), []).append((no, kind, m))
+            tl.setdefault(key(no, int(m.group(1))), []).append((no, kind, m))
         elif kind == "ref":
-            tl.setdefault(int(m.group(2)), []).append((no, "ref-dst", m))
-            tl.setdefault(int(m.group(1)), []).append((no, "ref-src", m))
-    for idx in sorted(tl):
-        seq = tl[idx]
+            tl.setdefault(key(no, int(m.group(2))), []).append((no, "ref-dst", m))
+            tl.setdefault(key(no, int(m.group(1))), []).append((no, "ref-src", m))
+    for k in sorted(tl, key=lambda t: (str(t[0]), t[1])):
+        idx = k[1]
+        seq = tl[k]
         if len(seq) < 2 and not any(k == "ref-dst" for _n, k, _m in seq):
             continue
         parts = []
@@ -176,29 +214,30 @@ def main():
                              % (no, m.group(4), m.group(5), m.group(6)))
             elif kind == "ref-src":
                 parts.append("L%d REF->src" % no)
-        print("  idx=%-4d %s" % (idx, "  ".join(parts)))
+        print("  sg=%-5s idx=%-4d %s" % (k[0], idx, "  ".join(parts)))
 
     print()
     print("=== 5. ★ alias 无条件改写 dst->size：与该 idx 先前 create 的 size 不符者 ===")
-    last_size = {}      # idx -> 最近一次 create/enter 看到的 tensor->size
+    last_size = {}      # (sg, idx) -> 最近一次 create/enter 看到的 tensor->size
     for no, kind, m in ev:
         if kind == "created":
-            last_size[int(m.group(1))] = int(m.group(2))
+            last_size[key(no, int(m.group(1)))] = int(m.group(2))
         elif kind == "enter":
             if int(m.group(4)):
-                last_size[int(m.group(1))] = int(m.group(4))
+                last_size[key(no, int(m.group(1)))] = int(m.group(4))
         elif kind == "ref":
             dst, newsz, old_res = int(m.group(2)), int(m.group(4)), m.group(5)
-            prev = last_size.get(dst)
+            prev = last_size.get(key(no, dst))
             if prev is not None and prev != newsz:
-                print("  L%d dst=%d : tensor->size 由 %d 被改写成 %d（old_res=%s, new_res=%s）"
-                      % (no, dst, prev, newsz, old_res, m.group(6)))
+                print("  L%d sg=%s dst=%d : tensor->size 由 %d 被改写成 %d"
+                      "（old_res=%s, new_res=%s）"
+                      % (no, sg_by_line.get(no), dst, prev, newsz, old_res, m.group(6)))
                 print("       ⇒ buffer 大小仍是 %d 那一版；元数据与 buffer 由此脱钩" % prev)
                 print("       ⇒ 这类「alias 改 size、不改 buffer」就是 assert 的机械成因")
             elif prev is None:
-                print("  L%d dst=%d : 首次出现，alias 直接写 size=%d（此前无 create 记录）"
-                      % (no, dst, newsz))
-            last_size[dst] = newsz
+                print("  L%d sg=%s dst=%d : 首次出现，alias 直接写 size=%d（此前无 create 记录）"
+                      % (no, sg_by_line.get(no), dst, newsz))
+            last_size[key(no, dst)] = newsz
     if not any(k == "ref" for _n, k, _m in ev):
         print("  （本日志没有 [och-alias] 行 ⇒ 无法做 alias/size 对账）")
 
@@ -213,19 +252,20 @@ def main():
     between = {}
     for no, kind, m in ev:
         if kind == "created":
-            cre.setdefault(int(m.group(1)), []).append((no, int(m.group(2))))
+            cre.setdefault(key(no, int(m.group(1))), []).append((no, int(m.group(2))))
         elif kind == "early":
-            between.setdefault(int(m.group(1)), []).append(no)
+            between.setdefault(key(no, int(m.group(1))), []).append(no)
         elif kind == "ref":
-            between.setdefault(int(m.group(2)), []).append(no)   # 作为 dst 被改写
-            between.setdefault(int(m.group(1)), []).append(no)   # 作为 src 被搬
+            between.setdefault(key(no, int(m.group(2))), []).append(no)   # 作为 dst 被改写
+            between.setdefault(key(no, int(m.group(1))), []).append(no)   # 作为 src 被搬
         elif kind == "destroy":
-            between.setdefault(int(m.group(1)), []).append(no)
+            between.setdefault(key(no, int(m.group(1))), []).append(no)
     found_dup = False
-    for idx, lst in sorted(cre.items()):
+    for k in sorted(cre, key=lambda t: (str(t[0]), t[1])):
+        lst = cre[k]
         if len(lst) < 2:
             continue
-        expl = between.get(idx, [])
+        expl = between.get(k, [])
         for (n1, s1), (n2, s2) in zip(lst, lst[1:]):
             if s1 == s2:
                 continue
@@ -233,8 +273,9 @@ def main():
             if inter:
                 continue
             found_dup = True
-            bad("idx=%d 在 L%d(size=%d) 与 L%d(size=%d) 之间无 early-return/alias/destroy "
-                "解释却被重复创建" % (idx, n1, s1, n2, s2))
+            bad("sg=%s idx=%d 在 L%d(size=%d) 与 L%d(size=%d) 之间无 "
+                "early-return/alias/destroy 解释却被重复创建"
+                % (k[0], k[1], n1, s1, n2, s2))
     if not found_dup:
         print("  无（每个 idx 的多次 created 要么 size 相同，要么中间有解释事件）")
 
