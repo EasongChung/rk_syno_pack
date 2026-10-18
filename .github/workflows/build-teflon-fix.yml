@@ -377,7 +377,11 @@ jobs:
 
           cut = src.find('\nset -eu')
           head = src[:cut] if cut > 0 else ''
-          m = re.search(r'\n# ── 3h\.[\s\S]*?(?=\n# -{20,})', src)
+                    # ⚠️ 段截取必须在**下一段标题**（`# ── `）或长横线处停下：
+          #    只认长横线会把后面的段一起吞进来，而邻居段里往往含本段
+          #    的关键词（如 3k 里有 TEFLON_ROFIX / 默认关闭）⇒ 门被喂饱、
+          #    真正的缺失反而判不出来。负控制里有一条专测这个。
+          m = re.search(r'\n# ── 3h\.[\s\S]*?(?=\n# ── |\n# -{20,})', src)
           sec = m.group(0) if m else ''
 
           if not head:

@@ -469,7 +469,11 @@ jobs:
 
           cut = src.find('\nset -eu')
           head = src[:cut] if cut > 0 else ''
-          m = re.search(r'\n# ── 3j\.[\s\S]*?(?=\n# -{20,})', src)
+                    # ⚠️ 段截取必须在**下一段标题**（`# ── `）或长横线处停下：
+          #    只认长横线会把后面的段一起吞进来，而邻居段里往往含本段
+          #    的关键词（如 3k 里有 TEFLON_ROFIX / 默认关闭）⇒ 门被喂饱、
+          #    真正的缺失反而判不出来。负控制里有一条专测这个。
+          m = re.search(r'\n# ── 3j\.[\s\S]*?(?=\n# ── |\n# -{20,})', src)
           sec = m.group(0) if m else ''
 
           if not head:
@@ -661,7 +665,8 @@ jobs:
           echo "=== old baseline (675a1091) - VOID for this build (ROFIX shifts layout by design) ==="
           echo "  read_outputs=0x230660  fault=0x2307e8  caller=0x8564c"
 
-      # 失败时把「出错现场」一次性打印出来，省掉一轮往返。      # 起因：ocfix 的结构门用 `src.find("\nstatic", fn_at)` 划函数体边界 ——
+      # 失败时把「出错现场」一次性打印出来，省掉一轮往返。
+      # 起因：ocfix 的结构门用 `src.find("\nstatic", fn_at)` 划函数体边界 ——
       # 若下一个函数不是 static，fn_body 会越界、计数被污染、门**大声拒绝**。
       # 方向是安全的（不会误放行），但要知道真实源码长什么样才能改门。
       - name: On failure - dump patch target neighbourhood

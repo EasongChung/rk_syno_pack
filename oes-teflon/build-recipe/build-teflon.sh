@@ -49,6 +49,18 @@
 #                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
 #                            不崩只说明越界消失，不代表系数排布正确。
 #
+#   TEFLON_ALIASDIAG=1    【诊断】alias（批量元数据迁移）取证。
+#                         起因：ROFIX 把野指针换成 assert
+#                           `pipe_buffer_map_range: offset + length <= buffer->width0'
+#                           ⇒ tensor 元数据与 resource 实际大小不一致。
+#                         可疑：reference_tensor_with_offset(:198) 同时改 size/offset，
+#                           recreate_tensor(:226) **只改 size** —— 不对称是条线索；
+#                           两者都把「所有共享 old_res 的 tensor」改成同一组值。
+#                         调用点 CONCAT/SPLIT/Add-Subtract/BYPASS。
+#                         ★ 与 TEFLON_ROFIX=1 **可同时开**（改的是不同函数）。
+#                         目标文件 etnaviv_ml.c（3k 步，在 3j 之后）。
+#                         ⚠️ 不可交付；上机须设 ETNA_MESA_DEBUG=ml_msgs。
+#                         锚点由 tools/gen-aliasdiag-patch.py 从真实源码逐字生成。
 #   TEFLON_ROFIX=1        【修复】read_outputs 映射范围与读取范围对齐。
 #                         根因（真机 RODIAG 取证 0078f5b2，三条假说一次性判定）：
 #                         H1 idx 越界**排除**；H2 pipe_buffer_size(res)!=tensor->size
@@ -83,6 +95,7 @@
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   本轮修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+#   本轮诊断构建：同上 + TEFLON_ALIASDIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -686,6 +699,57 @@ if [ "${TEFLON_ROFIX:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3j/6] read_outputs 范围修复：默认关闭（设 TEFLON_ROFIX=1 启用）"
+fi
+
+# ── 3k. 【诊断】alias（批量元数据迁移）取证 ───────────────────────────────
+# 【为什么需要：ROFIX(6acfef1f) 把野指针换成了可观测的 assert】
+#   u_inlines.h:503: pipe_buffer_map_range:
+#   Assertion `offset + length <= buffer->width0' failed
+#   ⇒ tensor 元数据（offset/size）与 resource 实际大小不一致。
+#
+#   RODIAG(0078f5b2) 实测三组：
+#     idx=139 bsize=940896 off_expected=940896
+#     idx=149 bsize=610000 off_expected=305000
+#     idx=151 bsize=5000   off_expected=610000
+#   三个 off_expected 全是 5000 的整数倍、toff 全 0 —— 静态分析解释不了，需运行时数据。
+#
+# 【可疑代码】
+#   reference_tensor_with_offset (:198-224)  同时改 size 与 offset
+#   recreate_tensor              (:226-246)  **只改 size，不改 offset** ← 不对称，是条线索
+#   两者都是：把「所有共享 old_res 的 tensor」一律改成同一个 (offset,size)。
+#   调用点 :540/:552/:562/:569 = CONCAT / SPLIT / NN且input_count>1(Add/Subtract) / BYPASS
+#
+# 【打印】ref 的 src/dst/offset/size + **每个被迁移 tensor 的旧 size/offset**（改之前抓）
+#         recreate 的 idx/new_size/旧 size/offset
+#
+# ★ 与 TEFLON_ROFIX=1 **可同时开**：本补丁改的是 reference_tensor_with_offset /
+#   recreate_tensor，ROFIX 改的是 read_outputs —— 不同函数，锚点不冲突。
+#
+# ⚠️ 该产物含取证打印，不可交付。
+# ⚠️ 上机必须同时设 ETNA_MESA_DEBUG=ml_msgs（ML_DBG 是运行期判断）。
+# ⚠️ 默认关闭。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 TEFLON_ALIASDIAG=1
+if [ "${TEFLON_ALIASDIAG:-0}" = "1" ]; then
+	echo "==> [3k/6] 打【诊断】alias 迁移取证（该产物不可交付）"
+	PATCHER11="$SCRIPT_DIR/patch-etnaviv-alias-diag.py"
+	MLAD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER11" ]; then
+		echo "ERROR: 设了 TEFLON_ALIASDIAG=1 却缺 $PATCHER11"
+		exit 1
+	fi
+	if [ ! -f "$MLAD" ]; then
+		echo "ERROR: 找不到 $MLAD"
+		exit 1
+	fi
+	python3 "$PATCHER11" "$MLAD" || {
+		echo "ERROR: alias 取证补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出无取证的 .so，白跑一轮真机验证）。"
+		echo "       请跑 tools/gen-aliasdiag-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3k/6] alias 迁移取证：默认关闭（设 TEFLON_ALIASDIAG=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
