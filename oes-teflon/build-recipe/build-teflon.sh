@@ -61,6 +61,18 @@
 #                         目标文件 etnaviv_ml.c（3k 步，在 3j 之后）。
 #                         ⚠️ 不可交付；上机须设 ETNA_MESA_DEBUG=ml_msgs。
 #                         锚点由 tools/gen-aliasdiag-patch.py 从真实源码逐字生成。
+#   TEFLON_CREATEDIAG=1   【诊断】create_tensor 分配取证。
+#                         起因：ALIASDIAG 把范围收窄到「buffer 分配大小」——
+#                           tensor->size=610000 正确，但 pipe_buffer_size(res)=5000，
+#                           而**模型里没有任何 5000 字节的张量** ⇒ 5000 是驱动算出来的；
+#                           5000 = 2×50×50，610000 = 244×50×50（差 122 倍）。
+#                         嫌疑：create_tensor 的早退 `if (res != NULL) return;`
+#                           （只看向不看 size；release 关 assert 后会静默早退）。
+#                         每条出口都打 pipe_buffer_size(res) = 实际分配大小。
+#                         ★ 与 ALIASDIAG / ROFIX 可同时开（注入函数互不相同）。
+#                         目标文件 etnaviv_ml.c（3l 步，在 3k 之后）。
+#                         ⚠️ 不可交付；上机须设 ETNA_MESA_DEBUG=ml_msgs。
+#                         锚点由 tools/gen-creatediag-patch.py 从真实源码逐字生成。
 #   TEFLON_ROFIX=1        【修复】read_outputs 映射范围与读取范围对齐。
 #                         根因（真机 RODIAG 取证 0078f5b2，三条假说一次性判定）：
 #                         H1 idx 越界**排除**；H2 pipe_buffer_size(res)!=tensor->size
@@ -95,7 +107,8 @@
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   本轮修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
-#   本轮诊断构建：同上 + TEFLON_ALIASDIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
+#   本轮诊断构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+#                 TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -750,6 +763,56 @@ if [ "${TEFLON_ALIASDIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3k/6] alias 迁移取证：默认关闭（设 TEFLON_ALIASDIAG=1 启用）"
+fi
+
+# ── 3l. 【诊断】create_tensor 分配取证 ───────────────────────────────────
+# 【为什么需要：ALIASDIAG(64933494) 把范围收窄到了「buffer 分配大小」】
+#   已确定：tensor->size = 610000 正确（与模型一致）
+#   已确定：pipe_buffer_size(res) = 5000 —— 错的是 buffer 分配，不是元数据
+#   已排除（真机数据）：recreate_tensor 0 次调用；批量迁移 13 次值全没变
+#   模型里**没有任何 5000 字节的张量** ⇒ 5000 是驱动自己算出来的
+#   且 5000 = 2×50×50，而 610000 = 244×50×50（差 122 倍）
+#
+# 【嫌疑：etna_ml_create_tensor 的早退条件】
+#   真实源码（不是我最初以为的 `res != NULL && size == ...`）：
+#       if (res != NULL) {
+#          assert(size == tensor->size);      // ★ release 构建关掉 assert ⇒ 静默早退
+#          return;
+#       }
+#   只要有 resource 就早退 ⇒ 「先以小 size 建、后以大 size 调用」会**静默保留小 buffer**。
+#
+# 【打印】enter / EARLY-RETURN（带 "*** size 不一致！***" 标记）/ destroy / created，
+#        每条都带 `pipe_buffer_size(res)` —— 实际分配大小，是本轮的关键列。
+#
+# ★ 与 ALIASDIAG / ROFIX **可同时开**：注入函数互不相同。
+#   标记锚点复用 `#include <stdio.h>`（ALIASDIAG 在其后插标记，该行仍唯一，已实测）。
+#
+# ⚠️ 该产物含取证打印，不可交付。
+# ⚠️ 上机必须同时设 ETNA_MESA_DEBUG=ml_msgs。
+# ⚠️ 默认关闭。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 \
+#       TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1
+if [ "${TEFLON_CREATEDIAG:-0}" = "1" ]; then
+	echo "==> [3l/6] 打【诊断】create_tensor 分配取证（该产物不可交付）"
+	PATCHER12="$SCRIPT_DIR/patch-etnaviv-create-diag.py"
+	MLCD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER12" ]; then
+		echo "ERROR: 设了 TEFLON_CREATEDIAG=1 却缺 $PATCHER12"
+		exit 1
+	fi
+	if [ ! -f "$MLCD" ]; then
+		echo "ERROR: 找不到 $MLCD"
+		exit 1
+	fi
+	python3 "$PATCHER12" "$MLCD" || {
+		echo "ERROR: create_tensor 取证补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出无取证的 .so，白跑一轮真机验证）。"
+		echo "       请跑 tools/gen-creatediag-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3l/6] create_tensor 取证：默认关闭（设 TEFLON_CREATEDIAG=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
