@@ -3,3 +3,6 @@ output/
 u-boot/bl31_0x00040000.bin.gz
 u-boot/tee.bin.gz
 *.o
+__pycache__/
+*.pyc
+
