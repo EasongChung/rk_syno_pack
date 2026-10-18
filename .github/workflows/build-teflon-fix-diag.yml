@@ -430,10 +430,19 @@ jobs:
               ok=0
             fi
           done
-          # 反向门：诊断/调试开关必须**没**开；作废方案（SNFIX）的日志也不得出现
+          # 正向门（本 workflow 特有）：调试开关必须**真的**开了 ——
+          # 否则产物没有 DWARF，addr2line 无从谈起，等于白跑一轮。
           for pat in 'strip：跳过（保留调试段' \
-                     '[och-wc] 已注入 out_channel 诊断' \
-                     '调试信息：开启（-g3）' \
+                     '调试信息：开启（-g3）'; do
+            if grep -qF "$pat" "$L"; then
+              echo "  OK(present): $pat"
+            else
+              echo "  ERROR: 本构建必须有「$pat」——调试开关没生效"
+              ok=0
+            fi
+          done
+          # 反向门：取证/作废方案的日志不得出现
+          for pat in '[och-wc] 已注入 out_channel 诊断' \
                      '[och-snfix]'; do
             if grep -qF "$pat" "$L"; then
               echo "  ERROR: 交付产物里不该出现的行「$pat」"
