@@ -34,13 +34,18 @@
 #                         锚点由 tools/gen-wcdiag-patch.py 从真实源码逐字生成。
 #                         ⚠️ 不改行为：崩溃行仍会照旧触发，但那一行已进日志
 #
-#   TEFLON_OCFIX=1       修正 write_core_interleaved() 的 out_channel 映射
-#                         （core*kernels_per_core + 前序 superblock 累计偏移 + kernel，
-#                          去掉多余的 * cores_used），并加越界钳位护栏。
-#                         根因已由真机 [och-wc] 日志证实：136 组合 0 反例地复现公式，
+#   TEFLON_OCFIX=1       在 write_core_interleaved() 的 out_channel 后加**尾部越界钳位**；
+#                         **公式逐字不动**（曾做过「重映射」版，已作废，见下）
+#                         根因已由真机 [och-wc] 日志证实：136 组合 0 反例地复现原式，
 #                         且出现 out_channel >= output_channels（实测 123 vs 122）→ SIGSEGV。
+#                         真正的缺陷是 kernels_per_core = DIV_ROUND_UP(output_channels,
+#                         cores_used) **均分**（8*16=128 > 122 产生幽灵槽）；上游 v8 已在
+#                         etnaviv_ml_nn_v8.c:729-731 用「余数分给前几个 core」修掉。
+#                         原式结构由 v8 :726 / :754 证明**有意**（末尾的 * cores_used
+#                         是 superblock 步长；逐 core 推进的是 kernels_in_superblock）。
 #                         锚点由 tools/gen-ocfix-patch.py 从真实源码逐字生成，
-#                         自带精确计数门 + 10 个反例测试。
+#                         自带精确计数门 + 9 个反例测试 + 编译期标记
+#                         och-patch-v7-outchannel-clamp（供 strings 判定）。
 #                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
 #                            不崩只说明越界消失，不代表系数排布正确。
 #

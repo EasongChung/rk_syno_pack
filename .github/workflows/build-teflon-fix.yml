@@ -287,6 +287,63 @@ jobs:
           print('AST-NAME-CHECK: PASS (%d files)' % len(files))
           PY
 
+      # ★ 文档一致性门（och 第 N 轮要求）：**注释描述的方案**与**代码实际做的事**
+      #   会各走各的。上一轮就漏过一次：头部 TEFLON_OCFIX 说明还在把已作废的
+      #   「重映射」当当前方案，而 3g 步骤早已改成只钳位。
+      #
+      # ⚠️ 注意：不能用裸 `grep -qi 重映射` —— 合法的说明里**也会**出现这三个字
+      #   （「曾做过「重映射」版，已作废」）。所以规则是：
+      #   **凡是提到「重映射」的行，必须同时出现「作废」。**
+      - name: Static check - OCFIX docs consistency
+        run: |
+          set -eu
+          F=oes-teflon/build-recipe/build-teflon.sh
+          echo "=== 反向断言：OCFIX 说明不得把「重映射」当成当前方案 ==="
+          bad=0
+          n=$(grep -c '重映射' "$F" || true)
+          echo "  含「重映射」的行数: $n"
+          i=0
+          while [ "$i" -lt "$n" ]; do
+            ln=$(grep -n '重映射' "$F" | sed -n "$((i+1))p")
+            case "$ln" in
+              *作废*) echo "  ok（已标注作废）: $ln" ;;
+              *)      echo "  ERROR: 提到重映射但未标注作废 -> $ln"; bad=1 ;;
+            esac
+            i=$((i+1))
+          done
+          [ "$bad" -eq 0 ] || { echo "DOCS-CONSISTENCY: FAIL"; exit 1; }
+
+          echo "=== 反向断言：作废的重映射描述不得复活 ==="
+          if grep -qF '去掉多余的' "$F"; then
+            echo "  ERROR: 出现了「去掉多余的」—— 这是 remap 版的说法，已被 v8 否证"
+            grep -nF '去掉多余的' "$F"; exit 1
+          fi
+          echo "  ok"
+
+          echo "=== 正向断言：OCFIX 说明必须写清当前方案与依据 ==="
+          for pat in '公式逐字不动' \
+                     'och-patch-v7-outchannel-clamp' \
+                     'etnaviv_ml_nn_v8.c:729-731' \
+                     'etnaviv_ml_nn_v8.c:715-760'; do
+            grep -qF "$pat" "$F" || { echo "  ERROR: 头部/3g 说明缺少「$pat」"; exit 1; }
+            echo "  ok: $pat"
+          done
+
+          echo "=== 3g 步骤必须指向 clamp 补丁 ==="
+          grep -qF 'patch-etnaviv-outchannel-clamp.py' "$F" \
+            || { echo "  ERROR: 3g 没指向 clamp 补丁"; exit 1; }
+          echo "  ok"
+
+          echo "=== 作废的 remap 补丁不得回到仓库里 ==="
+          if [ -e oes-teflon/build-recipe/patch-etnaviv-outchannel-fix.py ]; then
+            echo "  ERROR: patch-etnaviv-outchannel-fix.py（remap 版）回来了"
+            echo "         它编码了一个已被 v8 fill_weights() 否证的假设，"
+            echo "         留着就有人会打开它 —— 而它看起来是更彻底的修复。"
+            exit 1
+          fi
+          echo "  ok: remap 补丁不在仓库中"
+          echo "DOCS-CONSISTENCY: PASS"
+
       - name: Build libteflon.so (FIX_V7 + OCFIX, stripped)
         run: |
           set -eux
