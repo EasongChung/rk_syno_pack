@@ -1,12 +1,14 @@
 name: build-teflon-fix
 
-# 【修复版 / 交付候选】交叉编译带两处修复的 libteflon.so（aarch64 / glibc，**已 strip**）
+# 【修复版 / 交付候选】交叉编译带**三处**修复的 libteflon.so（aarch64 / glibc，**已 strip**）
 #
 # 开关（本 workflow 的意义就是这一组固定组合，不接受随意拼装）：
-#   TEFLON_FIX_V7=1   -> patch-etnaviv-v7-biasfix.py       （v7 缺 depthwise 特判，真实上游不一致）
-#   TEFLON_OCFIX=1    -> patch-etnaviv-outchannel-fix.py   （write_core_interleaved out_channel
-#                                                          映射修正 + 越界钳位；根因由真机
-#                                                          [och-wc] 136 组合 0 反例证实）
+#   TEFLON_FIX_V7=1   -> patch-etnaviv-v7-biasfix.py         （v7 缺 depthwise 特判，真实上游不一致）
+#   TEFLON_OCFIX=1    -> patch-etnaviv-outchannel-clamp.py   （write_core_interleaved 的 out_channel
+#                                                             **尾部越界钳位**，公式逐字不动；根因由真机
+#                                                             [och-wc] 136 组合 0 反例证实）
+#   TEFLON_FSGUARD=1  -> patch-etnaviv-filter-shape-guard.py （filter.in_c ≠ 输入通道数的卷积
+#                                                             **不接管、回退 CPU**；目标 etnaviv_ml.c）
 #   TEFLON_DIAG=0     -> 诊断（钳界取证）不进交付产物
 #   TEFLON_WCDIAG=0   -> 取证打印不进交付产物（取证已完成）
 #   TEFLON_DEBUG_INFO=0 / TEFLON_NO_STRIP=0 -> 干净产物，体积正常（交付候选要这个）
@@ -34,6 +36,7 @@ env:
   MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
   TEFLON_FIX_V7: '1'
   TEFLON_OCFIX: '1'
+  TEFLON_FSGUARD: '1'
   TEFLON_DIAG: '0'
   TEFLON_WCDIAG: '0'
   TEFLON_DEBUG_INFO: '0'
@@ -41,7 +44,7 @@ env:
 
 jobs:
   build:
-    name: build libteflon.so FIX_V7+OCFIX (stripped, delivery candidate)
+    name: build libteflon.so FIX_V7+OCFIX+FSGUARD (stripped, delivery candidate)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -230,6 +233,15 @@ jobs:
               shutil.rmtree(tmp, ignore_errors=True)
           PY
 
+      # ★ FSGUARD 正/反例自测：och 编号 n1..n7 + 我加固的 n8 + 幂等 + 生成器一致性。
+      #   n8 的意义：样本的 `default:` 分支本身就有 `return false;` ——
+      #   若「守卫块内必须有 return false」这道门只是全文件 grep，break 版会被蒙过，
+      #   而 break 正是 fail-open 的形态（守卫不生效、崩溃照旧）。所以 n8 必须能拦住。
+      - name: Preflight - filter shape guard (FSGUARD) self-test
+        run: |
+          set -eux
+          python3 oes-teflon/tools/selftest-fsguard.py
+
       # ★ AST 级「未定义名」检查 —— 语法合法 ≠ 名字存在。
       #   教训（两次，都是在门的错误分支上）：
       #     ① 我誊写 ocfix remap 版时把 TARGET_FN 打成 args_fn_name_placeholder，
@@ -344,11 +356,63 @@ jobs:
           echo "  ok: remap 补丁不在仓库中"
           echo "DOCS-CONSISTENCY: PASS"
 
-      - name: Build libteflon.so (FIX_V7 + OCFIX, stripped)
+      # ★ FSGUARD 文档一致性门：注释描述必须与代码实际做的事对齐。
+      #   基准（och 指定）：头部 TEFLON_FSGUARD 段 **与** 3h 步注释都必须出现
+      #   `op#58` 与 `filter.in_c`；作废方案（SNFIX / strided-normal）不得残留。
+      #   ⚠️ 只扫 oes-teflon/**，**不扫本 workflow 自己** —— 否则断言里的字面量
+      #      会把自己判红（上一轮踩过的自指陷阱）。
+      - name: Static check - FSGUARD docs consistency
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import glob, os, re, sys
+
+          F = 'oes-teflon/build-recipe/build-teflon.sh'
+          src = open(F, encoding='utf-8').read()
+          fail = []
+
+          cut = src.find('\nset -eu')
+          head = src[:cut] if cut > 0 else ''
+          m = re.search(r'\n# ── 3h\.[\s\S]*?(?=\n# -{20,})', src)
+          sec = m.group(0) if m else ''
+
+          if not head:
+              fail.append('取不到头部注释块（set -eu 之前）')
+          if not sec:
+              fail.append('取不到 3h 段 —— 正则没命中说明门已失效，必须修门而不是放行')
+
+          def need(where, text, pat):
+              if pat in text:
+                  print('  ok(%s): %s' % (where, pat))
+              else:
+                  fail.append('%s 缺少「%s」' % (where, pat))
+
+          for pat in ('op#58', 'filter.in_c'):
+              need('头部', head, pat)
+              need('3h', sec, pat)
+
+          print('=== 作废方案不得残留 ===')
+          for f in sorted(glob.glob('oes-teflon/**/*.py', recursive=True) +
+                          glob.glob('oes-teflon/**/*.sh', recursive=True)):
+              t = open(f, encoding='utf-8', errors='replace').read()
+              for p in ('SNFIX', 'strided-normal'):
+                  if p in t:
+                      fail.append('作废方案残留（%s）: %s' % (p, f))
+          if os.path.exists('oes-teflon/build-recipe/patch-etnaviv-strided-normal-fix.py'):
+              fail.append('作废补丁 patch-etnaviv-strided-normal-fix.py 回到仓库')
+
+          if fail:
+              for x in fail:
+                  print('  ERROR: ' + x)
+              sys.exit(1)
+          print('FSGUARD-DOCS: PASS')
+          PY
+
+      - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD, stripped)
         run: |
           set -eux
           chmod +x oes-teflon/build-recipe/build-teflon.sh
-          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
+          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-fix.log"
 
@@ -362,7 +426,9 @@ jobs:
                      '[och-fix] 已修复 v7 calculate_bias_correction' \
                      '[3g/6] 打【修复】write_core_interleaved' \
                      '[och-ocfix] 已加 out_channel 尾部越界钳位' \
-                     '[och-ocfix] 原式保留未动'; do
+                     '[och-ocfix] 原式保留未动' \
+                     '[3h/6] 打【修复】filter 深度一致性守卫' \
+                     '[och-fsguard] 已加 filter 深度一致性守卫'; do
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
             else
@@ -370,10 +436,11 @@ jobs:
               ok=0
             fi
           done
-          # 反向门：诊断/调试开关必须**没**开
+          # 反向门：诊断/调试开关必须**没**开；作废方案（SNFIX）的日志也不得出现
           for pat in 'strip：跳过（保留调试段' \
                      '[och-wc] 已注入 out_channel 诊断' \
-                     '调试信息：开启（-g3）'; do
+                     '调试信息：开启（-g3）' \
+                     '[och-snfix]'; do
             if grep -qF "$pat" "$L"; then
               echo "  ERROR: 交付产物里不该出现的行「$pat」"
               ok=0
@@ -425,18 +492,23 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: och-patch-v7-outchannel-clamp PRESENT (clamp really in .so)"
-          # ⚠️ OCFIX **没有**可 grep 的二进制标记，这是事实不是遗漏：
-          #   patch-etnaviv-outchannel-fix.py 的 MARKER 只出现在 C 注释
-          #   `/* och patch: out_channel ... */` 里，而**注释不会进二进制**。
-          #   （我第一版在这里写了 `strings | grep -qF 'och patch: out_channel'`，
-          #    那道门永远不可能通过 —— 已删除。）
-          #   OCFIX 的二进制级证据改为「**编译通过**」：补丁注入的代码引用了
-          #   och_sb_base / kernels_per_core / output_channels，若补丁没打上或
-          #   结构不符，build-teflon.sh 会在 3g 步 exit 1（构建失败）。
-          #   + 日志门 "[och-ocfix] 已修正 out_channel 映射并加越界钳位"。
-          #   TODO(och): 若要在二进制里留可 grep 的标记，需在补丁里加一个
-          #   `__attribute__((used)) static const char ...[]` 之类的编译期标记；
-          #   本轮不动他的补丁文件。
+          # ★★ FSGUARD 的二进制级证据：`ML_DBG` 的**格式串是真字面量**。
+          #   定义（etnaviv_ml.h:143）：
+          #     #define ML_DBG(fmt, ...) do { if (DBG_ENABLED(ETNA_DBG_ML_MSGS))
+          #                                  _debug_printf(fmt, ##__VA_ARGS__); } while (0)
+          #   DBG_ENABLED 读的是 `extern int etna_mesa_debug`（运行期变量），
+          #   不是编译期常量 ⇒ 分支不会被优化掉 ⇒ 格式串留在 .rodata。
+          #   本机已用**既有 stripped 产物**实证（不是推理）：
+          #     b9936131 / ffce949e / f9bf1d51 三个已 strip 产物里
+          #     `dumping intermediate graph` 与 `coefficients_size 0x` 都在。
+          #   ⚠️ 与注释 marker 的区别：C 注释不进二进制（那是永远红的假门，踩过），
+          #      这里查的是真字面量。
+          if ! strings -a "$SO" | grep -qF 'filter in_c'; then
+            echo "ERROR: 产物里找不到 'filter in_c' —— FSGUARD 的 ML_DBG 字面量不在二进制里"
+            echo "       说明形状守卫没打进去：那两个不自洽卷积仍会被接管 → 崩溃照旧"
+            exit 1
+          fi
+          echo "STRING-CHECK: 'filter in_c' PRESENT (FSGUARD really in .so)"
           # ★ 反向门：诊断开关的字符串一个都不该在
           if strings -a "$SO" | grep -qF '[och-wc]'; then
             echo "ERROR: 产物里出现 [och-wc] —— WCDIAG 诊断开关误开，这不是交付产物"
@@ -466,6 +538,20 @@ jobs:
             awk -v s="$LN" 'NR>s && /^[a-zA-Z_].*\(/ {print NR": "$0; c++} c>2{exit}' "$F"
           else
             echo "目标源文件不存在: $F"
+          fi
+          F2="$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+          if [ -f "$F2" ]; then
+            echo "================ etna_ml_operation_supported 全文（FSGUARD 注入点）================"
+            LN2=$(grep -n 'etna_ml_operation_supported(struct' "$F2" | head -1 | cut -d: -f1)
+            if [ -n "${LN2:-}" ]; then
+              sed -n "$((LN2>3?LN2-3:1)),$((LN2+110))p" "$F2"
+            fi
+            echo "================ input_tensor / supported 的出现位置（判作用域与 fail-open）================"
+            grep -n 'input_tensor' "$F2" | head -20
+            grep -n 'supported = true;' "$F2" | head -10
+            grep -n 'return supported;' "$F2" | head -10
+          else
+            echo "目标源文件不存在: $F2"
           fi
 
       - name: Glibc symbol ceiling check (device = 2.36)
@@ -499,19 +585,23 @@ jobs:
           [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           {
-            echo "########## FIX_V7 + OCFIX BUILD - delivery candidate, NOT yet validated ##########"
+            echo "########## FIX_V7 + OCFIX + FSGUARD BUILD - delivery candidate, NOT yet validated ##########"
             echo "purpose1=backport v8 depthwise/addition guard into v7 calculate_bias_correction"
             echo "purpose2=clamp write_core_interleaved out_channel tail OOB (formula UNCHANGED)"
+            echo "purpose3=refuse takeover when filter.in_c != input channels (etna_ml_operation_supported,"
+            echo "         etnaviv_ml.c): ops #58/#153 fall back to CPU instead of OOB in subsample:424"
             echo "void=patch-etnaviv-outchannel-fix.py (remap version) was DELETED from the repo:"
             echo "      its 'core*kernels_per_core, drop * cores_used' remap was REFUTED by upstream"
             echo "      etnaviv_ml_nn_v8.c fill_weights() (:726 keeps * cores_used, :754 advances by"
             echo "      kernels_in_superblock); v7's real defect is the even DIV_ROUND_UP split"
             echo "      (:729-731 in v8 distributes the remainder so slots == output_channels)"
             echo "void_sha256=f9bf1d51156e372cd5cf76859f7c76808235fab052739ee39a32ea38a471e490 (remap build, VOID)"
-            echo "TEFLON_FIX_V7=${TEFLON_FIX_V7:-0} TEFLON_OCFIX=${TEFLON_OCFIX:-0}"
+            echo "TEFLON_FIX_V7=${TEFLON_FIX_V7:-0} TEFLON_OCFIX=${TEFLON_OCFIX:-0} TEFLON_FSGUARD=${TEFLON_FSGUARD:-0}"
             echo "TEFLON_DIAG=${TEFLON_DIAG:-0} TEFLON_WCDIAG=${TEFLON_WCDIAG:-0}"
             echo "teflon_debug_info=${TEFLON_DEBUG_INFO:-0} teflon_no_strip=${TEFLON_NO_STRIP:-0}"
             echo "warning=NOT validated: must pass acceptance level 4 (byte-identical vs x86 baseline)"
+            echo "expected=takeover op count drops by exactly 2 (ops #58/#153 now run on CPU); this is BY DESIGN,"
+            echo "         not a regression. If the drop is NOT 2, read it as 'guard did not take effect'"
             echo "warning2=only write_core_interleaved patched; 3 more sites of the same formula"
             echo "         (write_core_6 x2, write_core_sequential) remain UNPATCHED by design"
             echo "mesa_tag_env=${MESA_TAG:-mesa-26.2.5}"

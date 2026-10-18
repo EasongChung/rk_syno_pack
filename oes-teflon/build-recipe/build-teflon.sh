@@ -49,8 +49,20 @@
 #                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」——
 #                            不崩只说明越界消失，不代表系数排布正确。
 #
+#   TEFLON_FSGUARD=1      不接管「filter.in_c ≠ 输入通道数」的卷积，回退 CPU。
+#                         根因：真机 +0x22fda0 SIGSEGV → addr2line → subsample:424
+#                         → 崩溃算子 op#58 filter=[244,3,3,1]：filter.in_c = 1，而 input
+#                           有 244 通道（op#153 同型，filter=[488,3,3,1] / input 488 通道）
+#                         → map_in 步长按 244 算而张量只有 2196 字节 → out_channel>=1 越界。
+#                         改法是**不接管**而非改系数排布：整条 coeff 路径都建立在
+#                         「filter 深度 == 输入通道」这个不成立的前提上，改单点只会把
+#                         越界换成静默错误数值。
+#                         目标文件 etnaviv_ml.c。
+#                         锚点由 tools/gen-fsguard-patch.py 从真实源码逐字生成。
+#                         预期：不崩 + 接管数下降 + 第 ④ 级逐字节比对应通过。
+#
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
-#   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1
+#   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -502,6 +514,58 @@ if [ "${TEFLON_FIX_V7:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3e/6] v7 修复补丁：默认关闭（设 TEFLON_FIX_V7=1 启用）"
+fi
+
+# ── 3h. 【修复】filter 深度 ≠ 输入通道数 的卷积不接管（回退 CPU）─────────────
+# 【根因：真机 SIGSEGV + 本地 addr2line + 离线模型审计 四重互证】
+#   崩溃地址 +0x22fda0（b9936131 与 f9bf1d51 完全相同）
+#     → addr2line → subsample  etnaviv_ml_nn.c:424  out[x][y] = in[in_x][in_y][in_z];
+#     → 调用链 etna_ml_lower_convolution → strided_to_normal(stride>1) → reshape → subsample
+#   离线审计定位到崩溃分区里的算子：
+#     op#58   CONV_2D input=[1,52,52,244] filter=[244,3,3,1] stride=2
+#     op#153  CONV_2D input=[1,25,25,488] filter=[488,3,3,1] stride=2
+#     **filter.in_c（最后一维）= 1，输入张量通道数 = 244 / 488**
+#   算术：input_channels 取自输入张量 = 244 → wdims_in[3]=244
+#         → map_in = input + out_channel*3*3*244 = input + out_channel*2196
+#         而权重张量只有 244*3*3*1 = 2196 字节 → out_channel>=1 必然越界读。
+#         ⚠️ 越界**不在 in_z**（wdims_in 在乘法之前初始化，本来就拿到原值），
+#            而在 map_in 的**步长**用了 input_channels —— 与 filter.in_c 不是同一个量。
+#
+# 为什么是「不接管」而不是「改系数排布」：
+#   从 coeff 构造（weights_map[input_channels][w][h]）到 strided_to_normal 的整条路径
+#   都建立在「filter 深度 == 输入通道」这个**不成立**的前提上，改单点只会把
+#   越界换成**静默错误数值**。回退 CPU 是唯一不产生错误数值的做法，
+#   也符合 Mesa 上游风格（etna_ml_operation_supported 本就拒绝 dilation 与 per-axis 量化）。
+#   判据：非 depthwise 卷积要求 weight_tensor->dims[3] == input_tensors[0]->dims[3]；
+#   depthwise 的 filter 布局是 [1,h,w,out_c]，dims[3] 是输出通道，豁免。
+#
+# 预期效果：不崩 + 接管数下降（那 2 个算子回退 CPU）+ 第 ④ 级逐字节比对应通过。
+# ⚠️ 接管数下降 2 个是**预期行为**，不是回归 —— 那两个算子本就不该被接管。
+#
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+# ⚠️ 目标文件是 etnaviv_ml.c（不是 ml_nn*.c）。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 ./build-teflon.sh
+if [ "${TEFLON_FSGUARD:-0}" = "1" ]; then
+	echo "==> [3h/6] 打【修复】filter 深度一致性守卫（不自洽卷积回退 CPU）"
+	PATCHER7="$SCRIPT_DIR/patch-etnaviv-filter-shape-guard.py"
+	MLFS="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER7" ]; then
+		echo "ERROR: 设了 TEFLON_FSGUARD=1 却缺 $PATCHER7"
+		exit 1
+	fi
+	if [ ! -f "$MLFS" ]; then
+		echo "ERROR: 找不到 $MLFS"
+		exit 1
+	fi
+	python3 "$PATCHER7" "$MLFS" || {
+		echo "ERROR: filter 形状守卫补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未修复的 .so，崩溃会照旧）。"
+		echo "       请跑 tools/gen-fsguard-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+else
+	echo "==> [3h/6] filter 形状守卫：默认关闭（设 TEFLON_FSGUARD=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
