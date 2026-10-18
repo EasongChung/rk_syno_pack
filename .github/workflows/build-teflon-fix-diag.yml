@@ -381,9 +381,20 @@ jobs:
               else:
                   fail.append('%s 缺少「%s」' % (where, pat))
 
-          for pat in ('op#58', 'filter.in_c'):
+          for pat in ('op#58',):
               need('头部', head, pat)
               need('3h', sec, pat)
+
+          # 「filter 深度（= in_c）≠ 输入通道数」的表述：三种写法任一即可（见上方说明）
+          for where, text in (('头部', head), ('3h', sec)):
+              hits = [a for a in ('filter.in_c', 'filter 的 in_c', 'filter 深度')
+                      if a in text]
+              if hits:
+                  print('  ok(%s): filter 深度/in_c 表述命中 %r' % (where, hits))
+              else:
+                  fail.append('%s 缺少「filter 深度（= in_c）≠ 输入通道数」的表述'
+                              '（接受 filter.in_c / filter 的 in_c / filter 深度）'
+                              % where)
 
           print('=== 作废方案不得残留 ===')
           for f in sorted(glob.glob('oes-teflon/**/*.py', recursive=True) +
@@ -401,7 +412,6 @@ jobs:
               sys.exit(1)
           print('FSGUARD-DOCS: PASS')
           PY
-
       - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD, UNSTRIPPED)
         run: |
           set -eux
