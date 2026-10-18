@@ -59,25 +59,40 @@ WARNS = []
 
 STUB_IO = "#include <stdio.h>\n"
 
-CREATE_SRC = (
-    "void\n"
-    + P.FN_CREATE + " *subgraph, unsigned idx, unsigned size)\n"
-    "{\n"
-    "   struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, idx);\n"
-    "\n"
-    "   assert(idx < util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *));\n"
-    "   assert(size > 0);\n"
-    "\n"
-    + P.OLD_CREATE +
-    "   }\n"
-    "\n"
-    "   res = etna_ml_create_resource(&subgraph->screen->base, size);\n"
-    "   tensor->resource = res;\n"
-    "   tensor->size = size;\n"
-    "\n"
-    '   ML_DBG("created resource %p for tensor %d with size %d\\n", res, idx, size);\n'
-    "}\n"
-)
+# ⚠️ v2 起 OLD_CREATE **本身就是完整函数**（从签名到收尾的 `}`）——
+#    v1 只截到 `return;`，需要外面再套一层壳。两种形态都会踩到「mock 括号不配平」，
+#    所以这里先判形态再拼，别写死。
+CREATE_IS_WHOLE_FN = P.OLD_CREATE.rstrip().endswith("}") and P.FN_CREATE in P.OLD_CREATE
+if CREATE_IS_WHOLE_FN:
+    # 原生函数已经自带签名/花括号/结尾换行，直接用；后面**不要**再补 `}`
+    CREATE_SRC = P.OLD_CREATE
+    CREATE_TAIL = ""
+else:
+    CREATE_SRC = (
+        "void\n"
+        + P.FN_CREATE + " *subgraph, unsigned idx, unsigned size)\n"
+        "{\n"
+        "   struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, idx);\n"
+        "\n"
+        "   assert(idx < util_dynarray_num_elements(&subgraph->tensors, "
+        "struct etna_ml_tensor *));\n"
+        "   assert(size > 0);\n"
+        "\n"
+        + P.OLD_CREATE
+        + "   }\n"
+    )
+    CREATE_TAIL = ""
+if CREATE_IS_WHOLE_FN:
+    CREATE_TAIL = (
+        "   }\n"
+        "\n"
+        "   res = etna_ml_create_resource(&subgraph->screen->base, size);\n"
+        "   tensor->resource = res;\n"
+        "   tensor->size = size;\n"
+        "\n"
+        '   ML_DBG("created resource %p for tensor %d with size %d\\n", res, idx, size);\n'
+        "}\n")
+    CREATE_SRC = P.OLD_CREATE
 DESTROY_SRC = (
     "static void\n"
     + P.FN_DESTROY + " *subgraph, unsigned idx)\n"
@@ -346,8 +361,16 @@ case("n5  tensor->size = size; 被删（create 体内那处）",
 case("n6  destroy 函数消失",
      MOCK.replace(P.FN_DESTROY.split("(")[0], P.FN_DESTROY.split("(")[0] + "_XX", 1),
      "找不到函数")
-DUP = CREATE_SRC.replace(P.FN_CREATE, P.FN_CREATE + "_dup", 1)
-case("n7  create 存在两个同形函数（文件级计数门）", MOCK + DUP, "锚点匹配到 2 处")
+# v2 起 OLD_CREATE 是**整函数**锚点（含签名），所以「同形副本」必须是**逐字节相同**的
+# 副本才撞车；只改签名的副本反而撞不上（那是更强的性质，不是漏洞）。
+# —— 第一版我把副本签名改名，反例因此作废、门判绿是对的。已踩一次。
+DUP = CREATE_SRC if CREATE_IS_WHOLE_FN else CREATE_SRC.replace(
+    P.FN_CREATE, P.FN_CREATE + "_dup", 1)
+case("n7  存在两个逐字节相同的 create 函数（文件级计数门）", MOCK + DUP,
+     "锚点匹配到 2 处")
+case("n7b create 函数被改名（整函数锚点应找不到）",
+     MOCK.replace(P.FN_CREATE.split("(")[0], P.FN_CREATE.split("(")[0] + "_XX", 1),
+     "找不到函数")
 case("n8  #include <stdio.h> 出现两次（标记锚点撞车）",
      MOCK.replace(STUB_IO, STUB_IO + STUB_IO, 1), "锚点匹配到 2 处")
 rc9, _, err9, _ = run_patch(MOCK.replace("   }\n", "   {\n", 1))

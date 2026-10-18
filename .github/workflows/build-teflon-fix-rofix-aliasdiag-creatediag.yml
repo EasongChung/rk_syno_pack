@@ -28,9 +28,14 @@ name: build-teflon-fix-rofix-aliasdiag-creatediag
 # ⚠️ 地址不与 6acfef1f / 64933494 对账：两个取证补丁都插在文件前部，
 #    后续函数**必然位移**。地址在本产物上 nm 现取（步骤已附）。
 #
-# ⚠️ **本 workflow 暂不派发**：Preflight 的「打印纪律门」会在
-#    `patch-etnaviv-create-diag.py` 改成纯打印之前判红 —— 那是设计意图（fail-closed），
-#    详见 `oes-teflon/tools/selftest-creatediag.py` 顶部注释。纪律门一旦转绿即可派发。
+# ✓ 本补丁为 **print-only**：去掉注释与 ML_DBG 后，注入前后的**可执行代码逐字相同**
+#   （`tools/selftest-creatediag.py` 与 `check-creatediag-anchors.py` 两道门各查一次）。
+#   理由：诊断轮的产物要用来解释**交付候选**的行为，补丁自己改了行为就不能归因。
+#   v1 曾把 `if (res != NULL)` 改成 `if (res != NULL && tensor->size == size)` 并新增
+#   静默重分配路径 —— 那会把「size 不一致 ⇒ assert 当场 abort」这个唯一可观测信号吃掉。
+# ⚠️ **assert 在我们的构建里是开的**（ROFIX 真机 abort = u_inlines.h:503 的 assert
+#    消息）⇒「release/NDEBUG 下静默早退」在我们这里已被排除；print-only 之后信息量
+#    反而更大：不一致会同时给 enter 行 + 一条带精确行号的 abort。
 #
 # 本轮要回答的四个问题（拿到 [och-create] 输出后逐条对）：
 #   ① 哪个 idx 被以 5000 字节**创建**过？（`created … size=5000` 的行）
@@ -301,14 +306,12 @@ jobs:
       #   （12 个语义载荷逐字节比对）+ **打印纪律门**。
       #   三处锚点口径不同：create 是段中间插入（OLD 应消失 0 处）；
       #   destroy / mark 是只追加型（OLD 应恰好保留 1 处）。
-      #   打印纪律门：诊断补丁只许加打印 —— 去掉注释与 ML_DBG 后，
-      #   注入前后的**可执行代码必须逐字相同**。理由：诊断轮的产物要用来解释
-      #   **交付候选**的行为；补丁自己改了行为，设备现象就不能归因给交付候选。
-      #   ⚠️ 该门**目前是红的**（patch-etnaviv-create-diag.py 把 `if (res != NULL)`
-      #      改成了 `if (res != NULL && tensor->size == size)` 并新增静默重分配路径）。
-      #      那是 fail-closed 的设计意图，不是误报；修好补丁器后转绿即可派发。
-      #   唯一预期 WARN：_body 对括号不平衡会 IndexError（方向仍 fail-closed；
-      #   这是同一处 nit 的第四次出现，已建议一次性修三个文件）。
+      #   打印纪律门：诊断补丁只许加打印 —— 去掉注释与 ML_DBG 后，注入前后的
+      #   **可执行代码必须逐字相同**。当前**应为绿**（v2 已改 print-only）；
+      #   若此门转红，说明补丁又改了控制流 —— 那是 fail-closed 的设计意图，
+      #   **不许改门放行、不许降级为 WARN**，必须改补丁器。
+      #   ⚠️ 唯一预期 WARN：_body 对括号不平衡会 IndexError（方向仍 fail-closed；
+      #      这是同一处 nit 的第四次出现，已建议一次性修三个文件）。
       - name: Preflight - create_tensor allocation diag (CREATEDIAG) self-test
         run: |
           set -eux
@@ -956,14 +959,17 @@ jobs:
             echo "     => only remaining fact: tensor->size=610000 is correct but pipe_buffer_size(res)=5000 => the BUFFER ALLOCATION is wrong"
             echo "purpose6=create/destroy_tensor evidence: print requested size vs actual pipe_buffer_size(res) at every create/early-return/destroy (etnaviv_ml.c step 3l)"
             echo "expect_line4=[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u"
-            echo "expect_line5=[och-create]   EARLY-RETURN idx=%u size=%u res=%p actual=%u"
-            echo "expect_line6=[och-create]   created   idx=%u size=%u res=%p actual=%u"
+            echo "expect_line5=[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u <size 一致|*** size 不一致！***>"
+            echo "expect_line6=[och-create]   created   idx=%u req_size=%u res=%p actual=%u"
             echo "expect_line7=[och-create]   destroy   idx=%u res=%p actual=%u"
-            echo "key_column=actual (=pipe_buffer_size(res)): a created line with size=5000 identifies who allocated the undersized buffer"
-            echo "questions=(1) which idx was CREATED with size=5000 (2) was the same idx later called with 610000 and early-returned (enter: req_size vs have_size) (3) if so, which operation output_tensor_sizes[i] produced req_size - can it be traced back to a node that dropped a dimension (4) is there any destroy-then-recreate path"
+            echo "key_column=actual (=pipe_buffer_size(res)): a created line with req_size=5000 identifies who allocated the undersized buffer"
+            echo "source_fact=etna_ml_create_resource has EXACTLY ONE call site (:84 inside etna_ml_create_tensor) and tensor->resource is only assigned at :62(NULL) and :85; alias/recreate/migrate only move pointers via pipe_resource_reference => every buffer size in the graph necessarily passes through the printed created line"
+            echo "source_fact2=etna_ml_create_resource is a 4-line pass-through (pipe_buffer_create(pscreen,0,PIPE_USAGE_DEFAULT,size)); there is NO alignment/min-size/reuse logic in the ML layer => if actual < req_size the culprit is pipe_buffer_create"
+            echo "discipline=the patch is print-only (executable code byte-identical after stripping comments and ML_DBG); asserts are ON in our builds, so a size mismatch aborts loudly at a mappable line instead of returning silently"
+            echo "questions=(1) which idx was CREATED with req_size=5000 (2) was the same idx later called with 610000 and early-returned (enter: req_size vs have_size) (3) if so, which operation output_tensor_sizes[i] produced req_size - can it be traced back to a node that dropped a dimension (4) is there any destroy-then-recreate path"
             echo "expect1=NO fix is claimed this round; the assert may still fire (that is the point)"
             echo "known_open=why etna_ml_create_resource() allocated 5000 for a 610000-byte tensor is NOT fixed here; this build only collects evidence"
-            echo "caveat=the delivered patch rewrites the early-return condition and adds a silent realloc path; the Preflight print-only gate is RED until that is fixed (by design)"
+            echo "caveat=none known: the patch is print-only and every gate is green; this build only collects evidence and claims no fix"
             echo "why=ROFIX turned the wild-pointer SIGSEGV into an observable assert: pipe_buffer_map_range: offset + length <= buffer->width0 failed"
             echo "     => tensor metadata (offset/size) disagrees with the real resource size"
             echo "purpose5=alias evidence: print reference_tensor_with_offset / recreate_tensor params + per-tensor migration BEFORE-state (etnaviv_ml.c step 3k)"

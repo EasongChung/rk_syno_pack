@@ -67,6 +67,7 @@ etna_ml_create_tensor(struct etna_ml_subgraph *subgraph, unsigned idx, unsigned 
 """
 
 import os
+import re
 import sys
 
 SRC = ("/root/workspace/oes-teflon/third_party/mesa-src-26.2.5/"
@@ -74,7 +75,7 @@ SRC = ("/root/workspace/oes-teflon/third_party/mesa-src-26.2.5/"
 OUT = ("/root/workspace/oes-teflon/build-recipe/"
        "patch-etnaviv-create-diag.py")
 
-MARKER = "och patch: create_tensor 分配取证"
+MARKER = "och patch: create_tensor 取证"
 COMPILE_MARK = "och-patch-creatediag"
 
 FN_CREATE = "etna_ml_create_tensor(struct etna_ml_subgraph"
@@ -96,29 +97,48 @@ STRUCT_DESTROY = (
     ("pipe_resource_reference(&tensor->resource, NULL);", 1),
 )
 
-INJ_CREATE = r'''   /* och patch: create_tensor 分配取证
-    *
-    * 已确定：tensor->size = 610000 正确（与模型一致），但 resource 实际只有 5000 字节。
-    * 已排除：recreate_tensor（0 次调用）、批量迁移（13 次值都没变）。
-    *
-    * 这里在**早退判断之前**打印已有状态，并在每条出口打印
-    * `pipe_buffer_size(res)`（实际分配大小）—— 那是回答本问题的关键列。 */
-   ML_DBG("[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u\n",
-          idx, size, (void *)res, res ? tensor->size : 0u,
-          res ? pipe_buffer_size(res) : 0u);
-   if (res != NULL && tensor->size == size) {
-      ML_DBG("[och-create]   EARLY-RETURN idx=%u size=%u res=%p actual=%u\n",
-             idx, size, (void *)res, pipe_buffer_size(res));
-      return;
-   }
-   res = etna_ml_create_resource(&subgraph->screen->base, size);
-   tensor->resource = res;
-   tensor->size = size;
-   ML_DBG("[och-create]   created   idx=%u size=%u res=%p actual=%u\n",
-          idx, size, (void *)res, res ? pipe_buffer_size(res) : 0u);
-'''
+# ★★★ 纪律门（本项目最严重的一次教训，oca 在真源码上实读抓到）★★★ #
+# 本诊断补丁**只能加打印，绝不改控制流**。
+#
+# 初版把 `if (res != NULL && tensor->size == size) { ... }` 连同 create 块**整块重发射**，
+# 而那个条件正是我在正文里刚更正掉的**错误形态**（真实源码是 `if (res != NULL)`）。
+# 后果：`res != NULL && size != size` 这条路径，上游会 `assert` 当场 abort，
+#       本补丁却变成**静默重分配 + 覆盖指针**，原生块还变成不可达死代码。
+# ⇒ 我要查的正是「size 不一致会怎样」，而补丁把那个现象改成了「悄悄修好」。
+#   这就是前两轮反复拒绝的「把可观测失败换成静默行为」，我自己犯了。
+#
+# 现在改成**三处独立切片 + 纯替换**：条件 / assert / return / create 块逐字保留，
+# 注入的只有 ML_DBG。
+#
+# 另有一条事实修正（oca 提供，重要）：**assert 在我们的构建里是开的**
+# —— ROFIX 真机那次 abort 就是 `u_inlines.h:503` 的 assert 消息。
+# ⇒ 「release/NDEBUG 下静默早退」在我们这里**已被排除**：
+#   size 不一致不可能静默，要么没走过，要么走过就崩，而崩点可 addr2line。
+# ⇒ 本轮真正能立功的是 `created … size=5000` 那类行，以及有没有 destroy 后重建。
 
-INJ_DESTROY = r'''   /* och patch: create_tensor 分配取证 —— destroy 侧 */
+DIAG_ENTER = (
+    "   struct pipe_resource *res = tensor->resource;\n"
+    "   /* och patch: create_tensor 取证 —— 只加打印，不改控制流 */\n"
+    "   ML_DBG(\"[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u\\n\",\n"
+    "          idx, size, (void *)res, res ? tensor->size : 0u,\n"
+    "          res ? pipe_buffer_size(res) : 0u);\n")
+
+DIAG_EARLY = (
+    "   if (res != NULL) {\n"
+    "      ML_DBG(\"[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u %s\\n\",\n"
+    "             idx, size, tensor->size, (void *)res, pipe_buffer_size(res),\n"
+    "             (tensor->size == size) ? \"<size 一致>\" : \"*** size 不一致！***\");\n"
+    "      assert(size == tensor->size);\n"
+    "      return;\n")
+
+DIAG_CREATED = (
+    "   tensor->size = size;\n"
+    "   /* och patch: create_tensor 取证 —— 记录实际分配大小 */\n"
+    "   ML_DBG(\"[och-create]   created   idx=%u req_size=%u res=%p actual=%u\\n\",\n"
+    "          idx, size, (void *)res, res ? pipe_buffer_size(res) : 0u);\n")
+
+
+INJ_DESTROY = r'''   /* och patch: create_tensor 取证 —— destroy 侧，只加打印 */
    ML_DBG("[och-create]   destroy   idx=%u res=%p actual=%u\n",
           idx, (void *)tensor->resource,
           tensor->resource ? pipe_buffer_size(tensor->resource) : 0u);
@@ -282,6 +302,22 @@ if __name__ == "__main__":
 '''
 
 
+def _strip_diag(t):
+    """去注释、去**整条** ML_DBG 语句（含跨行参数）。"""
+    t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+    t = re.sub(r"//[^\n]*", "", t)
+    out, skip = [], False
+    for l in t.split("\n"):
+        if not skip and "ML_DBG(" in l:
+            skip = not l.rstrip().endswith(");")
+            continue
+        if skip:
+            skip = not l.rstrip().endswith(");")
+            continue
+        out.append(l.rstrip())
+    return "\n".join(x for x in out if x.strip())
+
+
 def _body_gen(src, fn):
     at = src.find(fn)
     if at < 0:
@@ -317,18 +353,38 @@ def _extract(src):
                 return i, j
         die(sig + " 找不到配平花括号")
 
-    # create_tensor：从 `pipe_resource *res = …` 到 `      return;`
+    # create_tensor：**在完整函数体上做三次独立替换**。
+    # ⚠️ 踩坑：曾用「三段切片各自替换后**拼接**」—— 那会把切片之间的
+    #    原生代码（`res = etna_ml_create_resource(...)`、`tensor->resource = res;`）
+    #    **整段丢掉**。拼接是错的，只能在完整文本上逐个 replace。
     a, b = rng(FN_CREATE)
-    i0 = next((i for i in range(a, b + 1)
-               if lines[i].strip() == "struct pipe_resource *res = tensor->resource;"), -1)
-    if i0 < 0:
-        die("create_tensor 内找不到 `struct pipe_resource *res = tensor->resource;`")
-    i1 = next((i for i in range(i0, b + 1)
-               if lines[i].strip() == "return;"), -1)
-    if i1 < 0:
-        die("create_tensor 内找不到早退的 `return;`")
-    old_create = "\n".join(lines[i0:i1 + 1]) + "\n"
-    new_create = (lines[i0] + "\n" + INJ_CREATE + "\n".join(lines[i0 + 1:i1 + 1]) + "\n")
+    full = "".join(l + "\n" for l in lines[a:b + 1])
+
+    def sub(old, new, what):
+        n = full.count(old)
+        if n != 1:
+            die("create_tensor 内 `" + old.strip().split("\n")[0][:52]
+                + "` 匹配到 " + str(n) + " 处（期望 1）：" + what)
+        return full.replace(old, new, 1), new
+
+    for anchor, repl, what in (
+        ("   struct pipe_resource *res = tensor->resource;\n", DIAG_ENTER, "enter 锚点"),
+        ("   if (res != NULL) {\n      assert(size == tensor->size);\n      return;\n",
+         DIAG_EARLY, "早退锚点"),
+        ("   tensor->size = size;\n", DIAG_CREATED, "created 锚点"),
+    ):
+        full, _tail = sub(anchor, repl, what)
+
+    old_create = "".join(l + "\n" for l in lines[a:b + 1])
+    new_create = full
+    # 原生上下文逐字保留的三条硬性检查
+    for keep in ("      assert(size == tensor->size);\n",
+                 "      return;\n",
+                 "   res = etna_ml_create_resource(&subgraph->screen->base, size);\n",
+                 "   tensor->resource = res;\n",
+                 "   if (res != NULL) {\n"):
+        if keep not in new_create:
+            die("NEW_CREATE 丢了原生语句 `" + keep.strip() + "` —— 控制流被改了")
 
     # destroy_tensor：在 `pipe_resource_reference(&tensor->resource, NULL);` 之前
     a, b = rng(FN_DESTROY)
@@ -338,6 +394,7 @@ def _extract(src):
         die("destroy_tensor 内找不到 `pipe_resource_reference(&tensor->resource, NULL);`")
     old_destroy = lines[i2] + "\n"
     new_destroy = INJ_DESTROY + lines[i2] + "\n"
+    # destroy 是**纯追加**（打印插在原生语句之前），原生语句逐字保留在 NEW 里
 
     # 标记锚点：#include <stdio.h>
     i3 = next((i for i, l in enumerate(lines) if l.strip() == "#include <stdio.h>"), -1)
@@ -346,6 +403,9 @@ def _extract(src):
     anchor_mark = lines[i3] + "\n"
     new_mark = lines[i3] + "\n" + INJ_MARK
 
+    globals()["_EQ_PAIRS"] = (("create", old_create, full),
+                              ("destroy", old_destroy, old_destroy.replace(
+                                  INJ_DESTROY + old_destroy, "")))
     return old_create, new_create, old_destroy, new_destroy, anchor_mark, new_mark
 
 
@@ -373,6 +433,56 @@ def main():
             die("替换未生效")
     if MARKER not in nc or MARKER not in nd:
         die("注入块缺标记串")
+    # ★ 纪律门（本项目最严重教训）：**不用禁 token**，那会误报
+    #   —— 替换块必须逐字保留 `if (res != NULL) {` 等原生行，那正是替换的一部分。
+    #   正确的守门是下面的「去注释去 ML_DBG 后与原生逐字等价」：
+    #   它直接验证「可执行代码一字未改」，且不会有假阳性。
+
+    # 反向：原生语句必须逐字保留在 NEW 里
+    for keep in ("      assert(size == tensor->size);\n", "      return;\n",
+                 "   res = etna_ml_create_resource(&subgraph->screen->base, size);\n",
+                 "   tensor->resource = res;\n"):
+        if keep not in nc:
+            die("NEW_CREATE 丢了原生语句 `" + keep.strip() + "` —— 控制流被改了")
+
+    # ★ 最强的一道门：把「补丁后的函数」与「原生函数」都去注释、去**整条 ML_DBG 语句**
+    #   （含跨行参数），然后**逐字比对**。相等 ⇒ 控制流一字未改。
+    #   这是 oca 在真源码上实读抓到的那类问题的**自动化守门**。
+    def _strip_diag(t):
+        t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+        t = re.sub(r"//[^\n]*", "", t)
+        out, skip = [], False
+        for l in t.split("\n"):
+            if not skip and "ML_DBG(" in l:
+                skip = not l.rstrip().endswith(");")
+                continue
+            if skip:
+                skip = not l.rstrip().endswith(");")
+                continue
+            out.append(l.rstrip())
+        return "\n".join(x for x in out if x.strip())
+
+    def _fn(text, sig):
+        i = text.index(sig)
+        i = text.rfind("\n", 0, i)
+        seg = text[i:]
+        j = seg.index("{")
+        d = 0
+        k = j
+        while True:
+            if seg[k] == "{":
+                d += 1
+            elif seg[k] == "}":
+                d -= 1
+                if d == 0:
+                    return seg[:k + 1]
+            k += 1
+
+    for tag, before_txt, after_txt in _EQ_PAIRS:
+        if _strip_diag(before_txt) != _strip_diag(after_txt):
+            die("★ 纪律门未通过：" + tag + " 打补丁后与原生的可执行代码**不等价**"
+                "（去注释、去整条 ML_DBG 语句后逐字比对失败）"
+                "—— 诊断补丁只能加打印，不得改控制流")
     if COMPILE_MARK not in nm:
         die("标记块缺编译期字符串")
 
