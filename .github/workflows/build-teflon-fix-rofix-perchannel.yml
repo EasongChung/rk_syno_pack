@@ -368,6 +368,9 @@ jobs:
           set -eu
           python3 oes-teflon/tools/check-patch-verify-order.py \
             --file oes-teflon/build-recipe/build-teflon.sh
+          # ★ 必须带负控制：门自己写错就会出现假绿（本项目栽过 6 次）。
+          #   负控制会把两个块对调，门必须转红。
+          python3 oes-teflon/tools/selftest-check-patch-verify-order.py
 
       # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
       #

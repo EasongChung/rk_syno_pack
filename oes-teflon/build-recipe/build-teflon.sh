@@ -945,16 +945,29 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 			exit 1
 		fi
 	done
-	# ★ 锚点复核必须**在打补丁之前**跑。
+	# ★ 一切「核对未打补丁的原文」的检查都必须排在打补丁**之前**。
 	#   打完补丁后 calc_quantization / requantize_weights 已被整函数替换，
 	#   再去核对「OLD_* 是否命中原始文本」必然失配 ——
-	#   实测（run 39226436430）就是这样红的：
-	#     ERROR: calc_quantization 内 `if (poperation->conv.depthwise)` 实得 0（期望 1）
-	#   同样的坑在 .github/workflows 里已有注释，本轮又在脚本里重犯一次。
+	#   这个坑连栽两次：
+	#     run 39226436430 —— --verify 排在打补丁之后
+	#     run 39227152464 —— 结构自测排在打补丁之后（它内部也跑 --verify）
+	#   ⇒ 改成门来查：tools/check-patch-verify-order.py。
+	MLNN_DIR="$(cd "$(dirname "$MLPNN")" && pwd)"
 	if [ -f "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" --verify \
 			--src "$MLPNN" --src-v7 "$MLV7" --out "$PATCHER14" || {
 			echo "ERROR: 布局补丁锚点与真实源码不符（尚未打补丁，此时失配即为真失配）"
+			exit 1
+		}
+	fi
+	# 结构自测：幂等 / fail-closed / 两种 diag 模式。
+	#   它自己会拷一份临时副本去打，所以**不依赖**工作树是否已打补丁；
+	#   但它第一步就是 --verify，因此必须排在打补丁之前。
+	#   --src-root 必须给**绝对路径**：Mesa 在 $BUILD_DIR 下，不在仓库根。
+	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" \
+			--src-root "$MLNN_DIR" || {
+			echo "ERROR: per-channel 布局补丁结构自测未通过"
 			exit 1
 		}
 	fi
@@ -968,14 +981,6 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" || {
 			echo "ERROR: per-channel 布局数值自测未通过"
-			exit 1
-		}
-	fi
-	# 结构自测：幂等 / fail-closed / 两种 diag 模式。
-	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" ]; then
-		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" \
-			--src-root "$(dirname "$MLPNN")" || {
-			echo "ERROR: per-channel 布局补丁结构自测未通过"
 			exit 1
 		}
 	fi
