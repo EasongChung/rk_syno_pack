@@ -945,20 +945,25 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 			exit 1
 		fi
 	done
+	# ★ 锚点复核必须**在打补丁之前**跑。
+	#   打完补丁后 calc_quantization / requantize_weights 已被整函数替换，
+	#   再去核对「OLD_* 是否命中原始文本」必然失配 ——
+	#   实测（run 39226436430）就是这样红的：
+	#     ERROR: calc_quantization 内 `if (poperation->conv.depthwise)` 实得 0（期望 1）
+	#   同样的坑在 .github/workflows 里已有注释，本轮又在脚本里重犯一次。
+	if [ -f "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" --verify \
+			--src "$MLPNN" --src-v7 "$MLV7" --out "$PATCHER14" || {
+			echo "ERROR: 布局补丁锚点与真实源码不符（尚未打补丁，此时失配即为真失配）"
+			exit 1
+		}
+	fi
 	python3 "$PATCHER14" "$MLPNN" --v7 "$MLV7" --diag "${TEFLON_PERCHANNEL_DIAG:-1}" || {
 		echo "ERROR: per-channel 布局补丁应用失败 —— 不要跳过校验"
 		echo "       （会静默产出仍按错误布局读权重的 .so，崩溃照旧，白跑一轮真机验证）。"
 		echo "       请跑 tools/gen-perchannel-layout-patch.py 从真实源码重新生成锚点。"
 		exit 1
 	}
-	# 锚点复核：已入库补丁器的 OLD_* 是否仍与真源码逐字一致。
-	if [ -f "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" ]; then
-		python3 "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" --verify \
-			--src "$MLPNN" --src-v7 "$MLV7" --out "$PATCHER14" || {
-			echo "ERROR: 布局补丁锚点与真实源码不符"
-			exit 1
-		}
-	fi
 	# 数值自测：把下降路径镜像成 Python 逐元素比对（不依赖编译、不依赖设备）。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" || {

@@ -358,6 +358,17 @@ jobs:
           set -eu
           python3 oes-teflon/tools/selftest-perchannel-layout-math.py
 
+      # ★ run 39226436430 就是被这条抓红的（当时还没有这道门）：
+      #   `gen-*-patch.py --verify` 被放在了**打补丁之后** ——
+      #   calc_quantization / requantize_weights 已被整函数替换，
+      #   再核对 OLD_* 必然失配 ⇒ build-tfelon.sh exit 1 ⇒ 整轮 CI 白烧。
+      #   「写进注释」不管用（本轮就是在已有注释的地方重犯），所以让机器查。
+      - name: Static check - anchor verify must run BEFORE patching
+        run: |
+          set -eu
+          python3 oes-teflon/tools/check-patch-verify-order.py \
+            --file oes-teflon/build-recipe/build-teflon.sh
+
       # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
       #
       #   Preflight 阶段 Mesa 源码**还没下载**（build-teflon.sh 第 3 步才 clone），
