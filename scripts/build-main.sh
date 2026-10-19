@@ -33,7 +33,7 @@ Environment:
   SYNO_SATA_PCIE_ROOT  SATA pcie_root written into initrd model.dtb
                        defaults to 0000:00:00.0,00.0
   SYNO_MAX_DISKS       DSM internal slot count written into initrd model.dtb
-                       and synoinfo.conf, defaults to 6
+                       and synoinfo.conf, defaults to 1
 EOF
 }
 

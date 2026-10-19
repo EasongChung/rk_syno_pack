@@ -116,7 +116,7 @@ copy_model_dtb()
 sync_synoinfo_disk_count()
 {
 	max_disks="$(/bin/get_key_value /etc.defaults/synoinfo.conf maxdisks 2>/dev/null)"
-	[ -n "$max_disks" ] || max_disks=6
+	[ -n "$max_disks" ] || max_disks=1
 
 	for dir in etc.defaults etc; do
 		[ -d "$RootMnt/$dir" ] || continue

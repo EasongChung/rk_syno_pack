@@ -17,7 +17,7 @@ Environment:
   INSTALL_SYNO_HDDMON  replace syno_hddmon.ko, defaults to 1
   SYNO_HDDMON_KO       replacement syno_hddmon.ko path
   SYNO_SATA_PCIE_ROOT  SATA pcie_root written into model.dtb
-  SYNO_MAX_DISKS       DSM internal slot count, defaults to 6
+  SYNO_MAX_DISKS       DSM internal slot count, defaults to 1
 EOF
 }
 

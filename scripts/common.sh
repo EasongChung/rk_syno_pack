@@ -197,7 +197,7 @@ read_version_key() {
 }
 
 patch_model_dtb_rk3566_sata_slots() {
-  local max_disks="${SYNO_MAX_DISKS:-6}"
+  local max_disks="${SYNO_MAX_DISKS:-1}"
   local model_dtb slot slot_node ahci_node rtk_ahci_node actual
 
   case "${max_disks}" in
@@ -238,7 +238,7 @@ patch_model_dtb_rk3566_sata_slots() {
 
 patch_model_dtb_sata_pcie_root() {
   local pcie_root="${SYNO_SATA_PCIE_ROOT:-0000:00:00.0,00.0}"
-  local max_disks="${SYNO_MAX_DISKS:-6}"
+  local max_disks="${SYNO_MAX_DISKS:-1}"
   local model_dtb slot slot_node ahci_node actual
 
   [ -n "${pcie_root}" ] || die "SYNO_SATA_PCIE_ROOT must not be empty"
@@ -296,7 +296,7 @@ set_synoinfo_kv() {
 }
 
 patch_synoinfo_disk_count() {
-  local max_disks="${SYNO_MAX_DISKS:-6}"
+  local max_disks="${SYNO_MAX_DISKS:-1}"
   local synoinfo
 
   case "${max_disks}" in

@@ -280,7 +280,7 @@ EXTRA_PARTS='rdnew:16M,userdata:0' \
 | `DTB_NAME` | 覆盖当前平台默认 DTB 文件名 |
 | `CROSS_COMPILE` | 覆盖自动检测到的交叉工具链前缀 |
 | `UBOOT_DEFCONFIG` | 覆盖当前平台 U-Boot defconfig |
-| `SYNO_MAX_DISKS` | initrd 中的 DSM 内置盘位数量，默认 `6` |
+| `SYNO_MAX_DISKS` | initrd 中的 DSM 内置盘位数量，默认 `1` |
 | `SYNO_SATA_PCIE_ROOT` | RK3399/RK3568 SATA HBA 的 `pcie_root` |
 | `SYNO_MAC1` | 固定 LAN1 MAC，12 位十六进制且不带冒号 |
 | `SYNO_SN` | 固定 DSM 序列号 |
