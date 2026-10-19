@@ -347,6 +347,17 @@ jobs:
           set -eu
           python3 oes-teflon/tools/check-perchannel-quant.py --selftest
 
+      # ★ per-channel 布局契约的**数值**自测：把 expand_depthwise -> transpose ->
+      #   calc_quantization -> requantize_weights 整条链镜像成 Python，
+      #   与独立算出的正确答案逐元素比对（正/负/边界控制）。
+      #   不依赖 Mesa 源码、不依赖交叉编译器，所以放在 Preflight。
+      #   这道门抓到过我自己镜像里的两个真错误（transpose 循环顺序写反、
+      #   ref 遍历顺序与输出缓冲区不一致），它们都会让「数值自测」变成假绿。
+      - name: Preflight - per-channel layout math self-test
+        run: |
+          set -eu
+          python3 oes-teflon/tools/selftest-perchannel-layout-math.py
+
       # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
       #
       #   Preflight 阶段 Mesa 源码**还没下载**（build-teflon.sh 第 3 步才 clone），
@@ -757,6 +768,53 @@ jobs:
           echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-fix.log"
+
+      # ★ 硬门（源码级）：布局补丁的四处改动必须**真的**落在被打过补丁的源文件里。
+      #   「构建成功」证明不了这一点 —— 补丁器即使打歪了（少了某处替换）也能编过，
+      #   而症状要到设备上才表现为 SIGSEGV 或静默错误。
+      #   这里是 build-teflon.sh 里锚点复核之外的第二道：直接读**打完补丁的**源文件。
+      - name: Assert per-channel layout patch actually applied (source-level)
+        run: |
+          set -eu
+          SRC="$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv"
+          NN="$SRC/etnaviv_ml_nn.c"
+          V7="$SRC/etnaviv_ml_nn_v7.c"
+          for f in "$NN" "$V7"; do
+            [ -f "$f" ] || { echo "ERROR: 找不到 $f"; exit 1; }
+          done
+          ok=1
+          chk() {
+            n=$(grep -cF -- "$2" "$3" || true)
+            if [ "$n" -ne "$1" ]; then
+              echo "FAIL: $4 —— 实得 $n，期望 $1"
+              ok=0
+            else
+              echo "OK:   $4（$n）"
+            fi
+          }
+          chk 1 'uint8_t (*weights)[real_in]'        "$NN" 'calc_quantization 读侧 real_in'
+          chk 1 'uint8_t (*map_in)[real_in]'         "$NN" 'requantize_weights 读侧 real_in'
+          chk 1 'uint8_t (*map_out)[out_dim]'        "$NN" 'requantize_weights 写侧 out_dim'
+          chk 1 'unsigned src_ic = depthwise ? oc : ic;' "$NN" 'depthwise 对角线取权重'
+          chk 0 'nn_core_version >= 8 && poperation->conv.depthwise' "$NN" 'v7 写回条件已去掉'
+          chk 2 '[och-pcl] SEL'                      "$V7" 'v7 两处选路都插了诊断'
+          [ "$ok" = 1 ] || { echo "ERROR: 布局补丁未完整落地"; exit 1; }
+          # 取证：把改后的三个函数原样带走，供 review 与设备侧对撞
+          {
+            echo "=== calc_quantization / requantize_weights / 写回（etnaviv_ml_nn.c）==="
+            sed -n '/^calc_quantization(/,/^}/p' "$NN"
+            sed -n '/^requantize_weights(/,/^}/p' "$NN"
+            grep -n -A4 'och patch: v7 也要写回' "$NN"
+            echo
+            echo "=== create_coeffs_v7 选路（etnaviv_ml_nn_v7.c）==="
+            grep -n -B2 -A10 'och-pcl\] SEL' "$V7"
+            echo
+            echo "=== 本轮可证伪预测（设备上机时应逐条对上；不符即证伪报告 21）==="
+            echo "CQ-OUT dw=1 visited=2196   （不是 535824）"
+            echo "RW-OUT dw=1 new_size=2196 （不是 535824）"
+            echo "SEL    dw=1 input_channels=1 -> write_core_sequential"
+          } > "$RUNNER_TEMP/pcl-evidence.txt"
+          cat "$RUNNER_TEMP/pcl-evidence.txt"
 
       # ★ 硬门：两处修复都必须**真的**打上，否则产物会照旧崩 —— 而「构建成功」看不出来。
       - name: Assert both fixes actually applied

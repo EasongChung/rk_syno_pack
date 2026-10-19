@@ -912,6 +912,70 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 			exit 1
 		}
 	fi
+# ---------------------------------------------------------------- #
+	# 3m-2. per-channel **布局契约**修复（同一个开关，不另开）
+	#
+	# 【为什么必须在同一个开关里，不能拆成第二个开关】
+	#   门禁放开与布局修复都只可能在 per-channel 被准入时才走到；
+	#   拆开只会允许「开一个不启另一个」的坏组合 —— 那必然是错的。
+	#   单一 TEFLON_PERCHANNEL = 单一语义 = 单一产物来源。
+	#
+	# 【修什么】（详见 tools/selftest-perchannel-layout-math.py 的镜像）
+	#   calc_quantization / requantize_weights 都按 [out][W][H][in] 读权重，
+	#   但它们跑在 transpose() 之后，而 transpose() 的输出是 [out][in][W][H]。
+	#   depthwise 时 nn.c:239-240 还把 input_channels 压成 1：
+	#     - calc_quantization 只覆盖 0.41% 的权重 ⇒ scale 本身就是错的；
+	#     - requantize_weights 把缓冲区压成 1/244 ⇒ v7 未写回 in_c ⇒
+	#       create_coeffs_v7 按 in_c=244 选 write_core_interleaved ⇒ 越界 ⇒ SIGSEGV。
+	#
+	# 【非 depthwise 情形经证明无害，见报告 21】
+	#   两个索引都是到 [0,out*W*H*in) 的双射且同下标读写，oc 又能从下标还原
+	#   ⇒ 置换自逆、数值不变。本补丁在那一支只是把契约写明确。
+	# ---------------------------------------------------------------- #
+	MLPNN="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	MLV7="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	PATCHER14="$SCRIPT_DIR/patch-etnaviv-perchannel-layout.py"
+	if [ ! -f "$PATCHER14" ]; then
+		echo "ERROR: 缺 $PATCHER14"
+		exit 1
+	fi
+	for f in "$MLPNN" "$MLV7"; do
+		if [ ! -f "$f" ]; then
+			echo "ERROR: 找不到 $f"
+			exit 1
+		fi
+	done
+	python3 "$PATCHER14" "$MLPNN" --v7 "$MLV7" --diag "${TEFLON_PERCHANNEL_DIAG:-1}" || {
+		echo "ERROR: per-channel 布局补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出仍按错误布局读权重的 .so，崩溃照旧，白跑一轮真机验证）。"
+		echo "       请跑 tools/gen-perchannel-layout-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+	# 锚点复核：已入库补丁器的 OLD_* 是否仍与真源码逐字一致。
+	if [ -f "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/gen-perchannel-layout-patch.py" --verify \
+			--src "$MLPNN" --src-v7 "$MLV7" --out "$PATCHER14" || {
+			echo "ERROR: 布局补丁锚点与真实源码不符"
+			exit 1
+		}
+	fi
+	# 数值自测：把下降路径镜像成 Python 逐元素比对（不依赖编译、不依赖设备）。
+	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" || {
+			echo "ERROR: per-channel 布局数值自测未通过"
+			exit 1
+		}
+	fi
+	# 结构自测：幂等 / fail-closed / 两种 diag 模式。
+	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" \
+			--src-root "$(dirname "$MLPNN")" || {
+			echo "ERROR: per-channel 布局补丁结构自测未通过"
+			exit 1
+		}
+	fi
+	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
+	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"
 else
 	echo "==> [3m/6] per-channel 量化门：默认关闭（设 TEFLON_PERCHANNEL=1 启用）"
 fi
