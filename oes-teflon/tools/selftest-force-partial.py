@@ -26,9 +26,17 @@ ANCHOR = """   /* Get all the image tiles in the cache, then use the rest for th
    if (map->kernel_cache_start_address + coef_cache_size + image_cache_size < oc_sram_size) {
 """
 
+# ★ 补丁器有「结构自检」：必须能在文件里找到 oc_sram_size / kernel_cache_start_address /
+#   SRAM_CACHE_MODE_PARTIAL_CACHE 三个标记 ⇒ 合成文件必须带上，否则补丁会 fail-closed
+#   （第一版就是漏了第三个 token ⇒ 正控制直接失败 ⇒ CI Preflight 会红）。
 PREFIX = """#include <stdio.h>
 struct etna_nn_params { unsigned int a : 3; };
 struct etna_operation { int type; };
+#define SRAM_CACHE_MODE_PARTIAL_CACHE 0x2
+static unsigned oc_sram_size = 524288;
+static unsigned coef_cache_size = 0;
+static unsigned image_cache_size = 0;
+static unsigned kernel_cache_start_address = 0x800;
 """
 
 
