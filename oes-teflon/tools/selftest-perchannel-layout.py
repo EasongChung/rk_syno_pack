@@ -20,8 +20,16 @@ DEFAULT_SRC_ROOT = ("/root/workspace/oes-teflon/third_party/mesa-src-26.2.5/"
 BS = chr(92)
 NL = chr(10)
 
-GEN = r"D:\clawtemp\_wtF1\oes-teflon\tools\gen-perchannel-layout-patch.py"
-PATCH = r"D:\clawtemp\_wtF1\oes-teflon\build-recipe\patch-etnaviv-perchannel-layout.py"
+# ★ 路径必须按 __file__ 推导 —— 写死本地绝对路径会让 CI 上子进程直接失败，
+#   而失败会伪装成「补丁打不上」，极具误导性（run 39228292468 就这样红的）。
+GEN = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "gen-perchannel-layout-patch.py")
+PATCH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "build-recipe", "patch-etnaviv-perchannel-layout.py")
+for _p, _what in ((GEN, "生成器"), (PATCH, "补丁器")):
+    if not os.path.isfile(_p):
+        sys.stderr.write("ERROR: 找不到%s %s\n" % (_what, _p))
+        sys.exit(2)
 SRC = None
 
 _ap = argparse.ArgumentParser()

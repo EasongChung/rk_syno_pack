@@ -372,6 +372,15 @@ jobs:
           #   负控制会把两个块对调，门必须转红。
           python3 oes-teflon/tools/selftest-check-patch-verify-order.py
 
+      # ★ run 39227152464 / 39228292468 都被「写死本地路径」坑过：
+      #   一处 `--src-root` 用相对路径，一处 GEN/PATCH 写死 `D:\...`。
+      #   两者在 CI 上都表现为「文件不存在」，且失败会伪装成别的问题。
+      #   一条命令就能拦住的，不该用一轮 CI 去发现。
+      - name: Static check - no hardcoded local paths in scripts
+        run: |
+          set -eu
+          python3 oes-teflon/tools/check-no-hardcoded-paths.py
+
       # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
       #
       #   Preflight 阶段 Mesa 源码**还没下载**（build-teflon.sh 第 3 步才 clone），
