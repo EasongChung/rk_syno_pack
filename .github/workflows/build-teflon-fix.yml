@@ -259,6 +259,7 @@ jobs:
 
           def defined(tree):
               names = set()
+              dyn = []
               for n in ast.walk(tree):
                   if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
                       names.add(n.id)
@@ -276,6 +277,18 @@ jobs:
                       names.add(n.name)
                   elif isinstance(n, ast.comprehension):
                       names.update(x.id for x in ast.walk(n.target) if isinstance(x, ast.Name))
+                  elif isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                          and isinstance(n.targets[0], ast.Subscript):
+                      # 动态全局：globals()/locals()/vars()["X"] = ...
+                      # 不能只算成已定义，否则它的**消费者**会被误判成 undefined name。
+                      t0 = n.targets[0]
+                      v = t0.value
+                      if (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                              and v.func.id in ('globals', 'locals', 'vars')
+                              and isinstance(t0.slice, ast.Constant)
+                              and isinstance(t0.slice.value, str)):
+                          names.add(t0.slice.value)
+                          dyn.append('%s[%r]' % (v.func.id, t0.slice.value))
               return names
 
           files = sorted(glob.glob('oes-teflon/build-recipe/*.py') +

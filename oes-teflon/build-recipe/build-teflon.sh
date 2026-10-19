@@ -104,6 +104,8 @@
 #                         预期：不崩 + 接管数下降 + 第 ④ 级逐字节比对应通过。
 #
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
+#                         补丁器：build-recipe/patch-etnaviv-perchannel-quant.py
+#                         ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
 #                         根因：etna_ml_operation_supported() 对 input/weight/bias/output
 #                         四个张量统一要求
 #                           tensor_quantization_supported(t) = (t->scales == NULL && …)
@@ -119,6 +121,11 @@
 #                           故本补丁按张量区分，并自带该不变量的硬断言。
 #                         ⚠️ 折叠**有精度损失**，本补丁只保证「能接管、不崩溃」，
 #                            **不保证数值达标**；cos/top-1 必须设备实测（门 e）。
+#                         ★ **input/output 仍严格** —— 那两个张量的下降路径只读
+#                           **标量** tensor->scale，per-axis 张量的标量并未被设置；
+#                           放行它们会读到未设置的标量 ⇒ **静默算错**。
+#                           故只对 weight/bias 放开，补丁内与
+#                           tools/check-perchannel-quant.py 各硬断言这一点。
 #                         目标文件 etnaviv_ml.c。
 #                         锚点由 tools/gen-perchannel-quant-patch.py 从真实源码逐字生成。
 #                         预期：per-channel 模型的卷积接管数恢复 + 不崩；

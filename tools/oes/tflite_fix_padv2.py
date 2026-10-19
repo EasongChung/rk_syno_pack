@@ -34,6 +34,7 @@ TFLite 的 PAD 算子固定用 0 填充；PADV2 才带 constant_values。
   python tflite_fix_padv2.py --in legacy.tflite --out fixed.tflite [--dry-run]
 """
 import argparse
+import os
 import sys
 import sys as _sys
 

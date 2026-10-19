@@ -65,6 +65,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ★ PadV2 填充值门需要 numpy + tflite（flatbuffers schema 读取器）。
+      #   实测：run 39207812478 的第 11 步就挂在这里 —— ubuntu-latest 的系统
+      #   python3 **没有 numpy**（ModuleNotFoundError: No module named 'numpy'）。
+      #   tflite 精确 pin 到本地验证过的 2.18.0（schema API 与更早版本不同：
+      #   老版本没有 `Operator.BuiltinCode()`，要经 `OperatorCodes()` 取）。
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gate dependencies (numpy + tflite)
+        run: |
+          set -eux
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "numpy<3" "tflite==2.18.0"
+          python3 -c "import numpy, tflite; print('numpy', numpy.__version__); print('tflite import ok')"
+
       # ★ 只拉源码，不装编译工具链 —— 本 workflow 不构建。
       #   **URL 与 tag 必须与 build-teflon.sh 第 3 步逐字一致** ——
       #   一旦漂移，核对的就不是构建真正用的那份源码，整道门失效且**不会报错**
@@ -191,6 +208,15 @@ jobs:
         run: |
           set -eux
           python3 oes-teflon/tools/check-claims-evidence.py --selftest
+
+      # ★ 把「验步骤存在」升级成「**真跑那个步骤**」。
+      #   起因：run 39207851035 在 `Static check - PERCHANNEL docs consistency`
+      #   红了 —— 那道门**只读仓库里的 build-teflon.sh**，本来完全可以本地跑，
+      #   而我 dispatch 前只验了它「存在」。本工具把所有这类内嵌门抽出来真跑一遍。
+      - name: Run every runnable embedded gate locally
+        run: |
+          set -eux
+          python3 oes-teflon/tools/run-embedded-gates.py
 
       # 用本门扫**本次提交自己的** message（advisory：只警告不拦，
       # 因为自由中文上实测有假阳性 —— 依据见 03_强制开发规范.md §2.5）。
