@@ -213,6 +213,26 @@ jobs:
           set -eux
           python3 oes-teflon/tools/check-claims-evidence.py --selftest
 
+      # 所有 workflow 的 run: 块做 bash -n 语法检查。
+      #   起因：run 39209044465 的第 23 步红在**语法错误**上 ——
+      #   我插入的两行以 `\` 结尾，而被替换掉的段里带着 `; do`
+      #   ⇒ `for pat in …` 没有终止符 ⇒ `set -e` 直接退出，
+      #     日志里一行 `OK:` 都没有（只有脚本回显，极难定位）。
+      #   这类错本地零成本可抓。它自带自证：bash 不可信时报 exit 2，不报 PASS。
+      - name: Shell syntax gate - bash -n on every run block
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-run-syntax.py
+
+      # 构建日志断言的字面量必须与源码里**真正的 echo/print 输出**对得上。
+      #   `grep -qF '<字面量>' build-fix.log` 的字面量写错 = 断言永远命中不了
+      #   = CI 必红，且症状极难定位（日志里一行 `OK:` 都没有）。
+      - name: Log-assertion gate - literals match real echo/print output
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-log-asserts.py --selftest
+          python3 oes-teflon/tools/check-log-asserts.py
+
       # ★ 把「验步骤存在」升级成「**真跑那个步骤**」。
       #   起因：run 39207851035 在 `Static check - PERCHANNEL docs consistency`
       #   红了 —— 那道门**只读仓库里的 build-teflon.sh**，本来完全可以本地跑，

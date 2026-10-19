@@ -774,7 +774,7 @@ jobs:
                      '[3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查' \
                      '[och-rofix] 已加 read_outputs 范围对齐' \
                      '[3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）' \
-                     '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \
+                     '[perchannel] 已放开 weight/bias 的 per-axis 量化接管'; do
 
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
