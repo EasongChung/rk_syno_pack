@@ -112,20 +112,39 @@ def _call_args(src, name):
     return out
 
 
-def printed_corpus():
-    """仓库里所有 echo / printf / print(...) 的字符串实参拼接。"""
-    parts = []
+def printed_records():
+    """返回 [(文件, 行号, 该行文本)]：所有 echo / printf / print 的实参行。"""
+    recs = []
     files = (glob.glob(os.path.join(REPO, "oes-teflon", "build-recipe", "*"))
              + glob.glob(os.path.join(REPO, "oes-teflon", "tools", "*.py"))
              + glob.glob(os.path.join(REPO, "tools", "oes", "*.py")))
     for f in files:
         if os.path.isdir(f):
             continue
+        rel = os.path.relpath(f, REPO)
         src = strip_comments(open(f, encoding="utf-8", errors="replace").read())
         for m in re.finditer(r"(?:echo|printf)\s+(.+)$", src, re.M):
-            parts.append(m.group(1))
-        parts.extend(_call_args(src, "print"))
-    return "\n".join(parts)
+            recs.append((rel, src[:m.start()].count("\n") + 1, m.group(1)))
+        for a in _call_args(src, "print"):
+            recs.append((rel, 0, a))
+    return recs
+
+
+def find_evidence(recs, pat):
+    """返回第一条能**证明**该字面量会被打印的记录 (文件, 行号, 原文)。
+
+    ★ §5 的纪律：门输出 PASS 时必须给出「实际匹配到了哪段文本」——
+      拿不出匹配内容的 PASS 一律视为未通过。
+      本函数就是那个「匹配内容」的来源。
+    """
+    for rel, ln, txt in recs:
+        if pat in txt:
+            return rel, ln, " ".join(txt.split())[:150]
+    return None, None, None
+
+
+def printed_corpus():
+    return "\n".join(t for _r, _l, t in printed_records())
 
 
 def classify(run):
@@ -142,7 +161,11 @@ def classify(run):
     cat = "fwd"
     block, in_block = [], False
     for ln in run.split("\n"):
-        if "反向门" in ln:
+        # ★ `运行期负控制` 也是反向门 —— 它在**产物**上检索「诊断补丁若被应用
+        #   会留下的特征串」，同样要求**缺席**。
+        #   第三版忘了认这个注释 ⇒ 那批特征串落进正向桶，被判成「必须会被打印」
+        #   ⇒ 门自己报红。
+        if "反向门" in ln or "运行期负控制" in ln:
             cat = "rev"
         elif "正向门" in ln:
             cat = "dbg"
@@ -172,7 +195,8 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
-    corpus = printed_corpus()
+    recs = printed_records()
+    corpus = "\n".join(t for _r, _l, t in recs)
     if args.selftest:
         print("=== 自测：分类与判据本身 ===")
         demo = ("x=1\n# 正向门\nfor pat in 'AAA'; do\n echo \"$pat\"; done\n"
@@ -183,9 +207,13 @@ def main():
         rep("分类：'反向门' 段的 BBB 进 rev 桶", r == ["BBB"], repr(r))
         rep("分类：fwd 桶此时为空", f == [], repr(f))
         rep("语料非空（否则所有判据都会假 PASS）", len(corpus) > 1000,
-            "corpus=%d 字符" % len(corpus))
+            "corpus=%d 字符 / %d 条记录" % (len(corpus), len(recs)))
         rep("★ 负控制：一个从未出现在 echo 里的串，正向判据必须判红",
             "ZZZ_NEVER_PRINTED_ZZZ" not in corpus)
+        rep("★ 负控制：find_evidence 对不存在的串必须返回 None",
+            find_evidence(recs, "ZZZ_NEVER_PRINTED_ZZZ") == (None, None, None))
+        rep("★ 正控制：find_evidence 必须能给出**文件+原文**（§5：PASS 要带证据）",
+            find_evidence(recs, "[3e/6]")[0] is not None)
         print()
         if FAILS:
             print("SELFTEST RESULT: %d FAIL" % len(FAILS))
@@ -212,10 +240,15 @@ def main():
                 print("=== %s :: %s ===" % (name, nm))
                 for p in fwd + dbg:
                     total += 1
-                    rep("正向/调试门 必须会被打印: " + p[:44], p in corpus)
+                    rel, ln, ev = find_evidence(recs, p)
+                    ok = rel is not None
+                    rep("正向/调试门: " + p[:40], ok)
+                    if ok:
+                        # ★ §5：PASS 必须附带「实际匹配到了哪段文本」
+                        print("        证据: %s:%s  %s" % (rel, ln or "?", ev))
                 if rev:
-                    print("  · 反向门 %d 条（本地**不可检**，需运行期确认）：%s"
-                          % (len(rev), ", ".join(x[:26] for x in rev)))
+                    print("  · 反向门 %d 条（本地**不可检**；运行期负控理由 .so 侧）：%s"
+                          % (len(rev), ", ".join(x[:24] for x in rev)))
                 print()
 
     print("共核对 %d 条日志断言" % total)

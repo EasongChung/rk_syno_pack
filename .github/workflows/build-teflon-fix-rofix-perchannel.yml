@@ -783,6 +783,35 @@ jobs:
               ok=0
             fi
           done
+
+          # ★★ 运行期负控制（och 第四节）：反向断言「不出现」必须有**真的**负控制，
+          #   不能只是「本地没查」。正向断言全过之后，在**同一份产物**上检索
+          #   「诊断补丁若被应用会留下的特征串」——它们必须全部缺席。
+          #   可被任何人独立复核：产物会上传，这些特征串是 .rodata 里的明文。
+          SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
+          if [ ! -f "$SO" ]; then
+            echo "  ERROR: 找不到 $SO —— 运行期负控制**无法执行**，不能算通过"
+            ok=0
+          else
+            for pat in 'och-patch-alias-diag' '[och-alias]' \
+                       'och-patch-creatediag' '[och-create]' \
+                       '[och-wc]' '[och-ro]'; do
+              if strings -a "$SO" | grep -qF "$pat"; then
+                echo "  ERROR: 产物里出现「$pat」—— 诊断开关误开，这不是交付候选产物"
+                ok=0
+              else
+                echo "  OK(.so absent): $pat"
+              fi
+            done
+            # ★ 正向对照：探针本身必须先被证明有效，否则上面那串「都不在」是假绿。
+            if strings -a "$SO" | grep -qF 'och-patch-perchannel-quant'; then
+              echo "  OK(.so present): och-patch-perchannel-quant（正向对照，探针有效）"
+            else
+              echo "  ERROR: 产物里**找不到** och-patch-perchannel-quant ——"
+              echo "         那上面的「都不在」只说明探针失效，不说明开关真的关了"
+              ok=0
+            fi
+          fi
           # 正向门（本轮特有）：调试开关必须**真的**开了 ——
           # 否则产物没有 DWARF，崩溃点再变时 addr2line 无从谈起，等于白跑一轮。
           for pat in 'strip：跳过（保留调试段' \
