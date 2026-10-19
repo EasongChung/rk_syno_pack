@@ -105,6 +105,10 @@
 #
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
 #   TEFLON_NNDUMP=1        【诊断】NN core 描述符**逐字节** dump（create_nn_config 收尾）。
+#   TEFLON_KPAT=1          【诊断】NN core kernel_pattern **运行期强制开关**
+#                         （TEFLON_KPAT=6|3 选择强制值；不设=原分档逻辑，行为不变）。
+#                         用于单变量对照：244 通道 1×1 conv 挂死是否由 pattern 0x6 引起。
+#                         ⚠️ 产物**改行为**，**不可交付**。
 #                         用途：定位「244 通道 1×1 conv 使 NPU 作业挂死」的坏字段
 #                         （真机实测：244→244 挂、122→122 不挂，见 reports/27、28）。
 #                         只打印、**不改行为**；产物带取证打印，**不可交付**。
@@ -1088,6 +1092,46 @@ if [ "${TEFLON_NNDUMP:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3i/6] NN core 描述符 dump 补丁：默认关闭（设 TEFLON_NNDUMP=1 启用）"
+fi
+
+# ── 3j. 【诊断】NN core kernel_pattern 强制开关（改行为，不可交付）─────────
+# 背景（报告 28 实测 + 源码复算）：
+#   挂死最小单元 = 单个 1×1 CONV_2D（244→244 通道）；122→122 同型**不挂**。
+#   复算发现：1×1 conv 的权重一律由 v7 的 write_core_6 写出（= pattern 0x6 的布局），
+#   而描述符的 kernel_pattern 却按**输出通道数**分档挑：
+#     z≥1024→0x13  z≥512→0x3d  z≥256→0x3e  z≥160→0x6  else→0x3f
+#   ⇒ **244 是全模型唯一落进 [160,256) 档的通道数**（24/122/488/976/2048 都不在），
+#     也**唯一**挂死 ⇒ 6 个通道数 5 正常 1 挂，完美相关。
+# 本补丁把分档选择换成**运行期开关**（默认保持原逻辑，行为完全不变）：
+#   TEFLON_KPAT=6  强制 0x6  / 0x7e       / 0x0
+#   TEFLON_KPAT=3  强制 0x3f / 0xfffffffe / 0xffffffff
+#   不设            走原分档逻辑（默认）
+# 目的只有一个：**单变量对照** —— 同一个 122 通道 1×1 conv，只改 pattern 一个字段：
+#   仍不挂 ⇒ pattern 不是元凶；立刻挂 ⇒ pattern 0x6 就是元凶。
+#
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+# ⚠️ 产物**改行为**，**不可交付**。
+#
+# 用法：TEFLON_KPAT=1 ./build-teflon.sh
+if [ "${TEFLON_KPAT:-0}" = "1" ]; then
+	echo "==> [3j/6] 打【诊断】NN core kernel_pattern 强制开关"
+	PATCHER10="$SCRIPT_DIR/patch-etnaviv-kernel-pattern.py"
+	MLKPAT="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER10" ]; then
+		echo "ERROR: 设了 TEFLON_KPAT=1 却缺 $PATCHER10"
+		exit 1
+	fi
+	if [ ! -f "$MLKPAT" ]; then
+		echo "ERROR: 找不到 $MLKPAT"
+		exit 1
+	fi
+	python3 "$PATCHER10" "$MLKPAT" || {
+		echo "ERROR: kernel_pattern 补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未打补丁的 .so，实验结论无效）。"
+		exit 1
+	}
+else
+	echo "==> [3j/6] kernel_pattern 强制开关补丁：默认关闭（设 TEFLON_KPAT=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
