@@ -347,33 +347,19 @@ jobs:
           set -eu
           python3 oes-teflon/tools/check-perchannel-quant.py --selftest
 
-      - name: Preflight - per-channel anchors vs real Mesa source
-        run: |
-          set -eu
-          python3 oes-teflon/tools/gen-perchannel-quant-patch.py --verify \
-            --src oes-teflon/third_party/mesa-src-26.2.5/src/gallium/drivers/etnaviv/etnaviv_ml.c \
-            --out oes-teflon/build-recipe/patch-etnaviv-perchannel-quant.py
-
-      # ★ 通用真源码锚点门（och 第 N 轮提升为项目规则：「新补丁一律要过真源码核对」）
-      #   它把 build-recipe 下**全部**补丁按真实构建顺序打到一份 Mesa 源码副本上，
-      #   逐个验证「真打进去了」，而不是只在各自的合成 mock 上自测。
-      #   覆盖：npu-detect / conv-only / v7-biasfix / wcdiag / ocfix / fsguard /
-      #        rofix / aliasdiag / creatediag / perchannel
-      #   ⚠️ --src-root 必须覆盖**全部**目标文件（含 etnaviv/drm/etnaviv_gpu.c），
-      #      否则脚本以 exit 2 报 INCOMPLETE —— SKIP 不等于通过。
-      - name: Preflight - all patches vs real Mesa source (set=fix)
-        run: |
-          set -eu
-          python3 oes-teflon/tools/check-patches-vs-source.py \
-            --src-root oes-teflon/third_party/mesa-src-26.2.5/src --set fix
-
-      #   取证轮那一组也顺手过一遍：本 workflow 虽然不打它们，
-      #   但它们共用同一批 .c，锚点漂移会连带影响交付候选。
-      - name: Preflight - all patches vs real Mesa source (set=diag)
-        run: |
-          set -eu
-          python3 oes-teflon/tools/check-patches-vs-source.py \
-            --src-root oes-teflon/third_party/mesa-src-26.2.5/src --set diag
+      # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
+      #
+      #   Preflight 阶段 Mesa 源码**还没下载**（build-teflon.sh 第 3 步才 clone），
+      #   路径 oes-teflon/third_party/... 与 $RUNNER_TEMP/teflon-build/mesa/... 都不存在；
+      #   而 post-build 阶段源码**已经被打过补丁**，锚点文本已被替换掉，
+      #   再去核对「锚点是否命中原始文本」必然失败。
+      #   ⇒ 权威的真源码锚点核对放在**独立常设 workflow** `.github/workflows/anchor-check.yml`
+      #      （自己 clone 干净 Mesa，跑 `check-patches-vs-source.py --set maximal`）。
+      #      它与交付构建解耦，每次 push / 每周定时都跑一遍。
+      #
+      #   ⚠️ 上一版（本 commit 之前）曾把这两道门放在 Preflight 里 —— 它们在 CI 上
+      #      必然失败。这本身就是一条规范要治的病：**没有真跑过就声称「已接线」**。
+      #      参见 03_强制开发规范.md §2.4。
 
       # ★ TEFLON_PERCHANNEL 文档一致性门（照 FSGUARD 门的写法）：
       #   头部与 3m 步注释都必须写清「只放开 weight/bias」，

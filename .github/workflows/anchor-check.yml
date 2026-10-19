@@ -1,0 +1,143 @@
+name: anchor-check
+
+# 【常设】补丁锚点真源码核对 —— 与交付构建**完全解耦**
+#
+# ## 为什么要有这个独立 workflow
+#
+# 锚点核对必须在**干净**的 Mesa 源码上做：
+#   · Preflight 阶段 Mesa 还没下载（build-teflon.sh 第 3 步才 clone）
+#   · post-build 阶段源码已被打过补丁，锚点文本已被替换掉，再核对必然失败
+# ⇒ 放进任何交付构建 workflow 都是错的位置。这里自己 clone 一份干净的。
+#
+# ## 为什么必须常设（而不是等有人派构建才验）
+#
+# 锚点漂移是**已发生过的真实事故**，不是假想风险：
+#   `patch-etnaviv-perchannel-quant.py` 的 OLD_GATE 里那条 URL 被手抄成
+#   `#per_axis_vs_per_tensor`，真源码是 `#per-axis_vs-per-tensor`
+#   ⇒ `count == 0`，交付构建必然 fail-closed，
+#      而它自己的合成 mock selftest 12 项**全绿**。
+# 锚点漂移越早发现越便宜：改一个字符串 vs 改一轮构建 + 一轮真机。
+#
+# ## 覆盖范围
+#
+# `check-patches-vs-source.py --set maximal` 一次覆盖 9 个补丁：
+#   npu-detect / conv-only / v7-biasfix / wcdiag / ocfix / fsguard /
+#   rofix / aliasdiag / creatediag / perchannel
+# 另跑 `fix` / `diag` 两个真实构建组合，以及不依赖 Mesa 的纯逻辑门。
+#
+# ## 退出码语义（**不得降级**）
+#
+#   0 = 全过
+#   1 = 有补丁在真源码上没打进去 / 负控制被放过
+#   2 = INCOMPLETE：有补丁被 SKIP（源文件缺失）—— **不等于通过**
+#   3 = 组合定义错误（互斥补丁同时开）
+#
+# ⚠️ 本 workflow **不构建、不产出 .so、不上机**，只做静态核对，成本极低。
+# ⚠️ 本 workflow **不 dispatch 任何东西**，也不改任何交付 workflow 的触发条件。
+
+on:
+  push:
+    # 只在补丁/工具/构建脚本变动时触发 —— 文档改动不该触发一次 Mesa clone
+    paths:
+      - 'oes-teflon/build-recipe/**'
+      - 'oes-teflon/tools/**'
+      - '.github/workflows/anchor-check.yml'
+  schedule:
+    # 每周一次：防「上游 Mesa tag 内容变化」这种本地察觉不到的漂移
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      mesa_tag:
+        description: 'Mesa tag（需带 vendored TFLite 头）'
+        required: false
+        default: 'mesa-26.2.5'
+
+env:
+  MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
+
+jobs:
+  anchor-check:
+    name: patch anchors vs clean Mesa source (no build, no artifact)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ★ 只拉源码，不装编译工具链 —— 本 workflow 不构建。
+      #   拉取方式与 build-teflon.sh 第 3 步**逐字一致**（同一 tag、同一 URL），
+      #   否则核对的就不是构建真正用的那份源码。
+      - name: Clone clean Mesa source (same tag as build-teflon.sh)
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/anchor"
+          cd "$RUNNER_TEMP/anchor"
+          git clone --depth 1 --branch "$MESA_TAG" \
+            https://gitlab.freedesktop.org/mesa/mesa.git mesa
+          test -f mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c
+          test -f mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+          test -f mesa/src/gallium/frontends/teflon/tfl_device.c
+          test -f mesa/src/etnaviv/drm/etnaviv_gpu.c
+          echo "clean mesa at $MESA_TAG: $(git -C mesa rev-parse --short HEAD)"
+
+      # ★★ 通用真源码锚点门（`maximal` = 能同时开的最大限度组合）
+      #   exit 2（INCOMPLETE / 有 SKIP）同样判红 —— SKIP 不等于通过。
+      - name: Anchor gate - all patches vs clean Mesa source (set=maximal)
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root "$RUNNER_TEMP/anchor/mesa/src" --set maximal
+
+      - name: Anchor gate - delivery-candidate combination (set=fix)
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root "$RUNNER_TEMP/anchor/mesa/src" --set fix
+
+      - name: Anchor gate - forensics combination (set=diag)
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root "$RUNNER_TEMP/anchor/mesa/src" --set diag
+
+      # 通用门**自身**的负控制：扰动一个锚点后它必须拒绝。
+      # 没有这一条，通用门自己也可能像上一轮那样「静默失效」。
+      - name: Negative control - the anchor gate itself can go red
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root "$RUNNER_TEMP/anchor/mesa/src" --selftest
+
+      # per-channel 补丁的**逐字**锚点核对（比通用门更严：直接比 OLD_GATE/OLD_USE
+      # 与真实源码是否逐字相同，而不只是「能不能打上去」）。
+      - name: Anchor gate - perchannel byte-exact anchors
+        run: |
+          set -eux
+          python3 oes-teflon/tools/gen-perchannel-quant-patch.py --verify \
+            --src "$RUNNER_TEMP/anchor/mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c" \
+            --out oes-teflon/build-recipe/patch-etnaviv-perchannel-quant.py
+
+      # ── 以下是不依赖 Mesa 的纯逻辑门（合成 mock），一并跑，回归成本≈0 ──
+      - name: Logic gate - perchannel patcher self-test (mock)
+        run: |
+          set -eux
+          python3 oes-teflon/tools/selftest-perchannel-quant.py
+
+      - name: Logic gate - perchannel real-source checker self-test
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-perchannel-quant.py --selftest
+
+      - name: Logic gate - PadV2 fill gate self-test
+        run: |
+          set -eux
+          python3 tools/oes/selftest-padv2-gate.py
+
+      - name: Summary
+        run: |
+          echo "########## ANCHOR-CHECK: PASS（未构建、未产出 .so、未上机） ##########"
+          echo "mesa_tag=${MESA_TAG}"
+          echo "覆盖补丁: npu-detect conv-only v7-biasfix wcdiag ocfix fsguard rofix aliasdiag creatediag perchannel"
+          echo "⚠️ 本 workflow 只做静态锚点核对；**它绿不等于产物可交付**。"
+          echo "   交付仍需：strings 二进制门 + 设备实测门 d/e/f。"
