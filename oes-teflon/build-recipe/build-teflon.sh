@@ -970,12 +970,13 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	#   --src-root 必须给**绝对路径**：Mesa 在 $BUILD_DIR 下，不在仓库根。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" \
-			--src-root "$MLNN_DIR" \
-			2>&1 | tee "$BUILD_DIR_ABS/selftest-perchannel-layout.log"
-		[ "${PIPESTATUS[0]}" -eq 0 ] || {
-			echo "ERROR: per-channel 布局补丁结构自测未通过"
+			--src-root "$MLNN_DIR" > "$BUILD_DIR_ABS/selftest-perchannel-layout.log" 2>&1
+		_rc=$?
+		cat "$BUILD_DIR_ABS/selftest-perchannel-layout.log"
+		if [ "$_rc" -ne 0 ]; then
+			echo "ERROR: per-channel 布局补丁结构自测未通过（rc=$_rc）"
 			exit 1
-		}
+		fi
 	fi
 	python3 "$PATCHER14" "$MLPNN" --v7 "$MLV7" --diag "${TEFLON_PERCHANNEL_DIAG:-1}" || {
 		echo "ERROR: per-channel 布局补丁应用失败 —— 不要跳过校验"
@@ -993,11 +994,13 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	# 数值自测：把下降路径镜像成 Python 逐元素比对（不依赖编译、不依赖设备）。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" \
-			2>&1 | tee "$BUILD_DIR_ABS/selftest-perchannel-layout-math.log"
-		[ "${PIPESTATUS[0]}" -eq 0 ] || {
-			echo "ERROR: per-channel 布局数值自测未通过"
+			> "$BUILD_DIR_ABS/selftest-perchannel-layout-math.log" 2>&1
+		_rc=$?
+		cat "$BUILD_DIR_ABS/selftest-perchannel-layout-math.log"
+		if [ "$_rc" -ne 0 ]; then
+			echo "ERROR: per-channel 布局数值自测未通过（rc=$_rc）"
 			exit 1
-		}
+		fi
 	fi
 	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
 	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"

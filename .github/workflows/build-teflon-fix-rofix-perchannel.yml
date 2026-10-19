@@ -381,6 +381,16 @@ jobs:
           set -eu
           python3 oes-teflon/tools/check-no-hardcoded-paths.py
 
+      # ★ run 39230736466 的根因：build-teflon.sh 的 shebang 是 `#!/bin/sh`，
+      #   CI 上由 **dash** 解释，而 `check-run-syntax.py` 用 `bash -n` 检查
+      #   （workflow 的 run: 块默认 bash）⇒ 那道红本地永远看不见。
+      #   本轮我用了 ${PIPESTATUS[0]}，当场 Bad substitution，补丁器根本没被调用。
+      - name: Static check - shell portability (match each script's shebang)
+        run: |
+          set -eu
+          python3 oes-teflon/tools/check-script-shell-portability.py
+          python3 oes-teflon/tools/selftest-check-script-shell-portability.py
+
       # ★★ 真源码锚点核对**不在本 workflow 的 Preflight 里**，这是有意的：
       #
       #   Preflight 阶段 Mesa 源码**还没下载**（build-teflon.sh 第 3 步才 clone），
