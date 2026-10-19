@@ -1,0 +1,13 @@
+# 第 23 步 `Assert both fixes actually applied` 的**运行期原文**
+#
+# 来源：run 39211898461 / job 117926934460（GitHub Actions，2026-10-19）
+#       https://github.com/EasongChung/rk_syno_pack/actions/runs/39211898461
+# 抽取方式：gh api .../actions/jobs/117926934460/logs，去 ANSI、去时间戳、
+#           去掉 `+ echo ...` 的**脚本回显**（那是脚本源码，不是运行结果）。
+#
+# ★ 这份文件留档的理由：GitHub 日志有保留期，而「补丁真被应用」这条证据
+#   不能只活在网页上。它是**日志侧**证据，与产物侧（.so 里有标记）互为补充：
+#     · 产物里有标记   => 代码被编进去了
+#     · 构建期断言 OK  => build-teflon.sh 走的是打补丁那条分支
+#   两侧都有才算完整。
+

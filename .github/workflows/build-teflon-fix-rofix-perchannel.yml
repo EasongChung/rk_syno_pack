@@ -777,6 +777,13 @@ jobs:
                      '[perchannel] 已放开 weight/bias 的 per-axis 量化接管'; do
 
             if grep -qF "$pat" "$L"; then
+              # ★ 断言原文随产物走（och 第四节：证据必须可被独立复核）。
+              #   GitHub 的 job 日志有大小上限：run 39211898461 **成功**，但第 23 步
+              #   的输出在尾部被截断（实测 `OK: [` 命中 0 次，脚本回显 `ALL SWITCH`
+              #   命中 3 次）⇒ 日志侧证据**取不到**；日志还会过期。
+              #   ⇒ 整段输出 tee 到文件，由 Collect artifact 带走。
+              ASSERT_LOG="$RUNNER_TEMP/teflon-build/step23-assertions.log"
+              exec > >(tee "$ASSERT_LOG") 2>&1
               echo "  OK: $pat"
             else
               echo "  ERROR: 构建日志里缺少「$pat」"
@@ -1072,6 +1079,13 @@ jobs:
           OUT="$RUNNER_TEMP/teflon-build/out"
           mkdir -p artifact
           cp "$OUT/libteflon.so" artifact/
+          # ★ 第 23 步的断言原文（**日志侧**证据；产物侧证据是 .so 里的标记）
+          if [ -f "$RUNNER_TEMP/teflon-build/step23-assertions.log" ]; then
+            cp "$RUNNER_TEMP/teflon-build/step23-assertions.log" artifact/
+          else
+            echo "ERROR: 缺 step23-assertions.log —— 日志侧证据没进产物"
+            exit 1
+          fi
           [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           {
