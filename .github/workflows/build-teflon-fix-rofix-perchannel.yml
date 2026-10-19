@@ -845,6 +845,22 @@ jobs:
           set -eux
           L="$RUNNER_TEMP/build-fix.log"
           ok=1
+          # ★★ 断言原文随产物走（och 第四节：证据必须可被独立复核）。
+          #   GitHub 的 job 日志有大小上限：run 39211898461 成功，但第 23 步输出在尾部
+          #   被截断（实测 `OK: [` 命中 0 次）⇒ 日志侧证据**取不到**；日志还会过期。
+          #   ⇒ 整段输出 tee 到文件，由 Collect artifact 带走。
+          #
+          # ★★★ `exec` 必须放在**整个断言段之前**，且只做一次。
+          #   踩过的坑（run 39229309524 的产物实测）：
+          #     - exec 写在 for 循环**内部** ⇒ 每轮迭代都重新 tee 一次，
+          #       之前的输出被截断冲掉 ⇒ 11 条 `OK:` 只剩最后 1 条；
+          #       且多个 tee 进程并发写同一个文件 ⇒ `ALL SWITCH ASSERTIONS PASSED`
+          #       出现 22 次（正好是断言条数）⇒ 证据文件是坏的。
+          #   「在目标平台上跑过才叫跑过」——这条缺陷只在**产物里**才看得见，
+          #   本地任何门都测不到（本地没跑过这段 shell）。
+          ASSERT_LOG="$RUNNER_TEMP/teflon-build/step23-assertions.log"
+          exec > >(tee "$ASSERT_LOG") 2>&1
+          echo "== 断言原文（每条都带实际匹配到的文本）=="
           for pat in '[3e/6] 打【修复】v7' \
                      '[och-fix] 已修复 v7 calculate_bias_correction' \
                      '[3g/6] 打【修复】write_core_interleaved' \
@@ -858,13 +874,6 @@ jobs:
                      '[perchannel] 已放开 weight/bias 的 per-axis 量化接管'; do
 
             if grep -qF "$pat" "$L"; then
-              # ★ 断言原文随产物走（och 第四节：证据必须可被独立复核）。
-              #   GitHub 的 job 日志有大小上限：run 39211898461 **成功**，但第 23 步
-              #   的输出在尾部被截断（实测 `OK: [` 命中 0 次，脚本回显 `ALL SWITCH`
-              #   命中 3 次）⇒ 日志侧证据**取不到**；日志还会过期。
-              #   ⇒ 整段输出 tee 到文件，由 Collect artifact 带走。
-              ASSERT_LOG="$RUNNER_TEMP/teflon-build/step23-assertions.log"
-              exec > >(tee "$ASSERT_LOG") 2>&1
               echo "  OK: $pat"
             else
               echo "  ERROR: 构建日志里缺少「$pat」"
@@ -1167,6 +1176,20 @@ jobs:
             echo "ERROR: 缺 step23-assertions.log —— 日志侧证据没进产物"
             exit 1
           fi
+          # ★ 本轮新增的两份证据（run 39229309524 的产物里都没带上）：
+          #   1) pcl-evidence.txt  —— 打完补丁的三个函数原文 + 本轮可证伪预测
+          #   2) selftest-*.log    —— 自测输出（och 第三节第 2 条）
+          #      自测输出默认落在日志尾部，同样会被截断，所以必须走产物。
+          for f in "$RUNNER_TEMP/pcl-evidence.txt" \
+                   "$RUNNER_TEMP/teflon-build/selftest-perchannel-layout.log" \
+                   "$RUNNER_TEMP/teflon-build/selftest-perchannel-layout-math.log"; do
+            if [ -f "$f" ]; then
+              cp "$f" artifact/
+            else
+              echo "ERROR: 缺 $(basename "$f") —— 这份证据没进产物"
+              exit 1
+            fi
+          done
           [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           {

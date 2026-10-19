@@ -358,6 +358,10 @@ fi   # 结束 SYSROOT_MODE=deb 分支
 # ---------------------------------------------------------------- #
 echo "==> [3/6] 获取 Mesa $MESA_TAG"
 cd "$BUILD_DIR"
+# ★ BUILD_DIR 允许是**相对**路径（默认 "mesa-build"），而此时 cwd 已经是它。
+#   后面凡要按绝对路径写文件（自测日志 tee 等）必须用这个绝对路径，
+#   否则相对路径会被拼成 <cwd>/mesa-build/... 而写错地方。
+BUILD_DIR_ABS="$(pwd)"
 if [ ! -d mesa/.git ]; then
 	git clone --depth 1 --branch "$MESA_TAG" \
 		https://gitlab.freedesktop.org/mesa/mesa.git mesa
@@ -966,7 +970,9 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	#   --src-root 必须给**绝对路径**：Mesa 在 $BUILD_DIR 下，不在仓库根。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout.py" \
-			--src-root "$MLNN_DIR" || {
+			--src-root "$MLNN_DIR" \
+			2>&1 | tee "$BUILD_DIR_ABS/selftest-perchannel-layout.log"
+		[ "${PIPESTATUS[0]}" -eq 0 ] || {
 			echo "ERROR: per-channel 布局补丁结构自测未通过"
 			exit 1
 		}
@@ -977,9 +983,18 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 		echo "       请跑 tools/gen-perchannel-layout-patch.py 从真实源码重新生成锚点。"
 		exit 1
 	}
+	# ★ 编译期标记：让 strings 门能硬判「这个补丁真的在二进制里」。
+	#   少了它，产物侧只能靠 [och-pcl] 那几个格式串，判据不够独立
+	#   （run 39229309524 的产物里这个标记就是缺席的）。
+	#   用 shell 追加而不是在补丁器的三层嵌套模板里拼字符串 —— 那样转义太易错。
+	if ! grep -qF 'och-patch-perchannel-layout' "$MLPNN"; then
+		printf '\n/* och patch: compile-time marker */\n__attribute__((used)) static const char och_pcl_marker[] = "och-patch-perchannel-layout";\n' >> "$MLPNN"
+	fi
 	# 数值自测：把下降路径镜像成 Python 逐元素比对（不依赖编译、不依赖设备）。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
-		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" || {
+		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" \
+			2>&1 | tee "$BUILD_DIR_ABS/selftest-perchannel-layout-math.log"
+		[ "${PIPESTATUS[0]}" -eq 0 ] || {
 			echo "ERROR: per-channel 布局数值自测未通过"
 			exit 1
 		}
