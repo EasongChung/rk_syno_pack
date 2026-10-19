@@ -134,6 +134,20 @@ jobs:
           set -eux
           python3 tools/oes/selftest-padv2-gate.py
 
+      # 断言必须有证据：跑本门自己的正/负控制 + 真实 commit 回归。
+      # 它验的是**检查器本身**，不是模型或驱动 —— 回归不过说明某个门退化了。
+      - name: Gate self-check - claims must carry evidence
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-claims-evidence.py --selftest
+
+      # 用本门扫**本次提交自己的** message（advisory：只警告不拦，
+      # 因为自由中文上实测有假阳性 —— 依据见 03_强制开发规范.md §2.5）。
+      - name: Claims check - this commit's message
+        run: |
+          set -eu
+          git log -1 --format=%B | python3 oes-teflon/tools/check-claims-evidence.py -
+
       - name: Summary
         run: |
           echo "########## ANCHOR-CHECK: PASS（未构建、未产出 .so、未上机） ##########"
