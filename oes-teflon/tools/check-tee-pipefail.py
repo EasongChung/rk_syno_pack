@@ -13,10 +13,10 @@
 真实事故：run `39227152464` / `39228292468` 的 `Build libteflon.so` 都报
 **success**，而 `build-fix.log` 里明明白白写着
 `ERROR: per-channel 布局补丁结构自测未通过` —— 脚本在那里 `exit 1`，
-`libteflon.so` **根本没产出**。两次红因此从两个看起来毫不相关的步骤漏出来
-（一次像「产物有问题」，一次像「补丁器坏了」），把病因掩盖成两个症状。
+`.so` **根本没产出**。两次红因此从两个看起来毫不相关的步骤漏出来
+（一次像「产物有问题」，一次像「补丁器坏了」），同一个根因被假绿掩盖成两个症状。
 
-★ 全仓扫描：这类 build 步共 **8 个 / 8 个 workflow**（不是 1 个）。
+★ 全仓共 **8 个 build 步 / 8 个 workflow** 中招（不是 1 个）。
 
 ## 判据
 
@@ -27,6 +27,11 @@
 2. 管道出现在 `if` / `if !` 条件里 —— 退出状态由条件自己处理；
 3. 该步 `continue-on-error: true` —— 成功与否本就不是判据
    （必须是显式声明，不能默默放过）。
+
+★ 判据是「那一行是不是真的做了那件事」：裸词 `\bpipefail\b` 会被注释/echo 文本骗过；
+切块时必须把 `- name:` 行与注释行排除，否则门把自己数进去。
+
+★ PASS 必须带证据：打印它实际匹配到的那一行（纪律要求）。
 
 用法：python3 tools/check-tee-pipefail.py [--dir <workflows 目录>]
 """
@@ -43,7 +48,9 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 WF = os.path.join(ROOT, ".github", "workflows")
 
 RE_TEE = re.compile(r"\|\s*tee\b")
-RE_PIPEFAIL = re.compile(r"\bpipefail\b")
+# ★ 只认真正的 shell 选项：`set ... pipefail`，排除注释行
+RE_PIPEFAIL = re.compile(r"^\s*set\b(?![^#\n]*#)[^#\n]*\bpipefail\b")
+RE_COMMENT = re.compile(r"^\s*#")
 RE_OPT_OUT = re.compile(r"\|\|\s*true\b")
 RE_IF = re.compile(r"^\s*(if|elif)\s.*\|\s*tee")
 RE_CONT = re.compile(r"^\s*continue-on-error:\s*true")
@@ -79,12 +86,16 @@ def main():
         p = os.path.join(args.dir, fn)
         lines = io.open(p, encoding="utf-8", errors="replace").read().split("\n")
         for name, lo, hi in blocks(lines):
-            seg = lines[lo:hi]
-            tee_lines = [l for l in seg if RE_TEE.search(l)]
+            seg = lines[lo + 1:hi]                          # 跳过 `- name:` 行本身
+            tee_lines = [l for l in seg
+                         if RE_TEE.search(l) and not RE_COMMENT.match(l)]
             if not tee_lines:
                 continue
             n += 1
-            if any(RE_PIPEFAIL.search(l) for l in seg):
+            pf_hits = [l.strip() for l in seg
+                       if RE_PIPEFAIL.search(l) and not RE_COMMENT.match(l)]
+            if pf_hits:
+                print("  ok: %s :: %s  ← 证据: %s" % (fn, name[:52], pf_hits[0][:80]))
                 continue
             if any(RE_OPT_OUT.search(l) or RE_IF.search(l) for l in tee_lines):
                 continue
