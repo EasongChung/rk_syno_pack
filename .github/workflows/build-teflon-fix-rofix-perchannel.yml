@@ -354,6 +354,27 @@ jobs:
             --src oes-teflon/third_party/mesa-src-26.2.5/src/gallium/drivers/etnaviv/etnaviv_ml.c \
             --out oes-teflon/build-recipe/patch-etnaviv-perchannel-quant.py
 
+      # ★ 通用真源码锚点门（och 第 N 轮提升为项目规则：「新补丁一律要过真源码核对」）
+      #   它把 build-recipe 下**全部**补丁按真实构建顺序打到一份 Mesa 源码副本上，
+      #   逐个验证「真打进去了」，而不是只在各自的合成 mock 上自测。
+      #   覆盖：npu-detect / conv-only / v7-biasfix / wcdiag / ocfix / fsguard /
+      #        rofix / aliasdiag / creatediag / perchannel
+      #   ⚠️ --src-root 必须覆盖**全部**目标文件（含 etnaviv/drm/etnaviv_gpu.c），
+      #      否则脚本以 exit 2 报 INCOMPLETE —— SKIP 不等于通过。
+      - name: Preflight - all patches vs real Mesa source (set=fix)
+        run: |
+          set -eu
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root oes-teflon/third_party/mesa-src-26.2.5/src --set fix
+
+      #   取证轮那一组也顺手过一遍：本 workflow 虽然不打它们，
+      #   但它们共用同一批 .c，锚点漂移会连带影响交付候选。
+      - name: Preflight - all patches vs real Mesa source (set=diag)
+        run: |
+          set -eu
+          python3 oes-teflon/tools/check-patches-vs-source.py \
+            --src-root oes-teflon/third_party/mesa-src-26.2.5/src --set diag
+
       # ★ TEFLON_PERCHANNEL 文档一致性门（照 FSGUARD 门的写法）：
       #   头部与 3m 步注释都必须写清「只放开 weight/bias」，
       #   且都必须写明「input/output 仍严格」——
