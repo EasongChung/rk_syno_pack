@@ -220,6 +220,27 @@ def _revalidate(buf):
 
 
 def rewrite(src, dst, dry_run=False):
+    # ── ★ 前置安全门（och 第 N 轮补）────────────────────────────────────
+    # PAD 恒定用 0 填充；只有当 PADV2 的 constant_values 本该为 0 时，
+    # 改写才数值等价。原脚本无条件改写，遇到「良构但非零」的填充值
+    # 会静默改数值（推理不报错，只是结果错）。
+    # 真源实测：float16 源模型里 8 个 PAD 共用 int32[4,2]=[0,0,1,1,1,1,0,0]，
+    # 填充恒为 0 ⇒ 出现非零填充一定是转换器/上游图的垃圾，必须拦住。
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from padv2_fill_gate import scan_model
+    gate = scan_model(src, verbose=True)
+    if gate['blocking']:
+        raise RuntimeError(
+            'BLOCKED: 存在良构但**非零**的 PADV2 constant_values。'
+            '把它改写成 PAD 会把填充值静默换成 0。'
+            '正确做法是保留 PADV2 并把常量改成 0。详见 padv2_fill_gate.py')
+    if gate['unknown']:
+        raise RuntimeError(
+            'BLOCKED: 有 PADV2 判不出 constant_values（缺输入 / 无 buffer）。'
+            '信息不足时不做改写。')
+    print('FILL GATE: 通过（%d 个 PADV2，判定 %s）'
+          % (gate['n_padv2'], gate['counts'] or '无'), flush=True)
+
     raw = open(src, 'rb').read()
     fb, model = load_model_obj(raw)
     sub = model.subgraphs[0]

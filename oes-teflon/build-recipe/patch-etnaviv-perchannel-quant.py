@@ -67,7 +67,7 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
 {
    /*
     * Per-axis quantization not supported, for details see:
-    * https://ai.google.dev/edge/litert/models/quantization_spec#per_axis_vs_per_tensor
+    * https://ai.google.dev/edge/litert/models/quantization_spec#per-axis_vs_per-tensor
     */
    return tensor->scales == NULL && tensor->zero_points == NULL;
 }
@@ -77,7 +77,7 @@ tensor_quantization_supported(struct pipe_tensor *tensor)
 {
    /*
     * Per-axis quantization not supported, for details see:
-    * https://ai.google.dev/edge/litert/models/quantization_spec#per_axis_vs_per_tensor
+    * https://ai.google.dev/edge/litert/models/quantization_spec#per-axis_vs_per-tensor
     */
    return tensor->scales == NULL && tensor->zero_points == NULL;
 }

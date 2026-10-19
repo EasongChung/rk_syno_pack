@@ -103,12 +103,35 @@
 #                         锚点由 tools/gen-fsguard-patch.py 从真实源码逐字生成。
 #                         预期：不崩 + 接管数下降 + 第 ④ 级逐字节比对应通过。
 #
+#   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
+#                         根因：etna_ml_operation_supported() 对 input/weight/bias/output
+#                         四个张量统一要求
+#                           tensor_quantization_supported(t) = (t->scales == NULL && …)
+#                         ⇒ 任何 per-axis 模型卷积族接管数归零。
+#                         但下降路径**早已实现** per-channel
+#                         （etnaviv_ml_nn.c：scales[oc] 逐通道反量化 →
+#                           calc_quantization() 求单一 scale →
+#                           requantize_weights()/requantize_bias() 重量化），
+#                         upstream 自己标注 "with a loss of accuracy"。
+#                         ★ 只有 weight/bias 的下降路径处理了 per-axis；
+#                           input/output 只读**标量** tensor->scale，
+#                           放行它们会读到未设置的标量 ⇒ **静默算错**。
+#                           故本补丁按张量区分，并自带该不变量的硬断言。
+#                         ⚠️ 折叠**有精度损失**，本补丁只保证「能接管、不崩溃」，
+#                            **不保证数值达标**；cos/top-1 必须设备实测（门 e）。
+#                         目标文件 etnaviv_ml.c。
+#                         锚点由 tools/gen-perchannel-quant-patch.py 从真实源码逐字生成。
+#                         预期：per-channel 模型的卷积接管数恢复 + 不崩；
+#                               ③④ 判据**不因本补丁而达成**。
+#
 #   典型诊断构建：TEFLON_FIX_V7=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   本轮修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
 #   本轮诊断构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
 #                 TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
+#   per-channel 构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+#                 TEFLON_PERCHANNEL=1
 #   ⚠️ 带任一诊断开关的产物**只能用于诊断，不可交付**。
 #   ⚠️ 不要手改脚本里的 strip / c_args 段来「等效实现」这些开关 ——
 #      那会绕过日志断言与互斥检查（这个坑已经踩过一次）。
@@ -813,6 +836,77 @@ if [ "${TEFLON_CREATEDIAG:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3l/6] create_tensor 取证：默认关闭（设 TEFLON_CREATEDIAG=1 启用）"
+fi
+
+# ── 3m. 【修复】放开 weight/bias 的 per-channel（per-axis）量化接管 ──────
+# 【为什么需要：per-channel 模型卷积族接管数归零】
+#   etna_ml_operation_supported() 的 CONVOLUTION 分支对
+#   input/weight/bias/output **四个张量统一**调用
+#       tensor_quantization_supported(t) = (t->scales == NULL && t->zero_points == NULL)
+#   ⇒ 任何带 per-axis 参数的模型，卷积族全部不接管。
+#
+# 【但下降路径其实早就实现了 per-channel，只是被这道门挡住】
+#   etnaviv_ml_nn.c 里权重按 scales[oc] 逐通道反量化，
+#   再用 calc_quantization() 沿所有通道求出**单一** scale，
+#   最后 requantize_weights()/requantize_bias() 重量化到该标量。
+#   upstream 自己打印："hardware doesn't support it natively, so it will be
+#   workarounded by requantizing on the fly, **with a loss of accuracy**"。
+#   ⇒ NN multiplier 确实是标量（operation->weight_scale），
+#     但驱动已内置「按通道反量化再折叠」的 workaround。
+#
+# 【★ 为什么不能把那张门无脑翻成 true】
+#   那张门对四个张量一律同判，但只有 weight/bias 的下降路径处理了 per-axis：
+#     weight : scales[oc] -> calc_quantization -> requantize_weights()   ✅
+#     bias   : bias_tensor->scales[oc] -> requantize_bias()              ✅
+#     input  : input_tensors[0]->scale（**标量**）                          ❌
+#     output : output_tensors[0]->scale（**标量**）                         ❌
+#   放行 input/output 会读到**未被设置的标量 scale** ⇒ 静默算错。
+#   所以本补丁按张量区分，并自带「替换后 input/output 仍严格」的硬断言。
+#
+# 【代价（不藏着）：折叠有精度损失，小权重可能被压到 0】
+#   本补丁只保证「能接管、不崩溃」，**不保证数值达标**；
+#   cos / top-1 必须设备实测（门 e）判定，不能由本补丁推断。
+#
+# 【与 FSGUARD 的关系】
+#   两者都改 etna_ml_operation_supported 附近：FSGUARD 的 OLD 锚点结尾正是
+#   `// Dilation and per-axis quantization not yet implemented`，
+#   就在本补丁改的四连调用**上面**。
+#   selftest-perchannel-quant.py 已验证 **双向顺序都共存**。
+#
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+# ⚠️ 目标文件是 etnaviv_ml.c（与 3h/3i/3j/3l 同一文件，顺序在最后）。
+#
+# 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 \
+#       TEFLON_PERCHANNEL=1
+if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
+	echo "==> [3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）"
+	PATCHER13="$SCRIPT_DIR/patch-etnaviv-perchannel-quant.py"
+	MLPC="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER13" ]; then
+		echo "ERROR: 设了 TEFLON_PERCHANNEL=1 却缺 $PATCHER13"
+		exit 1
+	fi
+	if [ ! -f "$MLPC" ]; then
+		echo "ERROR: 找不到 $MLPC"
+		exit 1
+	fi
+	python3 "$PATCHER13" "$MLPC" || {
+		echo "ERROR: per-channel 量化门补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未放开的 .so，接管数仍是 0，白跑一轮真机验证）。"
+		echo "       请跑 tools/gen-perchannel-quant-patch.py 从真实源码重新生成锚点。"
+		exit 1
+	}
+	# 真源码复核：打完补丁后在**真实 Mesa 源码**上硬判三件事。
+	# 这一步替代不了 tools/selftest-perchannel-quant.py（那跑在合成 mock 上），
+	# 两者互补：mock 证逻辑，真源码证锚点仍然命中。
+	if [ -f "$SCRIPT_DIR/../tools/check-perchannel-quant.py" ]; then
+		python3 "$SCRIPT_DIR/../tools/check-perchannel-quant.py" "$MLPC" || {
+			echo "ERROR: per-channel 补丁在真实源码上的复核未通过"
+			exit 1
+		}
+	fi
+else
+	echo "==> [3m/6] per-channel 量化门：默认关闭（设 TEFLON_PERCHANNEL=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
