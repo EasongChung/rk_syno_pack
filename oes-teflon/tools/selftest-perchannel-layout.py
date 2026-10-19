@@ -15,10 +15,12 @@ import tempfile
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+# ⚠️ 默认值取的是 **och 开发机**的路径，不是 CI 的，也不是本机的。
+#    CI 里 build-teflon.sh 显式传了 --src-root，所以当前不致命；
+#    但它属于「换台机器就炸」的那一类陷阱（och 报告第二节第 3 条）。
+#    唯一可靠的用法是**显式传 --src-root**。
 DEFAULT_SRC_ROOT = ("/root/workspace/oes-teflon/third_party/mesa-src-26.2.5/"
                      "src/gallium/drivers/etnaviv")
-BS = chr(92)
-NL = chr(10)
 
 # ★ 路径必须按 __file__ 推导 —— 写死本地绝对路径会让 CI 上子进程直接失败，
 #   而失败会伪装成「补丁打不上」，极具误导性（run 39228292468 就这样红的）。
