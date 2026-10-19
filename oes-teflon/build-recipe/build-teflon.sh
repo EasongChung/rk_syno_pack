@@ -978,6 +978,15 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 			exit 1
 		fi
 	fi
+	# ★ 一切「核对未打补丁的原文」的检查都必须排在打补丁**之前**。
+	#   打完补丁后 calc_quantization / requantize_weights 已被整函数替换，
+	#   再去核对「OLD_* 是否命中原始文本」必然失配 ——
+	#   这个坑连栽两次：
+	#     run 39226436430 —— --verify 排在打补丁之后
+	#     run 39227152464 —— 结构自测排在打补丁之后（它内部也跑 --verify）
+	#   ⇒ 改成门来查：tools/check-patch-verify-order.py。
+	#   （本块在打补丁之前，与上面的 --verify / 结构自测一起 constitutes
+	#    「打补丁前的 pristine 原文核对区」。）
 	python3 "$PATCHER14" "$MLPNN" --v7 "$MLV7" --diag "${TEFLON_PERCHANNEL_DIAG:-1}" || {
 		echo "ERROR: per-channel 布局补丁应用失败 —— 不要跳过校验"
 		echo "       （会静默产出仍按错误布局读权重的 .so，崩溃照旧，白跑一轮真机验证）。"
@@ -1004,7 +1013,38 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	fi
 	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
 	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"
-else
+
+	# ---------------------------------------------------------------- #
+	# 3n. R5GUARD —— rank-5 激活 guard（och 报告 11）
+	#
+	# 【为什么需要】
+	#   契约里没有「维度个数」字段，delegate 写入最后 4 维；
+	#   驱动一律算 dims[1]*dims[2]*dims[3]，恒定丢 dims[0]。
+	#   rank-4 激活 dims[0]=1 ⇒ 无害；rank-5 激活 dims[0]=122 ⇒ 致命（size 5000 vs 610000）。
+	#   ⇒ 含 rank-5 的子图不接管，回退 CPU，不再 abort。
+	#
+	# 【predicate】data == NULL && dims[0] != 1（och 给的签名）
+	#   ⚠️ 误命中率必须先在真机上验证（P0），本补丁只保证「不再 abort」。
+	#
+	# 【P0 未做】och 要求先验误命中率。本补丁先入库，等设备侧数据。
+	# ---------------------------------------------------------------- #
+	if [ "${TEFLON_R5GUARD:-0}" = "1" ]; then
+		echo "==> [3n/6] 打【修复】R5GUARD（rank-5 激活 guard，回退 CPU）"
+		PATCHER15="$SCRIPT_DIR/patch-etnaviv-r5guard.py"
+		ML="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+		if [ ! -f "$PATCHER15" ]; then
+			echo "ERROR: 缺 $PATCHER15"
+			exit 1
+		fi
+		python3 "$PATCHER15" "$ML" || {
+			echo "ERROR: R5GUARD 补丁应用失败"
+			exit 1
+		}
+		echo "  [r5guard] 已加：含 rank-5 的子图不接管、回退 CPU"
+		echo "  [r5guard] ⚠️ 接管数必须真机实测；跌到不可接受时停下来报告"
+	else
+		echo "==> [3n/6] R5GUARD：默认关闭（设 TEFLON_R5GUARD=1 启用）"
+	fi
 	echo "==> [3m/6] per-channel 量化门：默认关闭（设 TEFLON_PERCHANNEL=1 启用）"
 fi
 
