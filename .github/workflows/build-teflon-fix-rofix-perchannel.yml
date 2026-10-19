@@ -750,7 +750,7 @@ jobs:
           print('CREATEDIAG-DOCS: PASS')
           PY
 
-      - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD + ROFIX + ALIASDIAG + CREATEDIAG, UNSTRIPPED)
+      - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL, UNSTRIPPED)
         run: |
           set -eux
           chmod +x oes-teflon/build-recipe/build-teflon.sh
@@ -773,10 +773,9 @@ jobs:
                      '[och-fsguard] 已加 filter 深度一致性守卫' \
                      '[3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查' \
                      '[och-rofix] 已加 read_outputs 范围对齐' \
-                     '[3k/6] 打【诊断】alias 迁移取证（该产物不可交付）' \
-                     '[och-alias] 已加 alias 迁移取证' \
-                     '[3l/6] 打【诊断】create_tensor 分配取证（该产物不可交付）' \
-                     '[och-create] 已加 create/destroy_tensor 分配取证'; do
+                     '[3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）' \
+                     '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \
+
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
             else
@@ -822,26 +821,7 @@ jobs:
           python3 oes-teflon/tools/check-rofix-anchors.py \
             "$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
 
-      # ★ ALIASDIAG 锚点门：与 ROFIX 锚点门并存（两个补丁改的是不同函数，互不影响）。
-      #   逆变换回「clean + FSGUARD + ROFIX」，再让生成器在真源码上重抽锚点逐字节比对，
-      #   同时打印两个注入点/两个目标函数/read_outputs 的构建后行号（排查坐标）。
-      - name: Static check - ALIASDIAG anchors vs real source (post-build)
-        run: |
-          set -eux
-          python3 oes-teflon/tools/check-aliasdiag-anchors.py \
-            "$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
-
-      # ★ CREATEDIAG 锚点门：与 ROFIX / ALIASDIAG 锚点门**三个并存**
-      #   （三个补丁改的是不同函数，互不影响）。除常规的保真逆变换 + 生成器重抽锚点
-      #   逐字节比对外，本门**额外在真实源码上复检「打印纪律」**：
-      #   补丁后的 create/destroy_tensor 去掉注释与 ML_DBG 后，必须与逆变换后逐字相同。
-      - name: Static check - CREATEDIAG anchors vs real source (post-build)
-        run: |
-          set -eux
-          python3 oes-teflon/tools/check-creatediag-anchors.py \
-            "$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
-
-      - name: Verify artifact (UNSTRIPPED, fix markers present, [och-rofix], [och-alias] and [och-create] present, other diag markers absent)
+      - name: Verify artifact (UNSTRIPPED, fix markers present incl. perchannel, ALL diag markers absent)
         run: |
           set -eux
           SO="$RUNNER_TEMP/teflon-build/out/libteflon.so"
@@ -909,36 +889,6 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: [och-rofix] PRESENT (ROFIX really in .so)"
-          # ★★ ALIASDIAG 的**两条互相独立**的二进制级证据：
-          #   ① 编译期标记 __attribute__((used)) static const char och_aliasdiag_marker[]
-          #      = "och-patch-alias-diag" —— 真字面量，必在 .rodata；
-          #      找不到 = 3k 根本没打进去（跟 ML_DBG 机制无关，是更硬的证据）。
-          if ! strings -a "$SO" | grep -qF 'och-patch-alias-diag'; then
-            echo "ERROR: 产物里找不到编译期标记 och-patch-alias-diag —— ALIASDIAG 没进二进制"
-            exit 1
-          fi
-          echo "STRING-CHECK: och-patch-alias-diag PRESENT (ALIASDIAG compile-time marker)"
-          #   ② [och-alias] 是 ML_DBG 格式串（与 'filter in_c' 同一机制）
-          if ! strings -a "$SO" | grep -qF '[och-alias]'; then
-            echo "ERROR: 产物里找不到 [och-alias] —— alias 取证代码不在二进制里"
-            exit 1
-          fi
-          echo "STRING-CHECK: [och-alias] PRESENT (ALIASDIAG really in .so)"
-          # ★★ CREATEDIAG 的**两条互相独立**的二进制级证据（同 ALIASDIAG 的两条）：
-          #   ① 编译期标记 __attribute__((used)) static const char och_creatediag_marker[]
-          #      = "och-patch-creatediag" —— 真字面量，必在 .rodata；
-          #      找不到 = 3l 根本没打进去（跟 ML_DBG 机制无关，是更硬的证据）。
-          if ! strings -a "$SO" | grep -qF 'och-patch-creatediag'; then
-            echo "ERROR: 产物里找不到编译期标记 och-patch-creatediag —— CREATEDIAG 没进二进制"
-            exit 1
-          fi
-          echo "STRING-CHECK: och-patch-creatediag PRESENT (CREATEDIAG compile-time marker)"
-          #   ② [och-create] 是 ML_DBG 格式串（与 '[och-alias]' 同一机制）
-          if ! strings -a "$SO" | grep -qF '[och-create]'; then
-            echo "ERROR: 产物里找不到 [och-create] —— create_tensor 取证代码不在二进制里"
-            exit 1
-          fi
-          echo "STRING-CHECK: [och-create] PRESENT (CREATEDIAG really in .so)"
           # ★ PERCHANNEL 的**两条互相独立**的二进制级证据（与 ALIASDIAG/CREATEDIAG 同构）：
           #   ① 编译期标记 __attribute__((used)) static const char
           #      och_perchannel_quant_marker[] = "och-patch-perchannel-quant"
@@ -955,16 +905,6 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: tensor_quantization_supported_per_axis PRESENT"
-          # ★★ 字节直查（**不是** strings）：探针含中文，GNU strings 默认 7-bit，
-          #   会在 UTF-8 字节处把串切断 ⇒ `strings | grep` 必然漏检（假绿）。
-          #   实测过：64933494 / 39146418954 上 `strings | grep '*** size 不一致'`
-          #   判 absent，而字节直查 FOUND @0x31521c。凡含非 ASCII 的探针一律走这里。
-          if ! python3 -c "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if '*** size 不一致'.encode('utf-8') in b else 1)" "$SO"; then
-            echo "ERROR: 字节直查找不到「*** size 不一致」标记 —— CREATEDIAG 的不一致标记没进二进制"
-            echo "       （注意：不能用 strings|grep 查这一条，7-bit 会漏检）"
-            exit 1
-          fi
-          echo "BYTE-CHECK: '*** size 不一致' PRESENT (byte-level; strings would MISS it)"
           # ★ 反向门：诊断开关的字符串一个都不该在
           if strings -a "$SO" | grep -qF '[och-wc]'; then
             echo "ERROR: 产物里出现 [och-wc] —— WCDIAG 诊断开关误开，这不是交付产物"

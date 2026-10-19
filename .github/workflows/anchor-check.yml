@@ -66,20 +66,71 @@ jobs:
         uses: actions/checkout@v4
 
       # ★ 只拉源码，不装编译工具链 —— 本 workflow 不构建。
-      #   拉取方式与 build-teflon.sh 第 3 步**逐字一致**（同一 tag、同一 URL），
-      #   否则核对的就不是构建真正用的那份源码。
-      - name: Clone clean Mesa source (same tag as build-teflon.sh)
+      #   **URL 与 tag 必须与 build-teflon.sh 第 3 步逐字一致** ——
+      #   一旦漂移，核对的就不是构建真正用的那份源码，整道门失效且**不会报错**
+      #   （静默失效比报错更坏）。
+      #
+      #   用 sparse-checkout 只检出补丁真正会碰的目录（cone 模式）；
+      #   目录清单的**覆盖度**由 tools/check-sparse-coverage.py 对着
+      #   check-patches-vs-source.py 的补丁目标表自动核对 ——
+      #   新增补丁而忘了加目录 ⇒ 那道门当场红，不会静默变 SKIP。
+      - name: Clone clean Mesa source (sparse; tag/URL byte-identical to build-teflon.sh)
         run: |
           set -eux
           mkdir -p "$RUNNER_TEMP/anchor"
           cd "$RUNNER_TEMP/anchor"
-          git clone --depth 1 --branch "$MESA_TAG" \
+          # ★★ URL / --branch 与 build-teflon.sh 第 3 步**逐字相同**（只多了稀疏参数）
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            --branch "$MESA_TAG" \
             https://gitlab.freedesktop.org/mesa/mesa.git mesa
-          test -f mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c
-          test -f mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
-          test -f mesa/src/gallium/frontends/teflon/tfl_device.c
-          test -f mesa/src/etnaviv/drm/etnaviv_gpu.c
-          echo "clean mesa at $MESA_TAG: $(git -C mesa rev-parse --short HEAD)"
+          cd mesa
+          git sparse-checkout init --cone
+          git sparse-checkout set \
+            src/gallium/drivers/etnaviv \
+            src/gallium/frontends/teflon \
+            src/etnaviv/drm
+          git checkout "$MESA_TAG"
+
+      # ★★★ 覆盖度硬门：稀疏检出必须覆盖**每一个**补丁要打的文件。
+      #   sparse-checkout 最危险的失败模式就是「该检的文件没检出 ⇒ 看起来 PASS」。
+      #   缺文件就以 **exit 2 INCOMPLETE** 退出，**绝不降级成通过**。
+      - name: Sparse coverage hard gate (exit 2 on any missing file)
+        run: |
+          set -eu
+          ROOT="$RUNNER_TEMP/anchor/mesa/src"
+          missing=0
+          for f in \
+            gallium/drivers/etnaviv/etnaviv_ml.c \
+            gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c \
+            gallium/frontends/teflon/tfl_device.c \
+            etnaviv/drm/etnaviv_gpu.c ; do
+            if [ -f "$ROOT/$f" ]; then
+              echo "  present: $f"
+            else
+              echo "  MISSING: $f"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo ""
+            echo "ERROR: 稀疏检出缺 $missing 个补丁目标文件 —— 锚点核对无法完成。"
+            echo "       **这不是通过**。要么把目录加进 sparse-checkout set，要么换 tag。"
+            exit 2
+          fi
+          echo "SPARSE-COVERAGE: OK（4/4 补丁目标文件在位）"
+
+      # sparse 覆盖度门**本仓侧**的静态版本：把 workflow 的 sparse 目录清单
+      # 与 check-patches-vs-source.py 的补丁目标表对撞。
+      #   新增一个补丁而忘了加目录 ⇒ 这里当场红，不会等到运行时静默变 SKIP。
+      - name: Static gate - sparse coverage vs patch target table
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-sparse-coverage.py
+
+      - name: Gate self-check - sparse coverage negative control
+        run: |
+          set -eux
+          python3 oes-teflon/tools/check-sparse-coverage.py --selftest
 
       # ★★ 通用真源码锚点门（`maximal` = 能同时开的最大限度组合）
       #   exit 2（INCOMPLETE / 有 SKIP）同样判红 —— SKIP 不等于通过。
