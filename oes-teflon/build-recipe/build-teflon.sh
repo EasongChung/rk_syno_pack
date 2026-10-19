@@ -106,6 +106,8 @@
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
 #   TEFLON_NNDUMP=1        【诊断】NN core 描述符**逐字节** dump（create_nn_config 收尾）。
 #   TEFLON_KPAT=1          【诊断】NN core kernel_pattern **运行期强制开关**
+#   TEFLON_FPARTIAL=1      【诊断】NN core **强制 PARTIAL cache 分支**（运行期 TEFLON_PARTIAL=1）
+#                         用途：验证「判别量 = FULL-cache + 大占用」这个新候选。
 #                         （TEFLON_KPAT=6|3 选择强制值；不设=原分档逻辑，行为不变）。
 #                         用于单变量对照：244 通道 1×1 conv 挂死是否由 pattern 0x6 引起。
 #                         ⚠️ 产物**改行为**，**不可交付**。
@@ -1132,6 +1134,40 @@ if [ "${TEFLON_KPAT:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3j/6] kernel_pattern 强制开关补丁：默认关闭（设 TEFLON_KPAT=1 启用）"
+fi
+
+# ── 3k. 【诊断】强制 NN core 走 PARTIAL cache 分支（运行期开关）──────────
+# 背景（真机实测 + oca 报告 31 第三轮复核）：
+#   挂死最小单元 = 单个 1×1 CONV_2D，244→244 通道；122/488/976/2048 同型都不挂。
+#   按 FULL/PARTIAL 判据（nn.c:1188，total = 0x800 + coef + image vs 512KB）分组：
+#     122 = 93,184  ⇒ FULL，占 18% ⇒ 不挂
+#     244 = 213,376 ⇒ FULL，占 41% ⇒ **挂**      ← 唯一「FULL 且占用大」
+#     488 = 540,928 ⇒ PARTIAL         ⇒ 不挂
+#   ⇒ 新头号候选：判别量 = **FULL-cache 路径 + 大占用**。
+# 本补丁加运行期开关：TEFLON_PARTIAL=1 ⇒ 强制走 PARTIAL 分支（只改描述符，数值不可信）。
+#   244 通道的 1×1 conv 若改走 PARTIAL 后**不再挂** ⇒ 该候选成立（根因确证）。
+#
+# ⚠️ 默认关闭；不设运行期变量时行为与原产物完全一致（可当基线）。
+#
+# 用法：TEFLON_FPARTIAL=1 ./build-teflon.sh
+if [ "${TEFLON_FPARTIAL:-0}" = "1" ]; then
+	echo "==> [3k/6] 打【诊断】强制 PARTIAL cache 分支开关"
+	PATCHER11="$SCRIPT_DIR/patch-etnaviv-force-partial.py"
+	MLFP="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER11" ]; then
+		echo "ERROR: 设了 TEFLON_FPARTIAL=1 却缺 $PATCHER11"
+		exit 1
+	fi
+	if [ ! -f "$MLFP" ]; then
+		echo "ERROR: 找不到 $MLFP"
+		exit 1
+	fi
+	python3 "$PATCHER11" "$MLFP" || {
+		echo "ERROR: 强制 PARTIAL 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3k/6] 强制 PARTIAL 分支补丁：默认关闭（设 TEFLON_FPARTIAL=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
