@@ -104,6 +104,10 @@
 #                         预期：不崩 + 接管数下降 + 第 ④ 级逐字节比对应通过。
 #
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
+#   TEFLON_NNDUMP=1        【诊断】NN core 描述符**逐字节** dump（create_nn_config 收尾）。
+#                         用途：定位「244 通道 1×1 conv 使 NPU 作业挂死」的坏字段
+#                         （真机实测：244→244 挂、122→122 不挂，见 reports/27、28）。
+#                         只打印、**不改行为**；产物带取证打印，**不可交付**。
 #                         补丁器：build-recipe/patch-etnaviv-perchannel-quant.py
 #                         ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
 #                         根因：etna_ml_operation_supported() 对 input/weight/bias/output
@@ -1046,6 +1050,44 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 		echo "==> [3n/6] R5GUARD：默认关闭（设 TEFLON_R5GUARD=1 启用）"
 	fi
 	echo "==> [3m/6] per-channel 量化门：默认关闭（设 TEFLON_PERCHANNEL=1 启用）"
+fi
+
+# ── 3i. 【诊断】NN core 描述符 dump（逐字节取证）──────────────────────
+# 背景（真机实测，见 verify/reports/27、28）：
+#   挂死最小单元已缩到**单个 1×1 CONV_2D（244→244 通道）**：
+#     段 #9 前 3 算子（RESHAPE,TRANSPOSE,CONV）→ 挂（520 ms/次，内核复位 4 次）
+#     段 #12 前 4 算子（…,CONV）              → 挂（512 ms/次）
+#     对照 段 #4 的 122→122 同型 1×1 conv      → 不挂（14 ms，零复位）
+#   驱动侧判挂死的依据是「前端 DMA 指针不再前进」⇒ NPU 连作业都没开始推进
+#   ⇒ 极可能是**下发给硬件的描述符本身不合法**。
+# 本补丁在 create_nn_config() 填完描述符后，把**整份描述符的原始字节**打出来；
+# 与不挂的 122 通道作业**逐字节 diff** 即可锁定是哪个字段越界/错位。
+#   struct etna_nn_params 是**位域**结构体 ⇒ 打原始字节（而非逐字段名）才不受改名影响，
+#   一次 dump 覆盖全部字段，之后离线解码，不必再改一次补丁、跑一次 CI。
+#
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+# ⚠️ 产物带取证打印，**不可交付**。
+#
+# 用法：TEFLON_NNDUMP=1 ./build-teflon.sh
+if [ "${TEFLON_NNDUMP:-0}" = "1" ]; then
+	echo "==> [3i/6] 打【诊断】NN core 描述符 dump"
+	PATCHER9="$SCRIPT_DIR/patch-etnaviv-nn-desc-dump.py"
+	MLNN="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER9" ]; then
+		echo "ERROR: 设了 TEFLON_NNDUMP=1 却缺 $PATCHER9"
+		exit 1
+	fi
+	if [ ! -f "$MLNN" ]; then
+		echo "ERROR: 找不到 $MLNN"
+		exit 1
+	fi
+	python3 "$PATCHER9" "$MLNN" || {
+		echo "ERROR: NN 描述符 dump 补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未打补丁的 .so，诊断结论无效）。"
+		exit 1
+	}
+else
+	echo "==> [3i/6] NN core 描述符 dump 补丁：默认关闭（设 TEFLON_NNDUMP=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
