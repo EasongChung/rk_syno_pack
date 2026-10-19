@@ -221,7 +221,7 @@ jobs:
 
       - name: Build libteflon.so (FIX_V7 + WCDIAG + NO_STRIP)
         run: |
-          set -eux
+          set -euxo pipefail
           chmod +x oes-teflon/build-recipe/build-teflon.sh
           echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \

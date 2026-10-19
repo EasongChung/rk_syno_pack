@@ -581,7 +581,7 @@ jobs:
 
       - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD + ROFIX + ALIASDIAG, UNSTRIPPED)
         run: |
-          set -eux
+          set -euxo pipefail
           chmod +x oes-teflon/build-recipe/build-teflon.sh
           echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
