@@ -65,22 +65,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ★ PadV2 填充值门需要 numpy + tflite（flatbuffers schema 读取器）。
-      #   实测：run 39207812478 的第 11 步就挂在这里 —— ubuntu-latest 的系统
-      #   python3 **没有 numpy**（ModuleNotFoundError: No module named 'numpy'）。
-      #   tflite 精确 pin 到本地验证过的 2.18.0（schema API 与更早版本不同：
+      # ★ 门工具的依赖清单。**每一次新增/改动门工具，都要在这里核一遍它的 import。**
+      #   实测两次同类失败：
+      #     · run 39207812478：PadV2 门挂 `ModuleNotFoundError: numpy`
+      #       （ubuntu-latest 的系统 python3 没有 numpy，本机有 ⇒ 本地全绿）
+      #     · run 39208774400：`run-embedded-gates.py` 挂 `ModuleNotFoundError: yaml`
+      #       —— 我诊断完 numpy 却没检查**自己刚写的**新工具还要 yaml，
+      #       **同一个坑踩了两次**。见 03_强制开发规范.md §2.4(b)。
+      #   `tflite` 精确 pin 到本地验证过的 2.18.0（schema API 与更早版本不同：
       #   老版本没有 `Operator.BuiltinCode()`，要经 `OperatorCodes()` 取）。
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install gate dependencies (numpy + tflite)
+      - name: Install gate dependencies (pyyaml + numpy + tflite)
         run: |
           set -eux
           python3 -m pip install --upgrade pip
-          python3 -m pip install "numpy<3" "tflite==2.18.0"
-          python3 -c "import numpy, tflite; print('numpy', numpy.__version__); print('tflite import ok')"
+          python3 -m pip install "pyyaml>=6" "numpy<3" "tflite==2.18.0"
+          python3 -c "import yaml, numpy, tflite; print('pyyaml', yaml.__version__); print('numpy', numpy.__version__); print('tflite import ok')"
 
       # ★ 只拉源码，不装编译工具链 —— 本 workflow 不构建。
       #   **URL 与 tag 必须与 build-teflon.sh 第 3 步逐字一致** ——
