@@ -28,6 +28,21 @@
   （它在槽为 NULL 时会 calloc 并**写入**，idx 越界时等于往野地址写，会掩盖 H1 现场）；
 - idx 越界时只打 `OOB`，不解引用 t。
 
+## 写端填充探针（`[och-wd]`，运行期 `TEFLON_WFILL=1`）
+
+只打印读端无法区分「NPU 没写」与「写了但 CPU 读到旧值」。探针在**提交前**
+把输出 BO 按 `tensor->offset/size` 整段填 `0xAA`，再交由正常的
+`context->flush()` 提交作业；提交后由 `[och-ro] head/sample` 看被改写范围：
+
+| 观察 | 结论 |
+|---|---|
+| 提交后仍全 `0xaa` | NPU **一个字节都没写进这个 BO** ⇒ 写地址侧（B2） |
+| 部分/全部被改写 | NPU 确实写了 ⇒ CPU 侧读到的不一致才是问题（B3） |
+
+⚠️ 探针会**破坏**输出内容 ⇒ 只在诊断产物上、且只在上机时按需打开。
+不设 `TEFLON_WFILL` 时该段代码整体跳过，行为与上游完全一致
+（这也是它不另开构建开关、直接随 RODIAG 产物的原因）。
+
 ## 用法
 
     python3 patch-etnaviv-readout-diag.py <etnaviv_ml.c 路径>
@@ -49,7 +64,7 @@ STRUCT = (('for (int i = 0; i < outputs_count; i++) {', 1), ('struct pipe_resour
 OLD_LOOP = '   for (int i = 0; i < outputs_count; i++) {\n      struct pipe_resource *res = etna_ml_get_resource(subgraph, output_idxs[i]);\n'
 NEW_LOOP = '   for (int i = 0; i < outputs_count; i++) {\n      /* och patch: read_outputs 越界取证 */\n      {\n         unsigned n_ten = util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *);\n         unsigned idx = output_idxs[i];\n         int in_range = (idx < n_ten);\n         /* 只读槽值，不调 etna_ml_get_tensor：它会在槽为 NULL 时 calloc 并写入，\n          * idx 越界时等于往野地址写，会掩盖现场。 */\n         struct etna_ml_tensor **slotp = in_range\n            ? util_dynarray_element(&subgraph->tensors, struct etna_ml_tensor *, idx)\n            : NULL;\n         struct etna_ml_tensor *t = slotp ? *slotp : NULL;\n         ML_DBG("[och-ro] i=%d idx=%u n_tensors=%u %s slot=%p res=%p tsize=%u toff=%u\\n",\n                i, idx, n_ten, in_range ? "IN " : "OOB", (void *)slotp,\n                (void *)(t ? t->resource : NULL), t ? t->size : 0u, t ? t->offset : 0u);\n      }\n      struct pipe_resource *res = etna_ml_get_resource(subgraph, output_idxs[i]);\n'
 OLD_MAP = '                                                     &src_transfer);\n         assert(src_map);\n'
-NEW_MAP = '                                                     &src_transfer);\n         assert(src_map);\n         /* och patch: read_outputs map 结果取证 */\n         ML_DBG("[och-ro]   map res=%p bsize=%u off_expected=%u -> src_map=%p\\n",\n                (void *)res, res ? pipe_buffer_size(res) : 0u,\n                etna_ml_get_size(subgraph, output_idxs[i]), (void *)src_map);\n         /* och patch: 头 16 字节 —— 判别「没写回(全 0x7f/0xff) / 别名到输入(输入图案) /\n          * 真的算出了 int8 值」。守卫 pipe_buffer_size(res) >= 16，避免本诊断自己越界读。 */\n         if (src_map && pipe_buffer_size(res) >= 16u) {\n            ML_DBG("[och-ro]   head=%02x %02x %02x %02x %02x %02x %02x %02x "\n                   "%02x %02x %02x %02x %02x %02x %02x %02x\\n",\n                   src_map[0], src_map[1], src_map[2], src_map[3],\n                   src_map[4], src_map[5], src_map[6], src_map[7],\n                   src_map[8], src_map[9], src_map[10], src_map[11],\n                   src_map[12], src_map[13], src_map[14], src_map[15]);\n         }\n'
+NEW_MAP = '                                                     &src_transfer);\n         assert(src_map);\n         /* och patch: read_outputs map 结果取证 */\n         ML_DBG("[och-ro]   map res=%p bsize=%u off_expected=%u -> src_map=%p\\n",\n                (void *)res, res ? pipe_buffer_size(res) : 0u,\n                etna_ml_get_size(subgraph, output_idxs[i]), (void *)src_map);\n         /* och patch: 头 16 字节 —— 判别「没写回(全 0x7f/0xff) / 别名到输入(输入图案) /\n          * 真的算出了 int8 值」。守卫 pipe_buffer_size(res) >= 16，避免本诊断自己越界读。 */\n         if (src_map && pipe_buffer_size(res) >= 16u) {\n            ML_DBG("[och-ro]   head=%02x %02x %02x %02x %02x %02x %02x %02x "\n                   "%02x %02x %02x %02x %02x %02x %02x %02x\\n",\n                   src_map[0], src_map[1], src_map[2], src_map[3],\n                   src_map[4], src_map[5], src_map[6], src_map[7],\n                   src_map[8], src_map[9], src_map[10], src_map[11],\n                   src_map[12], src_map[13], src_map[14], src_map[15]);\n         }\n         /* och patch: 空间采样 —— 配合 TEFLON_WFILL 判断「写了多少」（独立模式按 bsize 取样）*/\n         if (src_map && pipe_buffer_size(res) >= 64u) {\n            unsigned och_sz = pipe_buffer_size(res);\n            ML_DBG("[och-ro]   sample sz=%u @0=%02x @1/8=%02x @1/4=%02x"\n                   " @1/2=%02x @3/4=%02x @7/8=%02x @last=%02x\\n",\n                   och_sz, src_map[0], src_map[och_sz / 8u],\n                   src_map[och_sz / 4u], src_map[och_sz / 2u],\n                   src_map[och_sz * 3u / 4u], src_map[och_sz * 7u / 8u],\n                   src_map[och_sz - 1u]);\n         }\n'
 # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
 
@@ -112,7 +127,85 @@ NEW_MAP_ROFIX = ('                                                     &src_tran
                  '                   src_map[4], src_map[5], src_map[6], src_map[7],\n'
                  '                   src_map[8], src_map[9], src_map[10], src_map[11],\n'
                  '                   src_map[12], src_map[13], src_map[14], src_map[15]);\n'
+                 '         }\n'
+                 '         /* och patch: 空间采样 —— 配合 TEFLON_WFILL 判断「写了多少」*/\n'
+                 '         if (src_map && tensor->size >= 64u) {\n'
+                 '            unsigned och_sz = tensor->size;\n'
+                 '            ML_DBG("[och-ro]   sample sz=%u @0=%02x @1/8=%02x @1/4=%02x"\n'
+                 '                   " @1/2=%02x @3/4=%02x @7/8=%02x @last=%02x\\n",\n'
+                 '                   och_sz, src_map[0], src_map[och_sz / 8u],\n'
+                 '                   src_map[och_sz / 4u], src_map[och_sz / 2u],\n'
+                 '                   src_map[och_sz * 3u / 4u], src_map[och_sz * 7u / 8u],\n'
+                 '                   src_map[och_sz - 1u]);\n'
                  '         }\n')
+
+
+# ── 写端填充探针（B2 / B3 判决）──────────────────────────────────────────────
+#
+# 读端打印只能证明「读到的全 0」，无法区分：
+#   B2 写地址算错 ⇒ NPU 把结果写到了别处（甚至没写）
+#   B3 缓存陈旧   ⇒ NPU 写了，CPU 读的是旧映射
+# 在**提交前**把输出 BO 填成 0xAA，提交后看有没有被改写，就能一刀切开：
+#   仍全 0xaa ⇒ 没写（B2）    被改写 ⇒ 写了（B3 才可能成立）
+#
+# ★ 运行期门控（getenv TEFLON_WFILL），不新增构建开关：
+#   不设环境变量时这段代码整段跳过，产物行为与上游一致。
+# ★ 不调 etna_ml_get_tensor：它会在槽为 NULL 时 calloc 并写入，
+#   直接读槽值 + 先判越界，与 ROFIX/取证块同一纪律。
+WFILL_MARKER = 'och patch: 写端填充探针'
+
+WFILL_INC_OLD = '#include <stdio.h>\n'
+WFILL_INC_NEW = ('#include <stdio.h>\n'
+                 '#include <stdlib.h>   /* och patch: TEFLON_WFILL 需要 getenv */\n')
+
+WFILL_ANCHOR = '   if (operation_count > 0) {\n'
+
+WFILL_NEW = (
+    '   /* och patch: 写端填充探针（运行期 TEFLON_WFILL=1；不设则行为与上游一致）\n'
+    '    *\n'
+    '    * 目的：把「NPU 到底有没有写进输出 BO」变成可观测事实。\n'
+    '    *   提交前整段填 0xaa → 提交后看读端 head/sample 哪些位置被改写。\n'
+    '    *   全 0xaa ⇒ 一个字节都没写 ⇒ 写地址侧（B2）\n'
+    '    *   被改写  ⇒ NPU 真的写了   ⇒ 读端问题（B3）\n'
+    '    * ⚠️ 本探针破坏输出内容，只许在诊断产物上按需打开。 */\n'
+    '   {\n'
+    '      const char *och_wfill = getenv("TEFLON_WFILL");\n'
+    '      if (och_wfill && och_wfill[0] == \'1\') {\n'
+    '         unsigned och_n_ten = util_dynarray_num_elements(&subgraph->tensors,\n'
+    '                                                         struct etna_ml_tensor *);\n'
+    '         for (unsigned och_w = 0; och_w < outputs_count; och_w++) {\n'
+    '            /* 先判越界再取槽：越界时 util_dynarray_element 会算出野地址 */\n'
+    '            if (output_idxs[och_w] >= och_n_ten) {\n'
+    '               ML_DBG("[och-wd] idx %u >= n_tensors %u，跳过（拒绝 map 野槽）\\n",\n'
+    '                      output_idxs[och_w], och_n_ten);\n'
+    '               continue;\n'
+    '            }\n'
+    '            struct etna_ml_tensor **och_slotp = util_dynarray_element(\n'
+    '               &subgraph->tensors, struct etna_ml_tensor *, output_idxs[och_w]);\n'
+    '            struct etna_ml_tensor *och_t = och_slotp ? *och_slotp : NULL;\n'
+    '            if (!och_t || !och_t->resource || och_t->size == 0u)\n'
+    '               continue;\n'
+    '            struct pipe_transfer *och_tr = NULL;\n'
+    '            uint8_t *och_map = (uint8_t *) pipe_buffer_map_range(context, och_t->resource,\n'
+    '                                                                 och_t->offset, och_t->size,\n'
+    '                                                                 PIPE_MAP_WRITE, &och_tr);\n'
+    '            if (!och_map) {\n'
+    '               ML_DBG("[och-wd] idx=%u res=%p off=%u size=%u MAP_FAILED\\n",\n'
+    '                      output_idxs[och_w], (void *)och_t->resource,\n'
+    '                      och_t->offset, och_t->size);\n'
+    '               continue;\n'
+    '            }\n'
+    '            memset(och_map, 0xAA, och_t->size);\n'
+    '            ML_DBG("[och-wd] idx=%u res=%p va=%x off=%u size=%u bsize=%u fill=0xaa\\n",\n'
+    '                   output_idxs[och_w], (void *)och_t->resource,\n'
+    '                   (unsigned)etna_bo_gpu_va(etna_buffer_resource(och_t->resource)->bo),\n'
+    '                   och_t->offset, och_t->size, pipe_buffer_size(och_t->resource));\n'
+    '            pipe_buffer_unmap(context, och_tr);\n'
+    '         }\n'
+    '      }\n'
+    '   }\n'
+    + WFILL_ANCHOR)
+
 
 
 def _fn_body(src):
@@ -144,6 +237,9 @@ def main() -> int:
     if MARKER in src:
         sys.stderr.write("ERROR: " + args.path + " 已包含本补丁，拒绝重复应用。\n")
         return 1
+    if WFILL_MARKER in src:
+        sys.stderr.write("ERROR: " + args.path + " 已包含写端填充探针，拒绝重复应用。\n")
+        return 1
 
     on_rofix = ROFIX_MARKER in src
 
@@ -170,6 +266,9 @@ def main() -> int:
                  ("map 锚点", OLD_MAP, NEW_MAP))
         mode = "独立（源码未含 ROFIX）"
 
+    # 写端填充探针：两种模式都要（它是「提交前」的动作，与读端形态无关）
+    pairs = pairs + (("写端填充探针锚点", WFILL_ANCHOR, WFILL_NEW),)
+
     n_get_before = src.count("etna_ml_get_tensor(")
 
     for tag, old, new in pairs:
@@ -187,6 +286,13 @@ def main() -> int:
 
     for tag, old, new in pairs:
         src = src.replace(old, new, 1)
+
+    # 头文件：填充探针用 getenv，必须显式引入 stdlib.h（不赌传递包含）
+    if src.count(WFILL_INC_OLD) != 1:
+        sys.stderr.write("ERROR: `#include <stdio.h>` 应恰好 1 处，实际 "
+                         + str(src.count(WFILL_INC_OLD)) + " 处（无法安全插入 stdlib.h）\n")
+        return 1
+    src = src.replace(WFILL_INC_OLD, WFILL_INC_NEW, 1)
 
     # 反向自检。
     # ⚠️ 不能一律查「OLD 必须消失」：map 锚点是 NEW 的**相邻前缀**
@@ -220,10 +326,27 @@ def main() -> int:
         must = (MARKER, "[och-ro]", "util_dynarray_num_elements",
                 "in_range ?", "OOB")
 
+    # 写端填充探针的自检（与模式无关）
+    must = must + ("[och-wd]", WFILL_MARKER, 'getenv("TEFLON_WFILL")',
+                   "memset(och_map, 0xAA", "output_idxs[och_w] >= och_n_ten")
+
     for token in must:
         if token not in src:
             sys.stderr.write("ERROR: 自检失败，缺少: " + token + "\n")
             return 1
+
+    # 顺序门：填充必须发生在**提交之前**。若插到 flush 之后，探测到的永远是
+    # NPU 已经写过（或被跳过）的场面，B2/B3 就再也分不开 —— 而且不会报错。
+    body_after = _fn_body(src)
+    if body_after is None:
+        sys.stderr.write("ERROR: 打完后找不到 read_outputs 函数体（无法核对顺序）\n")
+        return 1
+    at_fill = body_after.find(WFILL_MARKER)
+    at_flush = body_after.find("context->flush(context, NULL, 0);")
+    if at_fill < 0 or at_flush < 0 or at_fill > at_flush:
+        sys.stderr.write("ERROR: 写端填充探针不在 context->flush() 之前 "
+                         "(fill=%d flush=%d) ⇒ 探针无效\n" % (at_fill, at_flush))
+        return 1
     # 不得引入 etna_ml_get_tensor 的新调用（它会在槽为 NULL 时 calloc 并写入，
     # idx 越界时等于往野地址写，会掩盖 H1 现场）。
     # ⚠️ 必须**先剥掉注释**再查：本文件的取证注释里恰好写了「不调 etna_ml_get_tensor」，
@@ -240,7 +363,9 @@ def main() -> int:
         f.write(src)
 
     print("  [och-ro] 已加 read_outputs 取证（" + mode + "）")
-    print("  [och-ro]   打印 idx / n_tensors / 槽 / res / tsize / toff / bsize / head")
+    print("  [och-ro]   打印 idx / n_tensors / 槽 / res / tsize / toff / bsize / head / sample")
+    print("  [och-wd] 已加写端填充探针（运行期 TEFLON_WFILL=1 才生效，默认不改行为）")
+    print("  [och-wd]   提交前输出 BO 填 0xaa，提交后看 head/sample 是否被改写 ⇒ 分 B2/B3")
     print("  [och-ro] 预期输出前缀 [och-ro]；需同时设 ETNA_MESA_DEBUG=ml_msgs 才会打印")
     if not on_rofix:
         print("  [och-ro] ⚠️⚠️ 本产物【不含 ROFIX】：read_outputs 的越界读重新存在。")

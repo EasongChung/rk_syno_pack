@@ -118,7 +118,10 @@ POSITIVE_DIAG = """
           for pat in 'och-patch-v7-phantom-clamp' \\
                      'och-patch-v7-phantom-gate' \\
                      '[och-ro]' \\
-                     '[och-ro]   head='; do
+                     '[och-ro]   head=' \\
+                     '[och-ro]   sample ' \\
+                     '[och-wd]' \\
+                     'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
             else
