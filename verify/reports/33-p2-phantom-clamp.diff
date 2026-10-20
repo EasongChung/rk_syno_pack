@@ -1,0 +1,60 @@
+--- a/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
++++ b/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+@@ -16,6 +16,29 @@
+    return etna_bo_map(etna_buffer_resource(resource)->bo);
+ }
+
++/* och patch: phantom-channel clamp (幻影通道尾���钳位)
++ *
++ * 背景：write_core_6 / write_core_sequential 用
++ *   out_channel = core * kernels_in_superblock + kernel
++ *               + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used
++ * 分配通道，而 kernels_per_core = DIV_ROUND_UP(output_channels, cores_used)
++ * (v7:193) 把通道总数向上取整到 cores_used 的倍数 ⇒ 末批必然多出
++ *   m = cores_used * DIV_ROUND_UP(output_channels, cores_used) - output_channels
++ * 个「幻影通道」(out_channel >= output_channels)，且这些幻影通道会被真实执行：
++ *   - v7:226 / v7:391  权重张量越界读
++ *   - v7:238 / v7:407  biases[out_channel] 越界读
++ *   - v7:251 / v7:426  输出偏移越界写（GPU DMA 写到输出张量之外）
++ * 钳位到 output_channels - 1 后，幻影 kernel 等价于「重算最后一个合法通道」，
++ * 输出幂等，数值语义不变，同时消除全部越界。
++ *
++ * 注：write_core_interleaved 的同一处已由 patch-etnaviv-outchannel-clamp.py
++ * (OCFIX) 覆盖，语义完全相同；此处**不重复**改它，避免两个补丁锚点冲突。
++ */
++static inline unsigned
++clamp_out_channel(unsigned out_channel, unsigned output_channels)
++{
++   if (output_channels > 0 && out_channel >= output_channels)
++      return output_channels - 1;
++
++   return out_channel;
++}
++
+ #define MAX_TILE_WIDTH 64
+
+ static unsigned
+@@ -223,6 +246,7 @@
+
+       for (unsigned kernel = 0; kernel < kernels_in_superblock; kernel++) {
+          unsigned out_channel = core * kernels_in_superblock + kernel + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used;
++         out_channel = clamp_out_channel(out_channel, output_channels);
+          weights_maps[kernel] = input + out_channel * operation->weight_width * operation->weight_height * input_channels;
+       }
+
+@@ -229,6 +253,7 @@
+       for (unsigned block = 0; block < DIV_ROUND_UP(input_channels, stride); block++) {
+          for (unsigned kernel = 0; kernel < kernels_in_superblock; kernel++) {
+             unsigned out_channel = core * kernels_in_superblock + kernel + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used;
++            out_channel = clamp_out_channel(out_channel, output_channels);
+
+             if (block == 0) {
+                wb_stream_write(&wb_stream, weights_maps[kernel][0]);
+@@ -387,6 +412,7 @@
+
+       for (unsigned kernel = 0; kernel < kernels_in_superblock; kernel++) {
+          unsigned out_channel = core * kernels_in_superblock + kernel + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used;
++         out_channel = clamp_out_channel(out_channel, output_channels);
+
+          uint8_t (*weights_map)[operation->weight_height] = (void*) input + out_channel * operation->weight_width * operation->weight_height;
+
