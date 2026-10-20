@@ -122,7 +122,13 @@ och_clamp_out_channel(unsigned out_channel, unsigned output_channels)
     * 没打进去，构建流程与产物都不对 —— 必须当场失败，而不是交付。 */
    __attribute__((used)) static const char och_phantom_clamp_marker[] =
       "och-patch-v7-phantom-clamp";
-   (void)och_phantom_clamp_marker;
+   /* ★ 不要在这里写 `(void)och_phantom_clamp_marker;` ——
+    *   本块插在**文件作用域**，语句在那里不是合法 C。
+    *   实测（CI run 39402555413 / 39402566168）：
+    *     etnaviv_ml_nn_v7.c:57:5: error: expected declaration specifiers …
+    *   `__attribute__((used))` 本身已足够让对象留在 .rodata，
+    *   不需要（也不能）再用一条 `(void)` 语句「保活」。
+    *   回归门：tools/selftest-phantom-clamp.py 正控制 4（gcc -fsyntax-only）。 */
 #endif
 """
 
