@@ -1,4 +1,4 @@
-name: build-teflon-fix-rofix-perchannel-kpat-phantomdiag
+name: build-teflon-fix-rofix-perchannel-kpat-diag
 
 # 【交付候选轮 / 数值未验证，NOT DELIVERABLE】四处修复 + per-channel 量化门（UNSTRIPPED）
 #
@@ -77,11 +77,11 @@ env:
   TEFLON_FIX_V7: '1'
   TEFLON_OCFIX: '1'
   TEFLON_FSGUARD: '1'
-  TEFLON_ROFIX: '1'
+  TEFLON_ROFIX: '0'
   TEFLON_PERCHANNEL: '1'
   TEFLON_NNDUMP: '1'
   TEFLON_KPAT: '1'
-  # ★ B 段：两条幻影通道路线 + read_outputs 取证（C2b 仪器）
+  # ★ B-diag：两条幻影补丁 + read_outputs 取证（ROFIX 必须为 0，见 build-teflon.sh:798）
   TEFLON_PHANTOM_CLAMP: '1'
   TEFLON_PHANTOM_GATE: '1'
   TEFLON_RODIAG: '1'
@@ -911,8 +911,6 @@ jobs:
                      '[och-ocfix] 原式保留未动' \
                      '[3h/6] 打【修复】filter 深度一致性守卫' \
                      '[och-fsguard] 已加 filter 深度一致性守卫' \
-                     '[3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查' \
-                     '[och-rofix] 已加 read_outputs 范围对齐' \
                      '[3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）' \
                      '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \
                      '[3g2/6] 打【修复】幻影通道 out_channel 钳位' \
@@ -978,11 +976,11 @@ jobs:
             fi
           done
 
-          # ★★ B 段正控制：本产物**必须**同时含这两条幻影补丁的编译期标记，
-          #   否则「开关设了但补丁没打上」会被构建成功掩盖（本仓踩过同类）。
+          # ★★ B 段正控制：两条幻影补丁的编译期标记 + RODIAG 取证打印**必须**都在。
           for pat in 'och-patch-v7-phantom-clamp' \
                      'och-patch-v7-phantom-gate' \
-                     '[och-ro]'; do
+                     '[och-ro]' \
+                     '[och-ro]   head='; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
             else
@@ -990,13 +988,15 @@ jobs:
               ok=0
             fi
           done
-          # ★ 反控制：FPARTIAL 必须缺席（B 段明确不带）
-          if strings -a "$SO" | grep -qF '[och-fp]'; then
-            echo "  ERROR: 产物里出现 [och-fp] —— FPARTIAL 误开，B 段不允许"
-            ok=0
-          else
-            echo "  OK(negative): [och-fp] absent"
-          fi
+          # ★ 反控制：FPARTIAL 必须缺席；ROFIX 的标记也必须缺席（本产物 ROFIX=0）
+          for pat in '[och-fp]' '[och-rofix]'; do
+            if strings -a "$SO" | grep -qF "$pat"; then
+              echo "  ERROR: 产物里出现 $pat —— 与 B-diag 的开关组合矛盾"
+              ok=0
+            else
+              echo "  OK(negative): $pat absent"
+            fi
+          done
 
           if [ "$ok" -ne 1 ]; then
             echo "  ---- 相关日志片段 ----"
@@ -1332,7 +1332,7 @@ jobs:
           echo "=== size ==="
           ls -l artifact/libteflon.so
 
-      - name: Upload artifact (B 段 — FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG)
+      - name: Upload artifact (B-diag — FIX_V7+OCFIX+FSGUARD+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX OFF)
         uses: actions/upload-artifact@v4
         with:
           name: libteflon-fix-rofix-perchannel-kpat-phantomdiag
