@@ -175,6 +175,56 @@ def build(base: str, mode: str) -> str:
         sub("上传步骤名", UPLOAD_BASE, UPLOAD_DIAG)
         sub("产物名", ARTIFACT, "          name: libteflon-fix-rofix-perchannel-kpat-phantomdiag\n")
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_DIAG + "\n" + ANCHOR_SUMMARY)
+    elif mode in ("clamp", "gate"):
+        # ★★ 为什么必须分开：两个补丁都改「接管/写通道」这条链。
+        #   GATE 对 out_c % 8 != 0 的卷积**直接 return false**（回退 CPU），
+        #   会把 CLAMP 的效果完全遮住 ⇒ 同一产物里放两个，C3 永远看不到 CLAMP。
+        #   run 39403704522 那个「两个都开」的产物只能用于 out_c % 8 == 0 的模型
+        #   （此时两者都是 no-op），不能用来做 C3/C4 判决。
+        is_clamp = (mode == "clamp")
+        sub("env: + %s（ROFIX 保持 1）" % ("CLAMP" if is_clamp else "GATE"),
+            ENV_ANCHOR,
+            ENV_ANCHOR +
+            "  # ★ B-%s：只带一条幻影路线（两条同产物会互相遮蔽，见 make-phantom-workflows.py）\n"
+            % mode +
+            ("  TEFLON_PHANTOM_CLAMP: '1'\n" if is_clamp else "  TEFLON_PHANTOM_GATE: '1'\n"))
+        if is_clamp:
+            sub("断言表 + CLAMP 应用证据", ASSERT_PERCHANNEL,
+                "                     '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \\\n"
+                "                     '[3g2/6] 打【修复】幻影通道 out_channel 钳位' \\\n"
+                "                     '[phantom-clamp] 已加幻影通道钳位'; do\n")
+        else:
+            sub("断言表 + GATE 应用证据", ASSERT_PERCHANNEL,
+                "                     '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \\\n"
+                "                     '[3h2/6] 打【修复】幻影通道形状门控' \\\n"
+                "                     '[och-pgate] 已加幻影通道形状门控'; do\n")
+        sub("上传步骤名", UPLOAD_BASE,
+            "      - name: Upload artifact (B-%s — FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT"
+            " + %s only)\n" % (mode, "PHANTOM_CLAMP" if is_clamp else "PHANTOM_GATE"))
+        sub("产物名", ARTIFACT,
+            "          name: libteflon-fix-rofix-perchannel-kpat-phantom%s\n" % mode)
+        pos = (
+            "          # ★★ 只带一条幻影路线：本产物必须**只有** %s 的标记，另一条必须缺席。\n"
+            "          if strings -a \"$SO\" | grep -qF '%s'; then\n"
+            "            echo \"  OK(positive): %s\"\n"
+            "          else\n"
+            "            echo \"  ERROR: 产物里缺少 %s —— 开关设了但补丁没进产物\"\n"
+            "            ok=0\n"
+            "          fi\n"
+            "          for pat in '%s' '[och-fp]' '[och-ro]'; do\n"
+            "            if strings -a \"$SO\" | grep -qF \"$pat\"; then\n"
+            "              echo \"  ERROR: 产物里出现 $pat —— 与本变体的开关组合矛盾\"\n"
+            "              ok=0\n"
+            "            else\n"
+            "              echo \"  OK(negative): $pat absent\"\n"
+            "            fi\n"
+            "          done\n"
+        ) % (("CLAMP" if is_clamp else "GATE"),
+             ("och-patch-v7-phantom-clamp" if is_clamp else "och-patch-v7-phantom-gate"),
+             ("och-patch-v7-phantom-clamp" if is_clamp else "och-patch-v7-phantom-gate"),
+             ("och-patch-v7-phantom-clamp" if is_clamp else "och-patch-v7-phantom-gate"),
+             ("och-patch-v7-phantom-gate" if is_clamp else "och-patch-v7-phantom-clamp"))
+        sub("正/反控制块", ANCHOR_SUMMARY, pos + "\n" + ANCHOR_SUMMARY)
     else:
         raise SystemExit("未知 mode: %s" % mode)
 
@@ -200,8 +250,9 @@ def main() -> int:
     for mode in modes:
         print("== 生成 %s ==" % mode)
         text = build(base, mode)
-        path = os.path.join(outdir, "build-teflon-fix-rofix-perchannel-kpat-%s.yml"
-                            % ("phantomfix" if mode == "fix" else "phantomdiag"))
+        suffix = {"fix": "phantomfix", "diag": "phantomdiag",
+                  "clamp": "phantomclamp", "gate": "phantomgate"}[mode]
+        path = os.path.join(outdir, "build-teflon-fix-rofix-perchannel-kpat-%s.yml" % suffix)
         os.makedirs(outdir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
