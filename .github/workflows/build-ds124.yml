@@ -117,11 +117,20 @@ jobs:
 
       - name: Verify CPU DVFS hook landed in uInitrd
         run: |
-          set -eu
-          BOOT=output/dsm/boot-root/boot
+          set -euo pipefail
+          # BOOT must be absolute: the unpack below runs inside a subshell that
+          # cd's into /tmp/rdcheck, where a relative path no longer resolves.
+          BOOT_DIR="output/dsm/boot-root/boot"
+          [ -d "$BOOT_DIR" ] || { echo "ERROR: boot dir missing: $BOOT_DIR"; exit 1; }
+          BOOT="$(cd "$BOOT_DIR" && pwd)"
           echo "== uInitrd must carry the CPU DVFS hook (1608 MHz cap + schedutil)"
+          test -f "$BOOT/uInitrd" || { echo "ERROR: uInitrd not found at $BOOT/uInitrd"; exit 1; }
           rm -rf /tmp/rdcheck && mkdir -p /tmp/rdcheck
-          ( cd /tmp/rdcheck && lzma -dc < "$BOOT/uInitrd" | cpio -idm --quiet )
+          if command -v lzma >/dev/null 2>&1; then
+            ( cd /tmp/rdcheck && lzma -dc < "$BOOT/uInitrd" | cpio -idm --quiet )
+          else
+            ( cd /tmp/rdcheck && xz --format=lzma -dc < "$BOOT/uInitrd" | cpio -idm --quiet )
+          fi
           test -f /tmp/rdcheck/linuxrc.syno.impl || { echo "ERROR: linuxrc.syno.impl missing from uInitrd"; exit 1; }
           test -f /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_dvfs.sh || { echo "ERROR: rk3566_cpufreq_dvfs.sh missing from uInitrd (cpufreq hook not installed)"; exit 1; }
           test -f /tmp/rdcheck/usr/syno/sbin/rk3566_cpufreq_rcd.sh || { echo "ERROR: rk3566_cpufreq_rcd.sh missing from uInitrd"; exit 1; }
