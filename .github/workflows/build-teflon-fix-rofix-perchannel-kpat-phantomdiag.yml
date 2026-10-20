@@ -1,4 +1,4 @@
-name: build-teflon-fix-rofix-perchannel-kpat-diag
+name: build-teflon-fix-rofix-perchannel-kpat-phantomdiag
 
 # 【交付候选轮 / 数值未验证，NOT DELIVERABLE】四处修复 + per-channel 量化门（UNSTRIPPED）
 #

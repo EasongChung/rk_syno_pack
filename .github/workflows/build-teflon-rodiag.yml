@@ -520,7 +520,7 @@ jobs:
                      '[och-ocfix] 原式保留未动' \
                      '[3h/6] 打【修复】filter 深度一致性守卫' \
                      '[och-fsguard] 已加 filter 深度一致性守卫' \
-                     '[3i/6] 打【诊断】read_outputs 越界取证' \
+                     '[3j-2] 打【诊断】read_outputs 越界取证' \
                      '[och-ro] 已加 read_outputs 取证'; do
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"

@@ -34,6 +34,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PATCH_PATH = os.path.join(ROOT, "build-recipe", "patch-etnaviv-readout-offset-fix.py")
+DIAG_PATH = os.path.join(ROOT, "build-recipe", "patch-etnaviv-readout-diag.py")
 GEN_PATH = os.path.join(HERE, "gen-rofix-patch.py")
 PAYLOAD = ("MARKER", "DIAG_MARKER", "STRUCT", "OLD", "NEW")
 ENTRY = "etna_ml_subgraph_read_outputs(struct pipe_context"
@@ -81,6 +82,39 @@ def main():
     print("  拷贝行:            %d" % line_of(src, COPY))
     print("  （stripped 产物无 DWARF：若真机再崩，偏移→行号的映射必须靠**同构建**"
           "的未 strip 副本重跑取，不能沿用 675a1091 的旧地址）")
+
+    # ── 先卸掉「叠加在 ROFIX 之上的取证层」──────────────────────────────
+    # 叠加式取证把 [och-ro] 打印插在 ROFIX 的 NEW 块**内部**，会把那一块切成
+    # 三段 ⇒ 不先卸掉，逆变换必然 n=0（2026-10-20 CI 实测：run 39460082705）。
+    # 顺序必须与打补丁相反：先填充块（最前），再循环块，最后 map 块。
+    print()
+    print("=== 0.5 卸掉叠加取证层（若有）===")
+    if os.path.isfile(DIAG_PATH):
+        DIAG = load(DIAG_PATH, "rodiag_patch_chk")
+        if getattr(DIAG, "WFILL_MARKER", None) and DIAG.WFILL_MARKER in src:
+            if src.count(DIAG.WFILL_NEW) != 1:
+                sys.stderr.write("ERROR: 填充探针块出现 %d 处（须恰好 1）\n" % src.count(DIAG.WFILL_NEW))
+                return 1
+            src = src.replace(DIAG.WFILL_NEW, DIAG.WFILL_ANCHOR, 1)
+            src = src.replace(DIAG.WFILL_INC_NEW, DIAG.WFILL_INC_OLD, 1)
+            print("  已卸掉写端填充探针（[och-wd]）")
+        if DIAG.MARKER in src or "och patch: read_outputs 越界取证" in src:
+            n_loop = src.count(DIAG.NEW_LOOP_ROFIX)
+            n_map = src.count(getattr(DIAG, "NEW_MAP_ROFIX", "\x00"))
+            if n_loop == 1:
+                src = src.replace(DIAG.NEW_LOOP_ROFIX, DIAG.ON_ROFIX_ANCHOR, 1)
+            if n_map == 1:
+                src = src.replace(DIAG.NEW_MAP_ROFIX, DIAG.OLD_MAP, 1)
+            print("  已卸掉读端取证（[och-ro]）：loop=%d map=%d" % (n_loop, n_map))
+            if n_loop != 1 or n_map != 1:
+                sys.stderr.write("ERROR: 取证层形态与常量不符（loop=%d map=%d），拒绝继续逆变换\n"
+                                 % (n_loop, n_map))
+                return 1
+            if DIAG.MARKER in src:
+                sys.stderr.write("ERROR: 卸掉取证层后仍残留标记，拒绝继续\n")
+                return 1
+    else:
+        print("  （没有 diag 补丁，跳过）")
 
     print()
     print("=== 1. 逆变换（ROFIX 替换倒回去）===")

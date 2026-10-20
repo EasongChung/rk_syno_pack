@@ -185,6 +185,9 @@ def build(base: str, mode: str) -> str:
             "  TEFLON_RODIAG: '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
+        sub("workflow 名（与产物名对齐，避免 run 列表里和旧 diag 混淆）",
+            "name: build-teflon-fix-rofix-perchannel-kpat-diag\n",
+            "name: build-teflon-fix-rofix-perchannel-kpat-phantomdiag\n")
         sub("上传步骤名", UPLOAD_BASE, UPLOAD_DIAG)
         sub("产物名", ARTIFACT, "          name: libteflon-fix-rofix-perchannel-kpat-phantomdiag\n")
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_DIAG + "\n" + ANCHOR_SUMMARY)
