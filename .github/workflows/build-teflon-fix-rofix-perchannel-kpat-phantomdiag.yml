@@ -1332,7 +1332,7 @@ jobs:
           echo "=== size ==="
           ls -l artifact/libteflon.so
 
-      - name: Upload artifact (B段: FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG)
+      - name: Upload artifact (B 段 — FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG)
         uses: actions/upload-artifact@v4
         with:
           name: libteflon-fix-rofix-perchannel-kpat-phantomdiag
