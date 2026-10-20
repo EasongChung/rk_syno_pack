@@ -77,11 +77,12 @@ env:
   TEFLON_FIX_V7: '1'
   TEFLON_OCFIX: '1'
   TEFLON_FSGUARD: '1'
-  TEFLON_ROFIX: '0'
+  TEFLON_ROFIX: '1'
   TEFLON_PERCHANNEL: '1'
   TEFLON_NNDUMP: '1'
   TEFLON_KPAT: '1'
-  # ★ B-diag：两条幻影补丁 + read_outputs 取证（ROFIX 必须为 0，见 build-teflon.sh:798）
+  # ★ B-diag：两条幻影补丁 + read_outputs 取证（★ ROFIX 必须为 1；取证叠加在 ROFIX 之上，
+  #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）
   TEFLON_PHANTOM_CLAMP: '1'
   TEFLON_PHANTOM_GATE: '1'
   TEFLON_RODIAG: '1'
@@ -831,7 +832,7 @@ jobs:
         run: |
           set -euxo pipefail
           chmod +x oes-teflon/build-recipe/build-teflon.sh
-          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"
+          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0} TEFLON_RODIAG=${TEFLON_RODIAG:-0}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-fix.log"
 
@@ -911,6 +912,8 @@ jobs:
                      '[och-ocfix] 原式保留未动' \
                      '[3h/6] 打【修复】filter 深度一致性守卫' \
                      '[och-fsguard] 已加 filter 深度一致性守卫' \
+                     '[3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查' \
+                     '[och-rofix] 已加 read_outputs 范围对齐' \
                      '[3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）' \
                      '[perchannel] 已放开 weight/bias 的 per-axis 量化接管' \
                      '[3g2/6] 打【修复】幻影通道 out_channel 钳位' \
@@ -988,8 +991,10 @@ jobs:
               ok=0
             fi
           done
-          # ★ 反控制：FPARTIAL 必须缺席；ROFIX 的标记也必须缺席（本产物 ROFIX=0）
-          for pat in '[och-fp]' '[och-rofix]'; do
+          # ★ 反控制：FPARTIAL 必须缺席。
+          #   ★ ROFIX 的标记则**必须存在**（2026-10-20 事故后：取证产物必须含 ROFIX，
+          #     否则 read_outputs 的越界读重新出现，真机会整机硬挂 —— 报告 38）。
+          for pat in '[och-fp]'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  ERROR: 产物里出现 $pat —— 与 B-diag 的开关组合矛盾"
               ok=0
@@ -997,6 +1002,10 @@ jobs:
               echo "  OK(negative): $pat absent"
             fi
           done
+          if ! strings -a "$SO" | grep -qF '[och-rofix]'; then
+            echo "  ERROR: 产物里缺少 [och-rofix] —— 取证产物必须含 ROFIX（报告 38）"
+            ok=0
+          fi
 
           if [ "$ok" -ne 1 ]; then
             echo "  ---- 相关日志片段 ----"
@@ -1010,7 +1019,6 @@ jobs:
       #   3h/3j 跑完、源码在盘上才能验证 —— 按补丁常量把 3j 的整块倒回去，
       #   再让生成器重抽锚点逐字节比对（同一时刻也留档构建后的入口行/拷贝行）。
       - name: Static check - ROFIX anchors vs real source (post-build)
-        if: env.TEFLON_ROFIX == '1'
         run: |
           set -eux
           python3 oes-teflon/tools/check-rofix-anchors.py \
@@ -1078,12 +1086,12 @@ jobs:
           #     DBG_ENABLED 读运行期变量 ⇒ 分支不会被优化掉 ⇒ 字符串留在 .rodata；
           #     同一机制已由 'filter in_c' 门在**既有 stripped 产物**上实证过）。
           #   找不到 = 3j 没生效 = 白跑一轮真机，必须当场失败。
-          # ★ 本变体 ROFIX=0（与 RODIAG 硬互斥）⇒ 这里必须**缺席**
-          if strings -a "$SO" | grep -qF '[och-rofix]'; then
-            echo "ERROR: 产物里出现 [och-rofix] —— 与 ROFIX=0 矛盾"
+          if ! strings -a "$SO" | grep -qF '[och-rofix]'; then
+            echo "ERROR: 产物里找不到 [och-rofix] —— ROFIX 修复代码不在二进制里"
+            echo "       说明 read_outputs 范围对齐没打进去：越界读照旧，真机仍会 SIGSEGV"
             exit 1
           fi
-          echo "STRING-CHECK: [och-rofix] absent (ROFIX off in this variant)"
+          echo "STRING-CHECK: [och-rofix] PRESENT (ROFIX really in .so)"
           # ★ PERCHANNEL 的**两条互相独立**的二进制级证据（与 ALIASDIAG/CREATEDIAG 同构）：
           #   ① 编译期标记 __attribute__((used)) static const char
           #      och_perchannel_quant_marker[] = "och-patch-perchannel-quant"
@@ -1334,7 +1342,7 @@ jobs:
           echo "=== size ==="
           ls -l artifact/libteflon.so
 
-      - name: Upload artifact (B-diag — FIX_V7+OCFIX+FSGUARD+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX OFF)
+      - name: Upload artifact (B-diag — FIX_V7+OCFIX+FSGUARD+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX ON + superimposed)
         uses: actions/upload-artifact@v4
         with:
           name: libteflon-fix-rofix-perchannel-kpat-phantomdiag

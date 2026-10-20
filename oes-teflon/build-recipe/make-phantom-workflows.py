@@ -4,15 +4,16 @@
 
 ## 为什么必须是两个产物（而不是一个）
 
-`build-teflon.sh` 里 **ROFIX 与 RODIAG 是硬互斥**（:798-799 直接 `exit 1`）：
-两者都改 `etna_ml_subgraph_read_outputs()` 的同一处循环体，锚点会互相打架。
+`build-teflon.sh` 现在保证 **RODIAG 必须配 ROFIX**，且顺序固定为「先 ROFIX、再取证叠加」
+（3j → 3j-2）。原因（2026-10-20 事故，报告 38）：**ROFIX=0 的取证产物**会把
+`read_outputs` 的越界读重新引入，在真机上**整机硬挂**（无 Oops、需断电重启）。
 
-于是 B 段拆成两个**同源**产物，各自的用途写死在名字里：
+于是 B 段仍是两个**同源**产物，但差别只在幻影补丁与取证：
 
 | 产物 | 开关 | 用途 |
 |---|---|---|
 | `...-kpat-phantomfix` | ROFIX=1，CLAMP=1，GATE=1 | C3 / C4 上机载体（能正常回写，不崩） |
-| `...-kpat-phantomdiag` | ROFIX=0，CLAMP=1，GATE=1，**RODIAG=1** | C2b 仪器：打印 tsize / bsize / head 16 B |
+| `...-kpat-phantomdiag` | **ROFIX=1**，CLAMP=1，GATE=1，**RODIAG=1** | 取证仪器：打印 tsize / bsize / head 16 B（**叠加在 ROFIX 之上**） |
 
 ## 用法
 
@@ -80,7 +81,7 @@ UPLOAD_FIX = (
 )
 UPLOAD_DIAG = (
     "      - name: Upload artifact (B-diag — FIX_V7+OCFIX+FSGUARD+PERCHANNEL+NNDUMP+KPAT"
-    " + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX OFF)\n"
+    " + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX ON + superimposed)\n"
 )
 UPLOAD_BASE = (
     "      - name: Upload artifact (FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL + NNDUMP + KPAT,"
@@ -125,8 +126,10 @@ POSITIVE_DIAG = """
               ok=0
             fi
           done
-          # ★ 反控制：FPARTIAL 必须缺席；ROFIX 的标记也必须缺席（本产物 ROFIX=0）
-          for pat in '[och-fp]' '[och-rofix]'; do
+          # ★ 反控制：FPARTIAL 必须缺席。
+          #   ★ ROFIX 的标记则**必须存在**（2026-10-20 事故后：取证产物必须含 ROFIX，
+          #     否则 read_outputs 的越界读重新出现，真机会整机硬挂 —— 报告 38）。
+          for pat in '[och-fp]'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  ERROR: 产物里出现 $pat —— 与 B-diag 的开关组合矛盾"
               ok=0
@@ -134,6 +137,10 @@ POSITIVE_DIAG = """
               echo "  OK(negative): $pat absent"
             fi
           done
+          if ! strings -a "$SO" | grep -qF '[och-rofix]'; then
+            echo "  ERROR: 产物里缺少 [och-rofix] —— 取证产物必须含 ROFIX（报告 38）"
+            ok=0
+          fi
 """
 
 
@@ -165,22 +172,14 @@ def build(base: str, mode: str) -> str:
         sub("产物名", ARTIFACT, "          name: libteflon-fix-rofix-perchannel-kpat-phantomfix\n")
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_FIX + "\n" + ANCHOR_SUMMARY)
     elif mode == "diag":
-        sub("env: ROFIX 关掉（与 RODIAG 互斥）", "  TEFLON_ROFIX: '1'\n", "  TEFLON_ROFIX: '0'\n")
         sub("env: + CLAMP/GATE/RODIAG",
             ENV_ANCHOR,
             ENV_ANCHOR +
-            "  # ★ B-diag：两条幻影补丁 + read_outputs 取证（ROFIX 必须为 0，见 build-teflon.sh:798）\n"
+            "  # ★ B-diag：两条幻影补丁 + read_outputs 取证（★ ROFIX 必须为 1；取证叠加在 ROFIX 之上，\n"
+            "  #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）\n"
             "  TEFLON_PHANTOM_CLAMP: '1'\n"
             "  TEFLON_PHANTOM_GATE: '1'\n"
             "  TEFLON_RODIAG: '1'\n")
-        sub("断言表：去掉 ROFIX 两条（本产物 ROFIX=0）", ASSERT_ROFIX, "")
-        # ★ 门 32「ROFIX anchors vs real source」直接检查**构建出来的** etnaviv_ml.c 里
-        #   ROFIX 锚点是否落地；本变体 ROFIX=0 ⇒ 该门必然红（run 39403716188 实测）。
-        #   用 if: 跳过，而不是删掉——保留原文便于对照。
-        sub("ROFIX 源码锚点门：按 env 条件跳过",
-            "      - name: Static check - ROFIX anchors vs real source (post-build)\n",
-            "      - name: Static check - ROFIX anchors vs real source (post-build)\n"
-            "        if: env.TEFLON_ROFIX == '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
         sub("上传步骤名", UPLOAD_BASE, UPLOAD_DIAG)
@@ -188,19 +187,6 @@ def build(base: str, mode: str) -> str:
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_DIAG + "\n" + ANCHOR_SUMMARY)
         # ★ Verify artifact 步（step 33）里还有两处与 ROFIX 强绑定的硬门，
         #   run 39406884649 实测：`ERROR: 产物里找不到 [och-rofix]`。
-        sub("Verify artifact：ROFIX 正门 → 反门",
-            "          if ! strings -a \"$SO\" | grep -qF '[och-rofix]'; then\n"
-            "            echo \"ERROR: 产物里找不到 [och-rofix] —— ROFIX 修复代码不在二进制里\"\n"
-            "            echo \"       说明 read_outputs 范围对齐没打进去：越界读照旧，真机仍会 SIGSEGV\"\n"
-            "            exit 1\n"
-            "          fi\n"
-            "          echo \"STRING-CHECK: [och-rofix] PRESENT (ROFIX really in .so)\"\n",
-            "          # ★ 本变体 ROFIX=0（与 RODIAG 硬互斥）⇒ 这里必须**缺席**\n"
-            "          if strings -a \"$SO\" | grep -qF '[och-rofix]'; then\n"
-            "            echo \"ERROR: 产物里出现 [och-rofix] —— 与 ROFIX=0 矛盾\"\n"
-            "            exit 1\n"
-            "          fi\n"
-            "          echo \"STRING-CHECK: [och-rofix] absent (ROFIX off in this variant)\"\n")
         sub("Verify artifact：RODIAG 反门 → 正门",
             "          if strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
             "            echo \"ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物\"\n"

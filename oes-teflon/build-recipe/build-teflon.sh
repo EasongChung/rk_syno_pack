@@ -81,7 +81,7 @@
 #                         改法：map 参数与 invoke(:908) 同构 (tensor->offset, tensor->size)
 #                         + idx 边界检查。不加 min() 截断（会把越界换成静默错误数值）。
 #                         目标文件 etnaviv_ml.c（3j 步，在 3i 之后）。
-#                         ⚠️ 与 TEFLON_RODIAG=1 互斥（都改这个循环体）。
+#                         ✅ 可与 TEFLON_RODIAG=1 叠加（自动先 ROFIX 后取证）。
 #                         ⚠️ 只针对崩溃；tensor->size 被批量改写的更深问题未处理。
 #                         锚点由 tools/gen-rofix-patch.py 从真实源码逐字生成。
 #   TEFLON_RODIAG=1       【诊断】read_outputs 越界取证：打印 idx / n_tensors / 槽 / res /
@@ -145,7 +145,8 @@
 #   典型修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1
 #   典型诊断构建：同上 + TEFLON_RODIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   本轮修复构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
-#   本轮诊断构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+#   本轮诊断构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 \
+#                 TEFLON_ROFIX=1 TEFLON_RODIAG=1   ← 取证必须配 ROFIX
 #                 TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1（上机另设 ETNA_MESA_DEBUG=ml_msgs）
 #   per-channel 构建：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
 #                 TEFLON_PERCHANNEL=1
@@ -748,25 +749,22 @@ fi
 #
 # 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_RODIAG=1
 if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
-	echo "==> [3i/6] 打【诊断】read_outputs 越界取证（该产物不可交付）"
+	if [ "${TEFLON_ROFIX:-0}" != "1" ]; then
+		echo "ERROR: TEFLON_RODIAG=1 必须同时设 TEFLON_ROFIX=1"
+		echo "       取证打印本身不改行为；但【不含 ROFIX 的取证产物】会把"
+		echo "       read_outputs 的越界读重新引入 —— 2026-10-20 该形态产物在真机上"
+		echo "       作业启动后几秒内整机硬挂、需断电重启（verify/reports/38）。"
+		echo "       正确形态：ROFIX 在前、取证叠加在后（本脚本自动排序）。"
+		exit 1
+	fi
 	PATCHER9="$SCRIPT_DIR/patch-etnaviv-readout-diag.py"
-	MLRD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
 	if [ ! -f "$PATCHER9" ]; then
 		echo "ERROR: 设了 TEFLON_RODIAG=1 却缺 $PATCHER9"
 		exit 1
 	fi
-	if [ ! -f "$MLRD" ]; then
-		echo "ERROR: 找不到 $MLRD"
-		exit 1
-	fi
-	python3 "$PATCHER9" "$MLRD" || {
-		echo "ERROR: read_outputs 取证补丁应用失败 —— 不要跳过校验"
-		echo "       （会静默产出无取证的 .so，白跑一轮真机验证）。"
-		echo "       请跑 tools/gen-rodiag-patch.py 从真实源码重新生成锚点。"
-		exit 1
-	}
+	echo "==> [3i/6] read_outputs 取证：已排队（叠加在 3j 的 ROFIX 之后执行）"
 else
-	echo "==> [3i/6] read_outputs 取证：默认关闭（设 TEFLON_RODIAG=1 启用）"
+	echo "==> [3i/6] read_outputs 取证：默认关闭（设 TEFLON_RODIAG=1，且必须同时 TEFLON_ROFIX=1）"
 fi
 
 # ── 3j. 【修复】read_outputs 映射范围与读取范围对齐 ───────────────────────
@@ -789,18 +787,14 @@ fi
 #   不加 min() 截断：前两处的教训是「改单点会把越界换成静默错误数值」。
 #   resource 真不够大时 map 返回 NULL → assert 明确失败（可观测）。
 #
-# ⚠️ 与 TEFLON_RODIAG=1 互斥（都改这个循环体）。
+# ✅ 可与 TEFLON_RODIAG=1 叠加：本脚本保证**先 ROFIX、再取证**。
+#    （2026-10-20 之前两者互斥，导致「ROFIX=0 的取证产物」被当成低危仪器；
+#     该形态在真机上整机硬挂 —— 见 verify/reports/38。）
 # ⚠️ 该修复只针对**崩溃**；tsize 被 etna_ml_tensor_offset 批量改写的更深问题未处理。
 # ⚠️ 默认关闭。
 #
 # 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
 if [ "${TEFLON_ROFIX:-0}" = "1" ]; then
-	if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
-		echo "ERROR: TEFLON_ROFIX 与 TEFLON_RODIAG 互斥"
-		echo "       （两者都改 etna_ml_subgraph_read_outputs 的循环体，锚点会冲突）"
-		echo "       交付构建请只开 TEFLON_ROFIX=1。"
-		exit 1
-	fi
 	echo "==> [3j/6] 打【修复】read_outputs 范围对齐 invoke + idx 边界检查"
 	PATCHER10="$SCRIPT_DIR/patch-etnaviv-readout-offset-fix.py"
 	MLRF="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
@@ -818,6 +812,16 @@ if [ "${TEFLON_ROFIX:-0}" = "1" ]; then
 		echo "       请跑 tools/gen-rofix-patch.py 从真实源码重新生成锚点。"
 		exit 1
 	}
+	# ── 3j-2. 【诊断】取证叠加（必须在 ROFIX 之后）────────────────────────
+	# 取证打印只读、不改行为；ROFIX 必须先落地，否则越界读重新出现。
+	if [ "${TEFLON_RODIAG:-0}" = "1" ]; then
+		echo "==> [3j-2] 打【诊断】read_outputs 越界取证（叠加在 ROFIX 之上）"
+		python3 "$PATCHER9" "$MLRF" || {
+			echo "ERROR: 取证补丁叠加失败 —— 不要跳过校验"
+			echo "       （会静默产出无取证的 .so，白跑一轮真机验证）。"
+			exit 1
+		}
+	fi
 else
 	echo "==> [3j/6] read_outputs 范围修复：默认关闭（设 TEFLON_ROFIX=1 启用）"
 fi

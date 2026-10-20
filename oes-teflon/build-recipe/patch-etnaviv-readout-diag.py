@@ -53,6 +53,68 @@ NEW_MAP = '                                                     &src_transfer);\
 # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
 
+# ── 叠加模式：补丁打在【已应用 ROFIX】的源码上 ─────────────────────────────
+#
+# 为什么必须有这个模式（2026-10-20 真机事故）：
+#   `phantomdiag` 产物是 ROFIX=0 建的。它把 read_outputs 的范围对齐**去掉了**，
+#   ⇒ map 用 (0, pipe_buffer_size)、读用 tsize，越界读重新出现。
+#   该产物被当成「低危诊断仪器」送上真机，作业启动后几秒内**整机硬挂**
+#   （kern.log 之后再无任何内核输出，需断电重启）。见 verify/reports/38。
+#
+#   取证打印本身不改行为；危险的是**丢掉 ROFIX**。所以正确形态是
+#   「ROFIX 在前 + 取证叠加在后」，两者不再互斥。
+#
+# ROFIX 之后循环体的形态（关键变量已存在，取证直接复用，不再自己查槽）：
+#
+#    for (int i = 0; i < outputs_count; i++) {
+#       /* och patch: read_outputs 范围对齐 invoke ... */
+#       unsigned n_ten = util_dynarray_num_elements(...);
+#       if (output_idxs[i] >= n_ten) { ...; continue; }
+#       struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, output_idxs[i]);
+#       struct pipe_resource *res = tensor->resource;      ← 取证块插在这两行之后
+#
+ROFIX_MARKER = 'och patch: read_outputs 范围对齐 invoke'
+
+# ROFIX 之后的函数体必须含这些点（与独立模式不同：res 已改由 tensor 提供）
+STRUCT_ROFIX = (('for (int i = 0; i < outputs_count; i++) {', 1),
+                ('struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, output_idxs[i]);', 1),
+                ('struct pipe_resource *res = tensor->resource;', 1),
+                ('src_map = (uint8_t *) pipe_buffer_map_range(context,', 1),
+                ('assert(src_map);', 1),
+                ('((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;', 1))
+
+_TAIL_ROFIX = '      struct pipe_resource *res = tensor->resource;\n'
+ON_ROFIX_ANCHOR = ('      struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, output_idxs[i]);\n'
+                   + _TAIL_ROFIX)
+
+NEW_LOOP_ROFIX = (ON_ROFIX_ANCHOR +
+                  '      /* och patch: read_outputs 越界取证（叠加在 ROFIX 之上；只读，不改行为）\n'
+                  '       *\n'
+                  '       * ★ 必须叠加在 ROFIX 之上：ROFIX 负责把 map 范围与读取范围对齐，\n'
+                  '       *   丢掉它就是把越界读重新引入（2026-10-20 整机硬挂，见报告 38）。\n'
+                  '       * 复用 ROFIX 已算好的 n_ten / tensor / res，不新增 etna_ml_get_tensor。 */\n'
+                  '      {\n'
+                  '         ML_DBG("[och-ro] i=%d idx=%u n_tensors=%u IN  res=%p tsize=%u toff=%u\\n",\n'
+                  '                i, output_idxs[i], n_ten, (void *)res,\n'
+                  '                tensor->size, tensor->offset);\n'
+                  '      }\n')
+
+NEW_MAP_ROFIX = ('                                                     &src_transfer);\n'
+                 '         assert(src_map);\n'
+                 '         /* och patch: read_outputs map 结果取证（ROFIX 之后：映射长度就是 tensor->size）*/\n'
+                 '         ML_DBG("[och-ro]   map res=%p bsize=%u off_expected=%u -> src_map=%p\\n",\n'
+                 '                (void *)res, res ? pipe_buffer_size(res) : 0u,\n'
+                 '                tensor->size, (void *)src_map);\n'
+                 '         if (src_map && tensor->size >= 16u) {\n'
+                 '            ML_DBG("[och-ro]   head=%02x %02x %02x %02x %02x %02x %02x %02x "\n'
+                 '                   "%02x %02x %02x %02x %02x %02x %02x %02x\\n",\n'
+                 '                   src_map[0], src_map[1], src_map[2], src_map[3],\n'
+                 '                   src_map[4], src_map[5], src_map[6], src_map[7],\n'
+                 '                   src_map[8], src_map[9], src_map[10], src_map[11],\n'
+                 '                   src_map[12], src_map[13], src_map[14], src_map[15]);\n'
+                 '         }\n')
+
+
 def _fn_body(src):
     at = src.find(TARGET_FN)
     if at < 0:
@@ -83,12 +145,14 @@ def main() -> int:
         sys.stderr.write("ERROR: " + args.path + " 已包含本补丁，拒绝重复应用。\n")
         return 1
 
+    on_rofix = ROFIX_MARKER in src
+
     body = _fn_body(src)
     if body is None:
         sys.stderr.write("ERROR: 源文件找不到函数 " + TARGET_FN + "（Mesa 结构可能已变）\n")
         return 1
 
-    for token, want in STRUCT:
+    for token, want in (STRUCT_ROFIX if on_rofix else STRUCT):
         got = body.count(token)
         if got != want:
             sys.stderr.write(
@@ -97,8 +161,18 @@ def main() -> int:
                 "       取证依赖这些点，请人工核对后重新生成补丁。\n")
             return 1
 
-    for tag, old, new in (("循环锚点", OLD_LOOP, NEW_LOOP),
-                          ("map 锚点", OLD_MAP, NEW_MAP)):
+    if on_rofix:
+        pairs = (("叠加锚点（ROFIX 之后）", ON_ROFIX_ANCHOR, NEW_LOOP_ROFIX),
+                 ("map 锚点", OLD_MAP, NEW_MAP_ROFIX))
+        mode = "叠加在 ROFIX 之上"
+    else:
+        pairs = (("循环锚点", OLD_LOOP, NEW_LOOP),
+                 ("map 锚点", OLD_MAP, NEW_MAP))
+        mode = "独立（源码未含 ROFIX）"
+
+    n_get_before = src.count("etna_ml_get_tensor(")
+
+    for tag, old, new in pairs:
         n = src.count(old)
         if n != 1:
             sys.stderr.write(
@@ -107,31 +181,46 @@ def main() -> int:
                   "（会静默产出无取证的 .so，白跑一轮真机验证）。\n"
                   "       请重跑 tools/gen-rodiag-patch.py 重新生成。\n")
             return 1
+        if new == old:
+            sys.stderr.write("ERROR: 生成的新代码与原文相同（替换未生效）\n")
+            return 1
 
-    if NEW_LOOP == OLD_LOOP or NEW_MAP == OLD_MAP:
-        sys.stderr.write("ERROR: 生成的新代码与原文相同（替换未生效）\n")
-        return 1
-
-    src = src.replace(OLD_LOOP, NEW_LOOP, 1)
-    src = src.replace(OLD_MAP, NEW_MAP, 1)
+    for tag, old, new in pairs:
+        src = src.replace(old, new, 1)
 
     # 反向自检。
-    # ⚠️ 不能一律查「OLD 必须消失」：OLD_MAP 是 NEW_MAP 的**相邻前缀**
+    # ⚠️ 不能一律查「OLD 必须消失」：map 锚点是 NEW 的**相邻前缀**
     #    （只追加型补丁），NEW ⊃ OLD 时正例会被全部误拒 —— 这个坑踩过。
-    #    正确口径：OLD_LOOP 两侧被 DIAG_LOOP 隔开 ⇒ 必须消失；
-    #              OLD_MAP 原样嵌在 NEW_MAP 里 ⇒ 必须**恰好保留 1 处**。
-    if src.count(OLD_LOOP) != 0:
-        sys.stderr.write("ERROR: 循环锚点仍在源文件中，替换未生效\n")
-        return 1
+    #    正确口径：map 锚点原样嵌在 NEW 里 ⇒ 必须**恰好保留 1 处**。
     if src.count(OLD_MAP) != 1:
-        sys.stderr.write("ERROR: map 锚点应恰好保留 1 处（它嵌在 NEW_MAP 里），"
+        sys.stderr.write("ERROR: map 锚点应恰好保留 1 处（它嵌在 NEW 里），"
                          "实际 " + str(src.count(OLD_MAP)) + " 处\n")
         return 1
-    if src.count(NEW_LOOP) != 1 or src.count(NEW_MAP) != 1:
-        sys.stderr.write("ERROR: 新代码出现次数异常\n")
-        return 1
-    for token in (MARKER, "[och-ro]", "util_dynarray_num_elements",
-                  "in_range ?", "OOB"):
+    for tag, old, new in pairs:
+        if src.count(new) != 1:
+            sys.stderr.write("ERROR: " + tag + " 新代码出现次数异常\n")
+            return 1
+
+    if on_rofix:
+        # 叠加模式：锚点两行必须原样保留 1 处；且**不得新增**任何
+        # etna_ml_get_tensor 调用（ROFIX 已经查过一次，取证只复用）。
+        if src.count(ON_ROFIX_ANCHOR) != 1:
+            sys.stderr.write("ERROR: 叠加锚点应恰好保留 1 处，实际 "
+                             + str(src.count(ON_ROFIX_ANCHOR)) + " 处\n")
+            return 1
+        if src.count("etna_ml_get_tensor(") != n_get_before:
+            sys.stderr.write("ERROR: 叠加模式新增了 etna_ml_get_tensor 调用 —— "
+                             "取证只许复用 ROFIX 已取到的 tensor\n")
+            return 1
+        must = (MARKER, "[och-ro]", "head=", "tensor->size", "n_ten")
+    else:
+        if src.count(OLD_LOOP) != 0:
+            sys.stderr.write("ERROR: 循环锚点仍在源文件中，替换未生效\n")
+            return 1
+        must = (MARKER, "[och-ro]", "util_dynarray_num_elements",
+                "in_range ?", "OOB")
+
+    for token in must:
         if token not in src:
             sys.stderr.write("ERROR: 自检失败，缺少: " + token + "\n")
             return 1
@@ -150,8 +239,13 @@ def main() -> int:
     with open(args.path, "w", encoding="utf-8") as f:
         f.write(src)
 
-    print("  [och-ro] 已加 read_outputs 取证：打印 idx / n_tensors / 槽 / res / tsize / bsize")
+    print("  [och-ro] 已加 read_outputs 取证（" + mode + "）")
+    print("  [och-ro]   打印 idx / n_tensors / 槽 / res / tsize / toff / bsize / head")
     print("  [och-ro] 预期输出前缀 [och-ro]；需同时设 ETNA_MESA_DEBUG=ml_msgs 才会打印")
+    if not on_rofix:
+        print("  [och-ro] ⚠️⚠️ 本产物【不含 ROFIX】：read_outputs 的越界读重新存在。")
+        print("  [och-ro]     2026-10-20 该形态上机后整机硬挂（报告 38）。")
+        print("  [och-ro]     build-teflon.sh 已强制要求 TEFLON_ROFIX=1 才能开 RODIAG。")
     return 0
 
 
