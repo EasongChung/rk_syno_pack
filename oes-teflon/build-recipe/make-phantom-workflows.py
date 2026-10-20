@@ -175,6 +175,33 @@ def build(base: str, mode: str) -> str:
         sub("上传步骤名", UPLOAD_BASE, UPLOAD_DIAG)
         sub("产物名", ARTIFACT, "          name: libteflon-fix-rofix-perchannel-kpat-phantomdiag\n")
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_DIAG + "\n" + ANCHOR_SUMMARY)
+        # ★ Verify artifact 步（step 33）里还有两处与 ROFIX 强绑定的硬门，
+        #   run 39406884649 实测：`ERROR: 产物里找不到 [och-rofix]`。
+        sub("Verify artifact：ROFIX 正门 → 反门",
+            "          if ! strings -a \"$SO\" | grep -qF '[och-rofix]'; then\n"
+            "            echo \"ERROR: 产物里找不到 [och-rofix] —— ROFIX 修复代码不在二进制里\"\n"
+            "            echo \"       说明 read_outputs 范围对齐没打进去：越界读照旧，真机仍会 SIGSEGV\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"STRING-CHECK: [och-rofix] PRESENT (ROFIX really in .so)\"\n",
+            "          # ★ 本变体 ROFIX=0（与 RODIAG 硬互斥）⇒ 这里必须**缺席**\n"
+            "          if strings -a \"$SO\" | grep -qF '[och-rofix]'; then\n"
+            "            echo \"ERROR: 产物里出现 [och-rofix] —— 与 ROFIX=0 矛盾\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"STRING-CHECK: [och-rofix] absent (ROFIX off in this variant)\"\n")
+        sub("Verify artifact：RODIAG 反门 → 正门",
+            "          if strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
+            "            echo \"ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"STRING-CHECK: [och-ro] absent (RODIAG switch really off)\"\n",
+            "          # ★ 本变体就是要 RODIAG ⇒ 必须存在，否则产物没有诊断价值\n"
+            "          if ! strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
+            "            echo \"ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)\"\n")
     elif mode in ("clamp", "gate"):
         # ★★ 为什么必须分开：两个补丁都改「接管/写通道」这条链。
         #   GATE 对 out_c % 8 != 0 的卷积**直接 return false**（回退 CPU），

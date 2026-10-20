@@ -1078,12 +1078,12 @@ jobs:
           #     DBG_ENABLED 读运行期变量 ⇒ 分支不会被优化掉 ⇒ 字符串留在 .rodata；
           #     同一机制已由 'filter in_c' 门在**既有 stripped 产物**上实证过）。
           #   找不到 = 3j 没生效 = 白跑一轮真机，必须当场失败。
-          if ! strings -a "$SO" | grep -qF '[och-rofix]'; then
-            echo "ERROR: 产物里找不到 [och-rofix] —— ROFIX 修复代码不在二进制里"
-            echo "       说明 read_outputs 范围对齐没打进去：越界读照旧，真机仍会 SIGSEGV"
+          # ★ 本变体 ROFIX=0（与 RODIAG 硬互斥）⇒ 这里必须**缺席**
+          if strings -a "$SO" | grep -qF '[och-rofix]'; then
+            echo "ERROR: 产物里出现 [och-rofix] —— 与 ROFIX=0 矛盾"
             exit 1
           fi
-          echo "STRING-CHECK: [och-rofix] PRESENT (ROFIX really in .so)"
+          echo "STRING-CHECK: [och-rofix] absent (ROFIX off in this variant)"
           # ★ PERCHANNEL 的**两条互相独立**的二进制级证据（与 ALIASDIAG/CREATEDIAG 同构）：
           #   ① 编译期标记 __attribute__((used)) static const char
           #      och_perchannel_quant_marker[] = "och-patch-perchannel-quant"
@@ -1108,11 +1108,12 @@ jobs:
           echo "STRING-CHECK: [och-wc] absent (diag switch really off)"
           # ★ 反向门：RODIAG（read_outputs 越界取证）的字符串也一个都不该在 ——
           #   它是本轮新增的第三个诊断开关，误开会让交付产物多出运行期打印与体积。
-          if strings -a "$SO" | grep -qF '[och-ro]'; then
-            echo "ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物"
+          # ★ 本变体就是要 RODIAG ⇒ 必须存在，否则产物没有诊断价值
+          if ! strings -a "$SO" | grep -qF '[och-ro]'; then
+            echo "ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去"
             exit 1
           fi
-          echo "STRING-CHECK: [och-ro] absent (RODIAG switch really off)"
+          echo "STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)"
           # ★ 反向门：本轮把 ALIASDIAG / CREATEDIAG 置 0，
           #   它们的字符串**一个都不该在**产物里（否则就是拿错产物）。
           for probe in '[och-alias]' '[och-create]'; do
