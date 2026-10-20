@@ -163,6 +163,13 @@ def build(base: str, mode: str) -> str:
             "  TEFLON_PHANTOM_GATE: '1'\n"
             "  TEFLON_RODIAG: '1'\n")
         sub("断言表：去掉 ROFIX 两条（本产物 ROFIX=0）", ASSERT_ROFIX, "")
+        # ★ 门 32「ROFIX anchors vs real source」直接检查**构建出来的** etnaviv_ml.c 里
+        #   ROFIX 锚点是否落地；本变体 ROFIX=0 ⇒ 该门必然红（run 39403716188 实测）。
+        #   用 if: 跳过，而不是删掉——保留原文便于对照。
+        sub("ROFIX 源码锚点门：按 env 条件跳过",
+            "      - name: Static check - ROFIX anchors vs real source (post-build)\n",
+            "      - name: Static check - ROFIX anchors vs real source (post-build)\n"
+            "        if: env.TEFLON_ROFIX == '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
         sub("上传步骤名", UPLOAD_BASE, UPLOAD_DIAG)

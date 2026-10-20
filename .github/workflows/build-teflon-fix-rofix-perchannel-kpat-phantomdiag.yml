@@ -1010,6 +1010,7 @@ jobs:
       #   3h/3j 跑完、源码在盘上才能验证 —— 按补丁常量把 3j 的整块倒回去，
       #   再让生成器重抽锚点逐字节比对（同一时刻也留档构建后的入口行/拷贝行）。
       - name: Static check - ROFIX anchors vs real source (post-build)
+        if: env.TEFLON_ROFIX == '1'
         run: |
           set -eux
           python3 oes-teflon/tools/check-rofix-anchors.py \
