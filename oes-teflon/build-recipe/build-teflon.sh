@@ -106,6 +106,8 @@
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
 #   TEFLON_NNDUMP=1        【诊断】NN core 描述符**逐字节** dump（create_nn_config 收尾）。
 #   TEFLON_KPAT=1          【诊断】NN core kernel_pattern **运行期强制开关**
+#   TEFLON_FPARTIAL=1      【诊断】NN core **强制 PARTIAL cache 分支**（运行期 TEFLON_PARTIAL=1）
+#                         用途：验证「判别量 = FULL-cache + 大占用」这个新候选。
 #                         （TEFLON_KPAT=6|3 选择强制值；不设=原分档逻辑，行为不变）。
 #                         用于单变量对照：244 通道 1×1 conv 挂死是否由 pattern 0x6 引起。
 #                         ⚠️ 产物**改行为**，**不可交付**。
@@ -569,6 +571,40 @@ else
 	echo "==> [3g/6] out_channel 钳位补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
 fi
 
+# ── 3g2. 【修复】幻影通道 out_channel 钳位（write_core_6 / write_core_sequential） ──
+# 【目的：消除 v7 三个写入器共有的幻影通道越界】
+#   kernels_per_core = DIV_ROUND_UP(output_channels, cores_used)（v7:193）把通道总数
+#   上取整到 cores_used 的倍数 ⇒ 末批多出 m 个幻影通道，被真实执行 ⇒
+#   v7:226/391 权重越界读、v7:238/407 偏置越界读、v7:251/426 输出偏移越界写（GPU）。
+#   钳位到 output_channels-1 ⇒ 幻影 kernel 变成「重算最后一个合法通道」，三处越界归零。
+# ⚠️ write_core_interleaved 的同一处已由 OCFIX（TEFLON_OCFIX）覆盖，本补丁**不动**它
+#    ⇒ 两个补丁可共存（锚点不同、函数不同）。
+# ⚠️ 与 OCFIX 的区别：OCFIX 只覆盖 interleaved；1×1 conv 走 write_core_6、
+#    depthwise 走 write_core_sequential ⇒ **这两条路径此前完全没有保护**。
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+#
+# 用法：TEFLON_PHANTOM_CLAMP=1 ./build-teflon.sh
+if [ "${TEFLON_PHANTOM_CLAMP:-0}" = "1" ]; then
+	echo "==> [3g2/6] 打【修复】幻影通道 out_channel 钳位（write_core_6 + write_core_sequential）"
+	PATCHER6C="$SCRIPT_DIR/patch-etnaviv-phantom-clamp.py"
+	ML7C="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER6C" ]; then
+		echo "ERROR: 设了 TEFLON_PHANTOM_CLAMP=1 却缺 $PATCHER6C"
+		exit 1
+	fi
+	if [ ! -f "$ML7C" ]; then
+		echo "ERROR: 找不到 $ML7C"
+		exit 1
+	fi
+	python3 "$PATCHER6C" "$ML7C" || {
+		echo "ERROR: 幻影通道钳位补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未修复**的 .so，越界会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3g2/6] 幻影通道 out_channel 钳位：默认关闭（设 TEFLON_PHANTOM_CLAMP=1 启用）"
+fi
+
 # ── 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
 # 上游 Mesa 缺陷（已静态证明，见 verify/reports/05 与 06）：
 #   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 用 operation->input_channels
@@ -649,6 +685,36 @@ if [ "${TEFLON_FSGUARD:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3h/6] filter 形状守卫：默认关闭（设 TEFLON_FSGUARD=1 启用）"
+fi
+
+# ── 3h2. 【修复】幻影通道形状门控（out_c %% 8 != 0 的卷积不接管） ─────────
+# 【目的：零挂死兜底】Mesa v7 按 ceil(C/8) 分配通道 ⇒ C 不是 8 的倍数时末批多出
+#   m = 8*ceil(C/8)-C 个「幻影通道」，被真实执行 ⇒ 权重/偏置/输出三处越界。
+#   真机实测 1×1 conv 在 C=244/284 挂死（C=244 只挂 GPU 可 recover，C=284 整机失联）。
+#   本门控把这类形状挡在 NPU 之外 ⇒ 该机制不可能再触发；代价是它们回落 CPU。
+# 【是兜底不是根治】要拿回加速 ⇒ 模型侧 pad-to-8（tools/pad-to-8.py）或长期移植 v8 分配。
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+#
+# 用法：TEFLON_PHANTOM_GATE=1 ./build-teflon.sh
+if [ "${TEFLON_PHANTOM_GATE:-0}" = "1" ]; then
+	echo "==> [3h2/6] 打【修复】幻影通道形状门控（out_c %% 8 != 0 ⇒ 回落 CPU）"
+	PATCHER7G="$SCRIPT_DIR/patch-etnaviv-phantom-gate.py"
+	MLPG="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER7G" ]; then
+		echo "ERROR: 设了 TEFLON_PHANTOM_GATE=1 却缺 $PATCHER7G"
+		exit 1
+	fi
+	if [ ! -f "$MLPG" ]; then
+		echo "ERROR: 找不到 $MLPG"
+		exit 1
+	fi
+	python3 "$PATCHER7G" "$MLPG" || {
+		echo "ERROR: 幻影通道门控补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未门控**的 .so，挂死会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h2/6] 幻影通道形状门控：默认关闭（设 TEFLON_PHANTOM_GATE=1 启用）"
 fi
 
 # ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────
@@ -1132,6 +1198,40 @@ if [ "${TEFLON_KPAT:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3j/6] kernel_pattern 强制开关补丁：默认关闭（设 TEFLON_KPAT=1 启用）"
+fi
+
+# ── 3k. 【诊断】强制 NN core 走 PARTIAL cache 分支（运行期开关）──────────
+# 背景（真机实测 + oca 报告 31 第三轮复核）：
+#   挂死最小单元 = 单个 1×1 CONV_2D，244→244 通道；122/488/976/2048 同型都不挂。
+#   按 FULL/PARTIAL 判据（nn.c:1188，total = 0x800 + coef + image vs 512KB）分组：
+#     122 = 93,184  ⇒ FULL，占 18% ⇒ 不挂
+#     244 = 213,376 ⇒ FULL，占 41% ⇒ **挂**      ← 唯一「FULL 且占用大」
+#     488 = 540,928 ⇒ PARTIAL         ⇒ 不挂
+#   ⇒ 新头号候选：判别量 = **FULL-cache 路径 + 大占用**。
+# 本补丁加运行期开关：TEFLON_PARTIAL=1 ⇒ 强制走 PARTIAL 分支（只改描述符，数值不可信）。
+#   244 通道的 1×1 conv 若改走 PARTIAL 后**不再挂** ⇒ 该候选成立（根因确证）。
+#
+# ⚠️ 默认关闭；不设运行期变量时行为与原产物完全一致（可当基线）。
+#
+# 用法：TEFLON_FPARTIAL=1 ./build-teflon.sh
+if [ "${TEFLON_FPARTIAL:-0}" = "1" ]; then
+	echo "==> [3k/6] 打【诊断】强制 PARTIAL cache 分支开关"
+	PATCHER11="$SCRIPT_DIR/patch-etnaviv-force-partial.py"
+	MLFP="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER11" ]; then
+		echo "ERROR: 设了 TEFLON_FPARTIAL=1 却缺 $PATCHER11"
+		exit 1
+	fi
+	if [ ! -f "$MLFP" ]; then
+		echo "ERROR: 找不到 $MLFP"
+		exit 1
+	fi
+	python3 "$PATCHER11" "$MLFP" || {
+		echo "ERROR: 强制 PARTIAL 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3k/6] 强制 PARTIAL 分支补丁：默认关闭（设 TEFLON_FPARTIAL=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #
