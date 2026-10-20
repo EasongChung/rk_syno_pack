@@ -36,6 +36,17 @@ def common_rules(suffix):
             "name: build-teflon-fix-rofix-perchannel-kpat\n",
             "name: build-teflon-fix-rofix-perchannel-kpat-%s\n" % suffix,
         ),
+        # ★ BUILD-INFO 台账：run 39407410761 / 39407423126 的产物里**没有**记录
+        #   PHANTOM_CLAMP / GATE / RODIAG（只靠编译期标记证明）。开关台账应随产物走，
+        #   否则「这个 .so 到底开了什么」只能靠人回忆。以后每轮必带。
+        (
+            "BUILD-INFO 台账补三个开关",
+            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"\n',
+            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}'
+            ' TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0}'
+            ' TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}'
+            ' TEFLON_RODIAG=${TEFLON_RODIAG:-0}"\n',
+        ),
     ]
 
 
