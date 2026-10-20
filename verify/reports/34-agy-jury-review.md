@@ -4,8 +4,8 @@ session: b91ba86c-f518-4ce7-9ee7-1493a23d3847
 retrieved: 2026-10-19
 retrieval_method: ag.ps1 read -> Python subprocess(stdout=bytes) -> utf-8（字节无损，避开 PowerShell 管道乱码）
 independence: AGY 独立推导，未与 OCA 结论对齐（OCA 提供 A-E 供其反驳）
-completeness: AGY 后端恢复后于第 5 次尝试产出**完整 Q1-Q10 + 自评**（见 §5，原始件 34b-agy-raw-full.md）；§1 为其首次尝试的 Q1-Q5 原文
-reviewer_note: 第1节=AGY 原文逐字；第2节=OCA 复核；第3节=AGY 英文推理残留；第4节=合并行动建议
+completeness: AGY 后端恢复后于第 5 次尝试产出**完整 Q1-Q10 + 自评**（见 §5，原始件 34b-agy-raw-full.md）；§1 为其首次尝试的 Q1-Q5 原文；§6 为 Muse（universal-agent-bridge）精简包答复
+reviewer_note: 第1节=AGY 原文逐字；第2节=OCA 复核；第3节=AGY 英文推理残留；第4节=合并行动建议；第5节=AGY 完整版 Q1-Q10；第5.1节=OCA 对第5节复核；第6节=Muse 答复+复核
 ---
 
 # 报告 34 — AGY（Antigravity）智囊团独立评审 + OCA 复核
@@ -413,3 +413,65 @@ AGY 给「`timeout -k 1s 3s` 看门狗 + 后台 `dmesg -w` 抓 `timedout_job` + 
 6. **④ 暂缓**：先修模型输出量化（AGY Q7 与 OCA 同判）。
 7. **判决点（若仍要跑）**：`C=250`（分离「全幻影核≥3」vs「rem==1」）与 `C=247`（分离「rem==1&m>0」vs「幻影核数」），
    均为 1×1、**不触发整机失联**；上机须用户在场 + 逐次许可。
+
+---
+
+## 6. Muse（universal-agent-bridge）评审 —— 精简包答复 + OCA 复核
+
+### 6.0 取证与合规记录
+
+| 项 | 实测值 |
+|---|---|
+| 通道 | `universal-agent-bridge`（`ws-transport.mjs`） |
+| Bridge 服务 | 本地 `ws://127.0.0.1:8765`，后台 `serve` 起于 8765 |
+| 目标平台 | `https://muse.ai/`（**由 transport 自动拉起默认浏览器打开**） |
+| 握手 | `connected_clients: 1`、`platforms:[muse]`、整体 `READY`、`logged_in: true`（`legacy-heuristic` 证据） |
+| 模型标签 | **`model: null` = 未知**（按 bridge 策略，**不得**据此声称使用了某个具体 Muse 模型） |
+| Context Packet | `verify/reports/34b-muse-mini-packet.md`（2,183 字符 ≈ 1.0K token，契约校验通过） |
+| 派发记录 | 完整包（6,833 字符 ≈ 1,952 token）**两次超时**（桥接内部硬编码 180s，`--timeout` 参数被忽略）；**精简包一次成功** |
+| 答复污染检查 | ✅ 无 `BEGIN_CONTEXT_PACKET` 回显、✅ 无导航栏噪声（`New chat/Share/Settings` 等） |
+
+⇒ **结论：Muse 通道可用；长包会超时 ⇒ 后续按 ≤2.5K 字符分片派发。**
+
+### 6.1 Muse 答复原文（逐字）
+
+```text
+1. No. Phantom OOB fires wherever m>0 (:226/:238 reads, :251 output offset) — including non-hanging 122, 196, 220, 252, 260. It is necessary background, not sufficient. The in-sample discriminator is rem==1 ∧ m>0. For 244 vs 252, candidate discriminating quantities: fully-phantom cores in the last superblock (4 vs 2), phantom fraction of last-superblock slots (4/8 vs 4/16), or d−rem (4 vs 3). Which one is causal: unknown.
+
+2. No — underdetermined. "Hang iff m>0 ∧ d−rem≥4" fits all 10 points equally well (244/284: d−rem=4, m=4; 248 excluded by m=0; 252: d−rem=3). These predicates diverge only at untested values of C.
+
+3. Ranked root causes:
+
+(1) Last-superblock launch degeneracy at rem==1. Cores holding zero valid channels are still launched with descriptors; a one-slot, all-phantom core may stall a hardware work/accumulation barrier. Offline test: replicate the :225 (core, kernel, superblock)→channel map for all C and check "some core's final superblock is entirely ≥C" — this also holds for 252 (cores 6–7), so that form alone is falsified; it survives only combined with rem==1 or the ≥4-fully-phantom-cores count.
+
+(2) GPU output-write OOB (:251) corrupting an adjacent buffer. Offline test: phantom write extent is m×2500 elements past the output buffer — identical (10,000 elements) for 244 and 252, predicting identical behaviour. So this mechanism can act only through allocation placement, i.e. luck, not through shape.
+```
+
+### 6.2 OCA 对 Muse 答复的复核（`【已核对】`）
+
+Muse 的三条结论**全部与我独立推导一致，且比我的版本更严格**：
+
+| Muse 结论 | OCA 复核 | 意义 |
+|---|---|---|
+| **「幻影 OOB 是必要背景条件，不是充分条件」**（122/196/220/252/260 同样触发 OOB 却不挂） | ✅ 一致 | ⇒ **OOB/页越界假说被降级为「背景条件」**，不能再当根因用 |
+| **「判据欠定」并给出第三个等价判据 `m>0 ∧ d−rem≥4`** | ✅ 我的判据族搜索已得 6 个 10/10 判据，Muse 独立给出第 7 个 | ⇒ ⇒ **7 个不同谓词同时 10/10 命中 ⇒ 经验律被证明「极不可识别」** ⇒ ⇒ **严禁把任何一个写进规范** |
+| **「OOB 写越界量对 244 与 252 完全相同（10,000 元素）⇒ 该机制只能靠分配落点『运气』起作用，不能靠形状」** | ✅ 与我纠正 AGY H2 的结论**完全一致** | ⇒ ⇒ **两位独立评审（AGY+OCA / Muse）殊途同归 ⇒ 「244 vs 252 的分歧在源码之外」这一判断可信度大幅提升** |
+| 根因排序：① 末批 `rem==1` 启动退化（全幻影 core 仍被下发描述符，可能卡死硬件 work/accumulation 屏障）② 输出写 OOB | ✅ 与 AGY 的 H1 同族 | ⇒ **三家独立收敛到「末批退化」这一族** |
+
+★ **Muse 带来的新增判别轴：末批槽位的「幻影占比」（244 = 4/8，252 = 4/16）** ⇒ 又多一个候选判据。
+
+### 6.3 ★ 关键推论（OCA 新算，已核对）：三条轴在现有 10 点上**互相耦合**，不可分辨
+
+对 `rem=1` 的点：末批共 8 槽（每 core 1 个），有效 = 8−m ⇒ **全幻影 core 数 = m**
+⇒ 「全幻影核 ≥3」在 `rem=1` 上 ⟺ 「m≥3」⇒ **与 `rem==1&m>0` 等价**。
+对 `rem=2` 的点：末批 16 槽，**全幻影 core 数 = ⌊m/2⌋ ≤ 3**（因 m ≤ 7 恒成立）⇒ **「≥4 全幻影核」在 rem≥2 时不可达**。
+⇒ ⇒ **「rem==1」「全幻影核数」「幻影占比」三条轴，在已测的 10 点上给出同一组预测 ⇒ 数据无法分辨它们。**
+⇒ ⇒ **唯一能把它们分开的点，仍然只有两个：**
+
+| 点 | 构造 | 分开什么 |
+|---|---|---|
+| **C=250** | `rem=2`、`m=6` ⇒ 末批 16 槽、全幻影核 **3** 个、幻影占比 6/16、d−rem=3 | 「rem==1」组判**不挂**；「全幻影核≥3 / 占比≥1/2」组判**挂** ⇒ **判决点** |
+| **C=247** | `rem=1`、`m=1` ⇒ 全幻影核 **1** 个、占比 1/8、d−rem=4 | 「rem==1&m>0」组判**挂**；「全幻影核≥3 / 占比≥1/2」组判**不挂** ⇒ **判决点**（OCH 清单里没有，建议补） |
+
+⇒ ⇒ **⇒ 一条铁律：本项目的经验律只能当「相关性提示」，不得当「判据」；任何要写进规范的判据，必须先在 C=250 / C=247 上拿到分歧。**
+
