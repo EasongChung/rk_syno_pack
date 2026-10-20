@@ -571,6 +571,40 @@ else
 	echo "==> [3g/6] out_channel 钳位补丁：默认关闭（设 TEFLON_OCFIX=1 启用）"
 fi
 
+# ── 3g2. 【修复】幻影通道 out_channel 钳位（write_core_6 / write_core_sequential） ──
+# 【目的：消除 v7 三个写入器共有的幻影通道越界】
+#   kernels_per_core = DIV_ROUND_UP(output_channels, cores_used)（v7:193）把通道总数
+#   上取整到 cores_used 的倍数 ⇒ 末批多出 m 个幻影通道，被真实执行 ⇒
+#   v7:226/391 权重越界读、v7:238/407 偏置越界读、v7:251/426 输出偏移越界写（GPU）。
+#   钳位到 output_channels-1 ⇒ 幻影 kernel 变成「重算最后一个合法通道」，三处越界归零。
+# ⚠️ write_core_interleaved 的同一处已由 OCFIX（TEFLON_OCFIX）覆盖，本补丁**不动**它
+#    ⇒ 两个补丁可共存（锚点不同、函数不同）。
+# ⚠️ 与 OCFIX 的区别：OCFIX 只覆盖 interleaved；1×1 conv 走 write_core_6、
+#    depthwise 走 write_core_sequential ⇒ **这两条路径此前完全没有保护**。
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+#
+# 用法：TEFLON_PHANTOM_CLAMP=1 ./build-teflon.sh
+if [ "${TEFLON_PHANTOM_CLAMP:-0}" = "1" ]; then
+	echo "==> [3g2/6] 打【修复】幻影通道 out_channel 钳位（write_core_6 + write_core_sequential）"
+	PATCHER6C="$SCRIPT_DIR/patch-etnaviv-phantom-clamp.py"
+	ML7C="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHER6C" ]; then
+		echo "ERROR: 设了 TEFLON_PHANTOM_CLAMP=1 却缺 $PATCHER6C"
+		exit 1
+	fi
+	if [ ! -f "$ML7C" ]; then
+		echo "ERROR: 找不到 $ML7C"
+		exit 1
+	fi
+	python3 "$PATCHER6C" "$ML7C" || {
+		echo "ERROR: 幻影通道钳位补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未修复**的 .so，越界会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3g2/6] 幻影通道 out_channel 钳位：默认关闭（设 TEFLON_PHANTOM_CLAMP=1 启用）"
+fi
+
 # ── 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
 # 上游 Mesa 缺陷（已静态证明，见 verify/reports/05 与 06）：
 #   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 用 operation->input_channels
@@ -651,6 +685,36 @@ if [ "${TEFLON_FSGUARD:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3h/6] filter 形状守卫：默认关闭（设 TEFLON_FSGUARD=1 启用）"
+fi
+
+# ── 3h2. 【修复】幻影通道形状门控（out_c %% 8 != 0 的卷积不接管） ─────────
+# 【目的：零挂死兜底】Mesa v7 按 ceil(C/8) 分配通道 ⇒ C 不是 8 的倍数时末批多出
+#   m = 8*ceil(C/8)-C 个「幻影通道」，被真实执行 ⇒ 权重/偏置/输出三处越界。
+#   真机实测 1×1 conv 在 C=244/284 挂死（C=244 只挂 GPU 可 recover，C=284 整机失联）。
+#   本门控把这类形状挡在 NPU 之外 ⇒ 该机制不可能再触发；代价是它们回落 CPU。
+# 【是兜底不是根治】要拿回加速 ⇒ 模型侧 pad-to-8（tools/pad-to-8.py）或长期移植 v8 分配。
+# ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+#
+# 用法：TEFLON_PHANTOM_GATE=1 ./build-teflon.sh
+if [ "${TEFLON_PHANTOM_GATE:-0}" = "1" ]; then
+	echo "==> [3h2/6] 打【修复】幻影通道形状门控（out_c %% 8 != 0 ⇒ 回落 CPU）"
+	PATCHER7G="$SCRIPT_DIR/patch-etnaviv-phantom-gate.py"
+	MLPG="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER7G" ]; then
+		echo "ERROR: 设了 TEFLON_PHANTOM_GATE=1 却缺 $PATCHER7G"
+		exit 1
+	fi
+	if [ ! -f "$MLPG" ]; then
+		echo "ERROR: 找不到 $MLPG"
+		exit 1
+	fi
+	python3 "$PATCHER7G" "$MLPG" || {
+		echo "ERROR: 幻影通道门控补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未门控**的 .so，挂死会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h2/6] 幻影通道形状门控：默认关闭（设 TEFLON_PHANTOM_GATE=1 启用）"
 fi
 
 # ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────
