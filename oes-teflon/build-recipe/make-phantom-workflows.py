@@ -129,6 +129,8 @@ POSITIVE_DIAG = """
                      'TEFLON_ODETRANS' \\
                      '[och-roundmode]' \\
                      'TEFLON_ROUNDMODE' \\
+                     '[och-pcdomain]' \\
+                     'TEFLON_PCDOMAIN' \\
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
@@ -200,7 +202,11 @@ def build(base: str, mode: str) -> str:
             "  TEFLON_STDINC_PATCH: '1'\n"
             "  # ★ 舍入模式探针：编进产物，运行期由 TEFLON_ROUNDMODE=0..3 覆盖，\n"
             "  #   不设 = 与上游逐字节一致。用于实测哪个值等价于 TFLite 的四舍五入。\n"
-            "  TEFLON_ROUNDMODE_PATCH: '1'\n")
+            "  TEFLON_ROUNDMODE_PATCH: '1'\n"
+            "  # ★ per-channel 权重折叠后的域修复（报告 46）：\n"
+            "  #   signed 分支多减 0x80 ⇒ 非对角权重 0→128 ⇒ 输出饱和到 255。\n"
+            "  #   运行期由 TEFLON_PCDOMAIN 门控，不设 = 与上游逐字节一致。\n"
+            "  TEFLON_PCDOMAIN_PATCH: '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
         sub("workflow 名（与产物名对齐，避免 run 列表里和旧 diag 混淆）",

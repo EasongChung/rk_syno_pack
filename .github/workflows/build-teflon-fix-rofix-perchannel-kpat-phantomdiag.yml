@@ -96,6 +96,10 @@ env:
   # ★ 舍入模式探针：编进产物，运行期由 TEFLON_ROUNDMODE=0..3 覆盖，
   #   不设 = 与上游逐字节一致。用于实测哪个值等价于 TFLite 的四舍五入。
   TEFLON_ROUNDMODE_PATCH: '1'
+  # ★ per-channel 权重折叠后的域修复（报告 46）：
+  #   signed 分支多减 0x80 ⇒ 非对角权重 0→128 ⇒ 输出饱和到 255。
+  #   运行期由 TEFLON_PCDOMAIN 门控，不设 = 与上游逐字节一致。
+  TEFLON_PCDOMAIN_PATCH: '1'
   TEFLON_ALIASDIAG: '0'
   TEFLON_CREATEDIAG: '0'
   TEFLON_DIAG: '0'
@@ -1004,6 +1008,8 @@ jobs:
                      'TEFLON_ODETRANS' \
                      '[och-roundmode]' \
                      'TEFLON_ROUNDMODE' \
+                     '[och-pcdomain]' \
+                     'TEFLON_PCDOMAIN' \
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
