@@ -123,6 +123,8 @@ POSITIVE_DIAG = """
                      '[och-wd]' \\
                      '[och-td]' \\
                      '[och-coef]' \\
+                     '[och-wdom]' \\
+                     'TEFLON_WDOMAIN' \\
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
@@ -184,7 +186,10 @@ def build(base: str, mode: str) -> str:
             "  #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）\n"
             "  TEFLON_PHANTOM_CLAMP: '1'\n"
             "  TEFLON_PHANTOM_GATE: '1'\n"
-            "  TEFLON_RODIAG: '1'\n")
+            "  TEFLON_RODIAG: '1'\n"
+            "  # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，\n"
+            "  #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。\n"
+            "  TEFLON_WDOM_PATCH: '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
         sub("workflow 名（与产物名对齐，避免 run 列表里和旧 diag 混淆）",

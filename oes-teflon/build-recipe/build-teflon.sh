@@ -1238,6 +1238,46 @@ else
 	echo "==> [3k/6] 强制 PARTIAL 分支补丁：默认关闭（设 TEFLON_FPARTIAL=1 启用）"
 fi
 
+# ── 3k2. 【修复】per-tensor 权重 int8→uint8 域（+128，运行期门控）──────────────
+# 背景（报告 39 + [och-coef] 真机实测）：
+#   etna_tensor_zero_point() 的注释写明「signed 张量上传时 +128，
+#   **Tensor zero point and weight coefficients have to be adapted**」，
+#   但实现只做了两处：输入（etna_ml_subgraph_invoke 的 src[k]+128）与 zero point。
+#   **per-tensor 的权重走裸 memcpy，漏了 +128**；
+#   per-channel 路径由 requantize_weights() 的 `+ wzp - 0x80` 正确转换。
+#
+#   实测（C=248，1×1 conv，权重=单位阵）：系数 BO 里是 0x01/0x00（int8 原始值），
+#   描述符 coef_zero_point=128 ⇒ 硬件按 字节-128 解释 ⇒ 每个权重变成 -128/-127
+#   ⇒ 累加巨额负数 ⇒ ReLU 全钳零。**这正是「改权重为全 1、改偏置为 +20000，
+#   NPU 输出逐字节不变」的原因**（三次 hash 都是 0xbb9e90a3c13f4a03）。
+#
+#   本补丁只在 `is_signed && scales == NULL`（per-tensor + int8）时逐字节 +128，
+#   并由环境变量在**运行期**门控，便于同产物 A/B：
+#     构建：TEFLON_WDOM_PATCH=1  → 把补丁编进 .so
+#     运行：TEFLON_WDOMAIN=1     → 激活转换（不设 = 与上游逐字节一致）
+#
+# ⚠️ 默认关闭。产物改行为，取证性质，不可直接交付。
+if [ "${TEFLON_WDOM_PATCH:-0}" = "1" ]; then
+	echo "==> [3k2/6] 打【修复】per-tensor 权重 int8→uint8 域（+128）"
+	PATCHER_WDOM="$SCRIPT_DIR/patch-etnaviv-weight-domain.py"
+	MLWDOM="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER_WDOM" ]; then
+		echo "ERROR: 设了 TEFLON_WDOM_PATCH=1 却缺 $PATCHER_WDOM"
+		exit 1
+	fi
+	if [ ! -f "$MLWDOM" ]; then
+		echo "ERROR: 找不到 $MLWDOM"
+		exit 1
+	fi
+	python3 "$PATCHER_WDOM" "$MLWDOM" || {
+		echo "ERROR: 权重域补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未打补丁的 .so，结论无效）。"
+		exit 1
+	}
+else
+	echo "==> [3k2/6] 权重域补丁：默认关闭（设 TEFLON_WDOM_PATCH=1 启用）"
+fi
+
 # ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #

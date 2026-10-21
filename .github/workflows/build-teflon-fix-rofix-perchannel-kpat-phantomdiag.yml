@@ -86,6 +86,9 @@ env:
   TEFLON_PHANTOM_CLAMP: '1'
   TEFLON_PHANTOM_GATE: '1'
   TEFLON_RODIAG: '1'
+  # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
+  #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。
+  TEFLON_WDOM_PATCH: '1'
   TEFLON_ALIASDIAG: '0'
   TEFLON_CREATEDIAG: '0'
   TEFLON_DIAG: '0'
@@ -988,6 +991,8 @@ jobs:
                      '[och-wd]' \
                      '[och-td]' \
                      '[och-coef]' \
+                     '[och-wdom]' \
+                     'TEFLON_WDOMAIN' \
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
