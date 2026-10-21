@@ -183,6 +183,57 @@ def _dangling_requantized(text):
     return "requantized" in seg
 
 
+def _compile_inserted(text):
+    """把**本补丁插入的那段代码**抽出来，用宿主 gcc 真编译一次。
+
+    动机：run 39566597876 的失败是**编译期**才发现的（删了声明却留着引用），
+    而那时的自测只验「补丁能落地」。这里补上「落地的代码能编译」这一层。
+
+    抽出的片段只用到 dequantized / operation->weight_scale /
+    operation->weight_zero_point / map_out / getenv / CLAMP ⇒ 可用最小 stub 编译。
+    返回 (ok, 编译器输出)。
+    """
+    m = re.search(r'int32_t och_requant.*?#endif\n', text, re.S)
+    if not m:
+        return False, "抽不出插入的代码片段"
+    frag = m.group(0)
+    harness = """
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
+#define CLAMP(X, MIN, MAX) ((X) > (MIN) ? ((X) > (MAX) ? (MAX) : (X)) : (MIN))
+struct op_stub { float weight_scale; int weight_zero_point; };
+static void probe(struct op_stub *operation, uint8_t (*map_out)[4][1][1], double dequantized) {
+   for (unsigned oc = 0; oc < 1; oc++)
+   for (unsigned ic = 0; ic < 1; ic++)
+   for (unsigned w = 0; w < 1; w++)
+   for (unsigned h = 0; h < 1; h++) {
+%s
+   }
+}
+static uint8_t out[1][4][1][1];
+int main(void) {
+   struct op_stub o = { 0.002026f, 0 };
+   probe(&o, out, 0.5);
+   return out[0][0][0][0];
+}
+""" % frag
+    with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as f:
+        f.write(harness)
+        path = f.name
+    try:
+        cc = os.environ.get("CC", "cc")
+        r = subprocess.run([cc, "-std=c99", "-Wall", "-Wextra", "-Werror",
+                            "-fsyntax-only", path],
+                           capture_output=True, text=True)
+        return (r.returncode == 0), (r.stdout + r.stderr)
+    except FileNotFoundError:
+        return True, "（无 C 编译器，跳过）"
+    finally:
+        os.unlink(path)
+
+
 def selftest(mesa_src):
     ok = True
     real_nn = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn.c")
@@ -226,6 +277,9 @@ def selftest(mesa_src):
         #   删了 requantized 的声明却留下引用它的那一行 ⇒ 编译期才炸。
         #   这里在**打完的文本**里查：函数体内除 och_requant 外不得再有裸 requantized。
         dangling = _dangling_requantized(out)
+        _compile_ok, _compile_msg = _compile_inserted(out)
+        if not _compile_ok:
+            print('        编译输出: %s' % _compile_msg.strip()[:300])
 
         for cond, desc in [
             (MARKER in out, "标记已写入"),
@@ -236,6 +290,7 @@ def selftest(mesa_src):
             ("- 0x80" in out, "未设门控时保留上游原样（int8 域）"),
             ("[och-pcdomain]" in out, "C 代码自带产物可查的标记"),
             (not dangling, "打完的 requantize_weights 里没有裸 requantized 引用（悬空引用守卫）"),
+            (_compile_ok, "插入的代码片段能真的编译过（宿主 gcc -fsyntax-only）"),
         ]:
             print("  [%s] 正控制：%s" % ("ok" if cond else "BAD", desc))
             ok = ok and cond
