@@ -122,6 +122,7 @@ POSITIVE_DIAG = """
                      '[och-ro]   sample ' \\
                      '[och-wd]' \\
                      '[och-td]' \\
+                     '[och-coef]' \\
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"

@@ -79,6 +79,46 @@ NEW = """   map->per_channel_post_mul = 0x0;
       for (unsigned och_i = 0; och_i < sizeof(*map); och_i++)
          fprintf(stderr, "%02x", raw[och_i]);
       fprintf(stderr, "\\n");
+
+      /* och patch: 系数 BO 取证（运行期门控，默认整段跳过）
+       *
+       * 为什么需要：描述符里的 kernel_address / in_image_address / out_image_address
+       * 已被离线解码证实正确（tools/decode-nn-desc.py），但把权重从「单位阵」
+       * 换成「全 1」、把偏置从 -63 换成 +20000，NPU 输出**逐字节不变**。
+       * 这只能意味着硬件读到的系数与偏置等价于全 0。
+       * 因此必须直接看这块 BO：它若全 0 ⇒ 打包/写入未落到这块 BO；
+       * 它若非 0 ⇒ 数据在内存里，问题在硬件侧（缓存搬运/寻址）。
+       */
+      if (getenv("TEFLON_WFILL") != NULL) {
+         const unsigned char *och_cb = (const unsigned char *)etna_bo_map(coefficients);
+         unsigned och_csz = etna_bo_size(coefficients);
+         if (och_cb != NULL) {
+            unsigned och_nz = 0;
+            unsigned och_lim = och_csz < 4096u ? och_csz : 4096u;
+            for (unsigned och_i = 0; och_i < och_csz; och_i++)
+               och_nz += och_cb[och_i] ? 1u : 0u;
+            fprintf(stderr,
+                    "[och-coef] va=%x bo_size=%u cache=%u nonzero=%u head=%02x %02x %02x %02x %02x %02x %02x %02x\\n",
+                    (unsigned)etna_bo_gpu_va(coefficients), och_csz, coef_cache_size, och_nz,
+                    och_cb[0], och_cb[1], och_cb[2], och_cb[3],
+                    och_cb[4], och_cb[5], och_cb[6], och_cb[7]);
+         } else {
+            fprintf(stderr, "[och-coef] va=%x bo_size=%u cache=%u MAP_FAILED\\n",
+                    (unsigned)etna_bo_gpu_va(coefficients), och_csz, coef_cache_size);
+         }
+
+         const unsigned char *och_w = (const unsigned char *)operation->weight_tensor;
+         unsigned och_wn = 0;
+         unsigned och_wsz = operation->weight_tensor_size;
+         if (och_w != NULL) {
+            for (unsigned och_i = 0; och_i < och_wsz; och_i++)
+               och_wn += och_w[och_i] ? 1u : 0u;
+            fprintf(stderr,
+                    "[och-coef] wscale=%g wzp=%u wt_size=%u wt_nonzero=%u wt_head=%02x %02x %02x %02x\\n",
+                    operation->weight_scale, operation->weight_zero_point, och_wsz, och_wn,
+                    och_w[0], och_w[1], och_w[2], och_w[3]);
+         }
+      }
    }
 
    etna_bo_cpu_fini(bo);
