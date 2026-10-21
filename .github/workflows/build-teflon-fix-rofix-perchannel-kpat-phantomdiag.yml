@@ -1171,11 +1171,19 @@ jobs:
           echo "STRING-CHECK: och-patch-perchannel-quant PRESENT (PERCHANNEL compile-time marker)"
           #   ② 新函数名本身也在 .rodata（调试符号/字符串表里可查），
           #      用来确认「追加」那一步真的发生了，而不只是标记被塞进去。
-          if ! strings -a "$SO" | grep -qF 'tensor_quantization_supported_per_axis'; then
-            echo "ERROR: 产物里找不到 tensor_quantization_supported_per_axis —— 新判定没进二进制"
-            exit 1
+          # ★ 这条查的是**函数名** ⇒ 它在符号表里，**strip 之后就没了**
+          #   （交付模式 NO_STRIP=0 ⇒ 查不到是正常的）。
+          #   ⇒ 只在未 strip 的取证产物上查；交付模式由上一条
+          #   「och-patch-perchannel-quant（真字面量）」证明补丁已落地。
+          if [ "${TEFLON_NO_STRIP:-0}" = "1" ]; then
+            if ! strings -a "$SO" | grep -qF 'tensor_quantization_supported_per_axis'; then
+              echo "ERROR: 产物里找不到 tensor_quantization_supported_per_axis —— 新判定没进二进制"
+              exit 1
+            fi
+            echo "STRING-CHECK: tensor_quantization_supported_per_axis PRESENT"
+          else
+            echo "ok(skipped): tensor_quantization_supported_per_axis（strip 产物没有符号表）"
           fi
-          echo "STRING-CHECK: tensor_quantization_supported_per_axis PRESENT"
           # ★ 反向门：诊断开关的字符串一个都不该在
           if strings -a "$SO" | grep -qF '[och-wc]'; then
             echo "ERROR: 产物里出现 [och-wc] —— WCDIAG 诊断开关误开，这不是交付产物"
@@ -1358,7 +1366,12 @@ jobs:
           [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           {
-            echo "########## FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL - CANDIDATE, NOT DELIVERABLE (numerics unverified) ##########"
+            if [ "${TEFLON_MODE:-phantomdiag}" = "delivery" ]; then
+              echo "########## DELIVERY: FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL(+layout) + PHANTOM_GATE + WDOM + ODETRANS + PCDOMAIN ##########"
+              echo "########## fixes default-ON, diagnostics OFF, stripped; runtime gates: TEFLON_WDOMAIN/ODETRANS/PCDOMAIN=0 to disable one ##########"
+            else
+              echo "########## FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL - CANDIDATE, NOT DELIVERABLE (numerics unverified) ##########"
+            fi
             echo "why=ALIASDIAG(64933494) falsified both hypotheses: recreate_tensor was called 0 times; all 13 batch migrations left size/offset unchanged"
             echo "     => only remaining fact: tensor->size=610000 is correct but pipe_buffer_size(res)=5000 => the BUFFER ALLOCATION is wrong"
             echo "purpose6=create/destroy_tensor evidence: print requested size vs actual pipe_buffer_size(res) at every create/early-return/destroy (etnaviv_ml.c step 3l)"
