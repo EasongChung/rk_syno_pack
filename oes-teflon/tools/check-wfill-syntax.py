@@ -44,7 +44,9 @@ struct etna_ml_subgraph {
    struct { struct etna_ml_tensor **data; unsigned n; } tensors;
 };
 
+#define PIPE_MAP_READ  (1u << 1)
 #define PIPE_MAP_WRITE (1u << 2)
+#define PIPE_MAP_UNSYNCHRONIZED (1u << 9)
 #define ML_DBG(...) printf(__VA_ARGS__)
 
 static pipe_transfer *pipe_buffer_map_range(void *ctx, pipe_resource *res,

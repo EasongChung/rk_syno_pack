@@ -183,7 +183,9 @@ def main() -> int:
             #   c) 少了越界守卫 ⇒ 探针自己去 map 野槽，可能把诊断变成事故。
             probe = read(p2)
             pb = fn_body(probe)
-            if "[och-wd]" not in probe:
+            if "[och-td]" not in probe:
+                fail("正控制 4 失效：缺少全张量快照 [och-td]（无法判断 NPU 读到了什么）")
+            elif "[och-wd]" not in probe:
                 fail("正控制 4 失效：叠加版里没有 [och-wd] 探针（B2/B3 判决仪器缺失）")
             elif 'getenv("TEFLON_WFILL")' not in probe:
                 fail("正控制 4 失效：探针没有运行期门控 TEFLON_WFILL（会无条件破坏输出）")
