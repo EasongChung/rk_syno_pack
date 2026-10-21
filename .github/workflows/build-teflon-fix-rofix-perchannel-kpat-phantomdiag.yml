@@ -1367,8 +1367,17 @@ jobs:
             || { echo "ERROR: 缺少 libdrm.so.2"; exit 1; }
           {
             if [ "${TEFLON_MODE:-phantomdiag}" = "delivery" ]; then
-              echo "########## DELIVERY: FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL(+layout) + PHANTOM_GATE + WDOM + ODETRANS + PCDOMAIN ##########"
-              echo "########## fixes default-ON, diagnostics OFF, stripped; runtime gates: TEFLON_WDOMAIN/ODETRANS/PCDOMAIN=0 to disable one ##########"
+              echo "########## DELIVERY BUILD — 交付候选产物（数值已在设备上验证，见报告 47）##########"
+              echo "fixes_default_on=TEFLON_WDOMAIN(per-tensor 权重 +128) / TEFLON_ODETRANS(图输出 NCHW->NHWC) / TEFLON_PCDOMAIN(per-channel 权重域)"
+              echo "disable_one=设 TEFLON_WDOMAIN=0 / TEFLON_ODETRANS=0 / TEFLON_PCDOMAIN=0 单独关掉某一个（不设=修复生效）"
+              echo "safety_on=FIX_V7 / OCFIX / FSGUARD / ROFIX / PHANTOM_GATE(out_c%8!=0 回落 CPU)"
+              echo "diagnostics_off=NNDUMP / RODIAG / ALIASDIAG / CREATEDIAG / WCDIAG / KPAT / FORCE-PARTIAL / ROUNDMODE / R5GUARD / PHANTOM_CLAMP"
+              echo "stripped=yes（无 .debug_info）"
+              echo "known_limit1=per-axis(per-channel)量化达不到逐字节一致：驱动把各通道 scale 压成单一 scale（upstream 明确声明的损失）"
+              echo "known_limit2=实测与 TFLite CPU 约 78% 一致、其余 <=1 LSB；per-tensor 模型可达逐字节一致（与精确整数数学 100% 相同）"
+              echo "known_limit3=out_c%8!=0 的卷积回落 CPU（幻影通道，GATE 兜底）：零挂死风险，但少加速"
+              echo "verified_on_device=三模型回归：c248 合成(per-tensor)=与精确整数数学 100.0000% / 官方 MobileNetV1=与 CPU 99.70% / c248-perchannel=与 CPU 78.36% 且不再饱和"
+              echo "reports=verify/reports/42 43 44 46 47（本仓）；详见本仓 AGENTS.md「交付版」节"
             else
               echo "########## FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL - CANDIDATE, NOT DELIVERABLE (numerics unverified) ##########"
             fi
