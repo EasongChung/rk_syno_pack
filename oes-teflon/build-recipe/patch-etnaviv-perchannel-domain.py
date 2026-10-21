@@ -76,6 +76,7 @@ signed 分支与 unsigned 分支**统一到 uint8 域**：
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -133,7 +134,6 @@ NEW = """               if (operation->weight_signed) {
                      "[och-pcdomain]";
                   (void)och_pcdomain_marker;
                   #endif
-                  map_out[oc][ic][w][h] = requantized + operation->weight_zero_point - 0x80;
                } else {
 """
 
@@ -154,6 +154,33 @@ def apply(path):
     print("  [och-pcdomain] 已注入 per-channel 权重域修复: %s" % path)
     print("  [och-pcdomain] 运行期门控：TEFLON_PCDOMAIN=1 才生效")
     return 0
+
+
+def _dangling_requantized(text):
+    """signed 分支里是否残留裸 `requantized` 引用（删了声明却留着引用）。
+
+    ★ 必须用**括号配对**定位 signed 块：里面还嵌着本补丁自己的
+    `if (getenv(...)) { ... } else { ... }` ⇒ 非贪婪正则会停在内层的 `} else {`
+    上，把真正出问题的 else 分支漏在检查范围之外（第一版就是这么漏判的）。
+    """
+    m_fn = re.search(r'requantize_weights\(struct etna_ml_subgraph', text)
+    if not m_fn:
+        return False
+    i = text.index("if (operation->weight_signed) {", m_fn.start())
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                seg = text[i:j]
+                break
+    else:
+        return True                      # 括号不配平 ⇒ 判失败（fail-closed）
+    seg = re.sub(r'/\*.*?\*/', '', seg, flags=re.S)   # 剥注释（注释里会提到 requantized）
+    seg = seg.replace("och_requant", "")               # 去掉我们自己的变量名
+    return "requantized" in seg
 
 
 def selftest(mesa_src):
@@ -195,6 +222,11 @@ def selftest(mesa_src):
             return False
         out = io.open(dst, encoding="utf-8").read()
 
+        # ★ 悬空引用守卫（run 39566597876 的失败类别）：
+        #   删了 requantized 的声明却留下引用它的那一行 ⇒ 编译期才炸。
+        #   这里在**打完的文本**里查：函数体内除 och_requant 外不得再有裸 requantized。
+        dangling = _dangling_requantized(out)
+
         for cond, desc in [
             (MARKER in out, "标记已写入"),
             ('getenv("TEFLON_PCDOMAIN")' in out, "运行期门控存在"),
@@ -203,9 +235,20 @@ def selftest(mesa_src):
             ("CLAMP(och_qu, 0, 255)" in out, "夹到 uint8 域 [0,255]"),
             ("- 0x80" in out, "未设门控时保留上游原样（int8 域）"),
             ("[och-pcdomain]" in out, "C 代码自带产物可查的标记"),
+            (not dangling, "打完的 requantize_weights 里没有裸 requantized 引用（悬空引用守卫）"),
         ]:
             print("  [%s] 正控制：%s" % ("ok" if cond else "BAD", desc))
             ok = ok and cond
+
+        # ★ 守卫自身的负控：把打完的文本改回「有悬空引用」的形态，
+        #   守卫必须判 True —— 否则这道守卫自己可能是假绿。
+        buggy = out.replace(
+            "map_out[oc][ic][w][h] = (uint8_t)((int8_t)och_requant +",
+            "map_out[oc][ic][w][h] = requantized + (int8_t)och_requant +")
+        cond = (buggy != out) and _dangling_requantized(buggy)
+        print("  [%s] 负控制 0：守卫自己会失败（造 bug 版必须被判中）"
+              % ("ok" if cond else "BAD"))
+        ok = ok and cond
 
         # 负控制 1：重复应用被拒
         cond = (apply(dst) == 1)
