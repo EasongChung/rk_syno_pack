@@ -283,24 +283,50 @@ def stage_check_tflite_int8(src, out_path):
     print('WROTE %s (ort direct)' % out_path, flush=True)
 
 
+def _run_onnx2tf(qdq_path, out_dir, extra_args):
+    cmd = [sys.executable,
+           os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'run_onnx2tf.py'),
+           '-i', qdq_path, '-o', out_dir,
+           '--non_verbose'] + list(extra_args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _keep_names_from_error(err):
+    """从 onnx2tf 的报错里解析「需要保持形状的张量名」。
+
+    onnx2tf 在 NHWC/非标准通道布局时会报：
+        ERROR: onxx_op_name: a;b;c
+        ERROR: ... use the -kt or -kat option.
+    ⇒ -kat 要跟**张量名**（nargs='+'），不是布尔开关。
+    """
+    for ln in err.splitlines():
+        if 'onxx_op_name:' in ln:
+            raw = ln.split('onxx_op_name:', 1)[1].strip()
+            return [x.strip() for x in raw.split(';') if x.strip()]
+    return []
+
+
 def stage_qdq_to_tflite(qdq_path, out_path):
-    r = subprocess.run(
-        [sys.executable,
-         os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                      'run_onnx2tf.py'),
-         '-i', qdq_path, '-o', out_path + '.qd',
-         '--non_verbose', '-kat'],
-        capture_output=True, text=True)
+    # ★ 只给**输入**加 -kt 不够：模型全程 NHWC，而 onnx2tf 默认按 NCHW 解释中间张量
+    #   （run 39208774472 的报错点名的正是中间算子：relu_4/Relu;add_6/Add;...）。
+    base = ['-kt', 'inputs_0']
+    r = _run_onnx2tf(qdq_path, out_path + '.qd', base)
+    if r.returncode != 0:
+        names = _keep_names_from_error((r.stderr or '') + (r.stdout or ''))
+        if names:
+            print('  ORTQ-RETRY: onnx2tf 要求保持形状的张量 %d 个 -> %s'
+                  % (len(names), names[:6]), flush=True)
+            r = _run_onnx2tf(qdq_path, out_path + '.qd', base + ['-kat'] + names)
     print(r.stdout[-1500:], flush=True)
     print(r.stderr[-1500:], file=sys.stderr, flush=True)
     import glob as gb
     outs = gb.glob(os.path.join(out_path + '.qd', '*.tflite'))
     if not outs:
-        # ★ 失败诊断（run 39208774472 就是死在这里，报错只说 "produced nothing"）：
-        #   把 onnx2tf 的关键报错行打出来，便于一眼看出是**布局**问题还是别的。
+        # ★ 失败诊断：把 onnx2tf 的关键报错行打出来，免得只剩「produced nothing」。
         err = (r.stderr or '') + (r.stdout or '')
         keys = ['ERROR:', 'use the -kt or -kat option', 'input_onnx_file_path',
-                'onnx_op_name']
+                'onxx_op_name', 'onnx2tf: error']
         for ln in err.splitlines():
             if any(k in ln for k in keys):
                 print('  ORTQ-DIAG: %s' % ln.strip()[:160], flush=True)
