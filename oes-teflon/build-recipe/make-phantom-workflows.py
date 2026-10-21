@@ -221,7 +221,7 @@ DELIVERY_ENV = """env:
 """
 
 DELIVERY_STRINGS = """          # ★ 交付版的额外门：三个修复的标记**必须在**，诊断/实验标记**必须不在**
-          for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]'; do
+          for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]' 'och-patch-ml-resource-width'; do
             if ! strings -a "$SO" | grep -qF "$pat"; then
               echo "ERROR: 产物里缺少 $pat —— 该修复没进二进制，交付产物会带缺陷"
               exit 1
@@ -276,6 +276,7 @@ MODE_ENV = [
     # PERCHANNEL_DIAG 不在 base env 里，但 build-teflon.sh 默认 1 ⇒ 交付版必须显式关
     #   （否则产物里会带 [och-pcl] 的诊断打印）
     ("  TEFLON_PERCHANNEL_DIAG: '1'", "0"),
+    ("  TEFLON_MLWIDTH_PATCH: '0'", "1"),
 ]
 
 

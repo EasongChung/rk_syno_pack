@@ -1093,6 +1093,36 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
 	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"
 
+# ── 3k7. 【修复】ML 层自建资源的 width0=0（Synology Photos 主题识别模型的 abort）──
+# 现象：photos 的 concept 模型（FC 输出 rank-2）在推理期 abort：
+#        pipe_buffer_map_range: Assertion `offset + length <= buffer->width0' failed.
+# 根因：etna_ml_create_resource() 调 pipe_buffer_create(pscreen, 0, …, size)
+#        ⇒ Gallium 把 width 直接写进 res->width0 ⇒ 自建资源 width0=0 ⇒ 任何 map_range 必炸。
+#        （未打补丁的上游原版同样 abort ⇒ 与本仓其它改动无关。）
+# 修法：width 取 size（width0 的语义就是「可映射的字节范围」）；不改任何数值。
+#
+#   构建：TEFLON_MLWIDTH_PATCH=1
+#
+if [ "${TEFLON_MLWIDTH_PATCH:-0}" = "1" ]; then
+	echo "==> [3k7/6] 打【修复】ML 自建资源 width0=0"
+	PATCHER_MLW="$SCRIPT_DIR/patch-etnaviv-ml-resource-width.py"
+	MLMLW="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_MLW" ]; then
+		echo "ERROR: 设了 TEFLON_MLWIDTH_PATCH=1 却缺 $PATCHER_MLW"
+		exit 1
+	fi
+	if [ ! -f "$MLMLW" ]; then
+		echo "ERROR: 找不到 $MLMLW"
+		exit 1
+	fi
+	python3 "$PATCHER_MLW" "$MLMLW" || {
+		echo "ERROR: ML 资源 width 补丁应用失败 —— 不要跳过校验。"
+		exit 1
+	}
+else
+	echo "==> [3k7/6] ML 自建资源 width 修复：默认关闭（设 TEFLON_MLWIDTH_PATCH=1 启用）"
+fi
+
 # ── 3m2. 【修复】per-channel（per-axis）权重折叠后的域错误 ────────────────
 # 背景（报告 46，真机实测）：
 #   权重 scale **不均匀**的 int8 模型（C=248）上 NPU 输出**全 255 饱和**，

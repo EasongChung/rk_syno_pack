@@ -84,6 +84,7 @@ env:
   TEFLON_FSGUARD: '1'
   TEFLON_ROFIX: '1'
   TEFLON_PERCHANNEL: '1'
+  TEFLON_MLWIDTH_PATCH: ${{ inputs.mode == 'delivery' && '1' || '0' }}
   TEFLON_PERCHANNEL_DIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_NNDUMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_KPAT: ${{ inputs.mode == 'delivery' && '0' || '1' }}
@@ -1211,7 +1212,7 @@ jobs:
           done
           if [ "$TEFLON_MODE" = "delivery" ]; then
             # ★ 交付版的额外门：三个修复的标记**必须在**，诊断/实验标记**必须不在**
-            for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]'; do
+            for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]' 'och-patch-ml-resource-width'; do
               if ! strings -a "$SO" | grep -qF "$pat"; then
                 echo "ERROR: 产物里缺少 $pat —— 该修复没进二进制，交付产物会带缺陷"
                 exit 1
