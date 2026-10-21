@@ -91,7 +91,7 @@ NEW = """         if (tensor->exp_layout == ETNA_ML_LAYOUT_ANY &&
          if (getenv("TEFLON_ODETRANS") != NULL &&
              !etna_ml_find_consumer(poperations, count, poperation->output_tensors[i]->index) &&
              tensor->act_layout == ETNA_ML_LAYOUT_NCHW) {
-            ML_DBG("och: graph output tensor %d NCHW -> expect NHWC.\\n",
+            ML_DBG("[och-odetrans] graph output tensor %d NCHW -> expect NHWC.\\n",
                    poperation->output_tensors[i]->index);
             tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;
          }
@@ -139,6 +139,7 @@ def selftest(mesa_src):
             ("TEFLON_ODETRANS" in out, "运行期门控存在"),
             ("tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;" in out, "只改 exp_layout"),
             (out.count("getenv(\"TEFLON_ODETRANS\")") == 1, "门控只出现一次"),
+            ("[och-odetrans]" in out, "C 代码自带产物可查的标记"),
         ]:
             print("  [%s] 正控制：%s" % ("ok" if cond else "BAD", desc))
             ok = ok and cond
