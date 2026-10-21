@@ -72,6 +72,26 @@ jobs:
             --eval-dir eval --frontend-num 50
           ls -la out/
 
+      # ★ 提前上传：run 39610365571 / 39208774472 两次都在跑到 ORT 阶段时被
+      #   「runner received a shutdown signal」砍断 ⇒ 末尾的 Upload 步永远没执行
+      #   ⇒ 一次转换白跑（本地既没有模型、也没有报告）。
+      #   这里在**MLIR 转换刚完成**就先传一份产物 ⇒ 后面无论成败都拿得到模型。
+      - name: Upload INT8 artifacts (early, right after MLIR convert)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: concept-int8-oes-early
+          path: |
+            out/concept_int8.tflite
+            out/concept_int8_floatio.tflite
+            out/concept_dyn.tflite
+            out/concept_mixed.tflite
+            out/concept_legacy.tflite
+            out/*.json
+            out/*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: ORT QDQ pre-quantization (bypass MLIR PTQ)
         run: |
           set -euo pipefail
