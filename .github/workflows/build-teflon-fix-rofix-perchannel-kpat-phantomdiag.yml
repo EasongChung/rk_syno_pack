@@ -91,6 +91,11 @@ env:
   TEFLON_WDOM_PATCH: '1'
   # ★ 图输出 NCHW→NHWC 收口（同样运行期 TEFLON_ODETRANS 门控）
   TEFLON_ODETRANS_PATCH: '1'
+  # ★ 显式 std 头文件（纯卫生，无行为变化）
+  TEFLON_STDINC_PATCH: '1'
+  # ★ 舍入模式探针：编进产物，运行期由 TEFLON_ROUNDMODE=0..3 覆盖，
+  #   不设 = 与上游逐字节一致。用于实测哪个值等价于 TFLite 的四舍五入。
+  TEFLON_ROUNDMODE_PATCH: '1'
   TEFLON_ALIASDIAG: '0'
   TEFLON_CREATEDIAG: '0'
   TEFLON_DIAG: '0'
@@ -997,6 +1002,8 @@ jobs:
                      'TEFLON_WDOMAIN' \
                      '[och-odetrans]' \
                      'TEFLON_ODETRANS' \
+                     '[och-roundmode]' \
+                     'TEFLON_ROUNDMODE' \
                      'TEFLON_WFILL'; do
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"

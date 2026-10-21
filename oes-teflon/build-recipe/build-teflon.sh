@@ -1314,6 +1314,63 @@ else
 	echo "==> [3k3/6] 图输出收口补丁：默认关闭（设 TEFLON_ODETRANS_PATCH=1 启用）"
 fi
 
+# ── 3k4. 【卫生】补齐 etnaviv_ml{,_nn}.c 的显式 std 头文件 ─────────────────
+# 这两个文件原本没有 <stdlib.h>（nn.c 连 <stdio.h> 也没有），我们后续补丁首次在
+# 其中引入 getenv()/atoi()/fprintf()。当前靠 mesa 头文件链间接包含才能编过 ——
+# 属脆弱依赖（上游改一次 include 就退化成 implicit declaration，指针被截断）。
+#
+# 只加 include，不改任何逻辑。幂等：已存在则跳过。
+#
+#   构建：TEFLON_STDINC_PATCH=1
+#
+if [ "${TEFLON_STDINC_PATCH:-0}" = "1" ]; then
+	echo "==> [3k4/6] 补【卫生】显式 std 头文件"
+	PATCHER_INC="$SCRIPT_DIR/patch-etnaviv-includes.py"
+	if [ ! -f "$PATCHER_INC" ]; then
+		echo "ERROR: 设了 TEFLON_STDINC_PATCH=1 却缺 $PATCHER_INC"
+		exit 1
+	fi
+	python3 "$PATCHER_INC" \
+		"mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c" \
+		"mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c" || {
+		echo "ERROR: include 补齐失败 —— 不要跳过校验。"
+		exit 1
+	}
+else
+	echo "==> [3k4/6] 显式 std 头文件：默认关闭（设 TEFLON_STDINC_PATCH=1 启用）"
+fi
+
+# ── 3k5. 【探针】NN 描述符 rounding_mode 运行期覆盖（舍入方式实测）──────────
+# 背景（报告 42）：两处根因修好后，NPU vs CPU 只剩「恰好差 -1、npu>cpu 恒为 0」
+# 的单侧残差 —— 典型舍入方式差异（硬件向 -inf 截断，TFLite 四舍五入）。
+#
+# rounding_mode 是 2 bit 字段（etnaviv_ml_nn.c:71），上游固定写 0x1 且**没有任何
+# 取值含义的注释或枚举** ⇒ 只能真机实测 0/1/2/3。
+#
+#   构建：TEFLON_ROUNDMODE_PATCH=1 ；运行：TEFLON_ROUNDMODE=0..3（不设 = 上游行为）
+#
+# ⚠️ 探针性质，默认关闭。它不是修复，是为了拿到「哪个值 = 四舍五入」这一事实。
+#
+if [ "${TEFLON_ROUNDMODE_PATCH:-0}" = "1" ]; then
+	echo "==> [3k5/6] 打【探针】舍入模式运行期覆盖"
+	PATCHER_RM="$SCRIPT_DIR/patch-etnaviv-roundmode.py"
+	MLRM="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER_RM" ]; then
+		echo "ERROR: 设了 TEFLON_ROUNDMODE_PATCH=1 却缺 $PATCHER_RM"
+		exit 1
+	fi
+	if [ ! -f "$MLRM" ]; then
+		echo "ERROR: 找不到 $MLRM"
+		exit 1
+	fi
+	python3 "$PATCHER_RM" "$MLRM" || {
+		echo "ERROR: 舍入探针补丁应用失败 —— 不要跳过校验。"
+		exit 1
+	}
+else
+	echo "==> [3k5/6] 舍入探针：默认关闭（设 TEFLON_ROUNDMODE_PATCH=1 启用）"
+fi
+
 # ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #
