@@ -1278,6 +1278,42 @@ else
 	echo "==> [3k2/6] 权重域补丁：默认关闭（设 TEFLON_WDOM_PATCH=1 启用）"
 fi
 
+# ── 3k3. 【修复】图输出 NCHW→NHWC 收口（detranspose，运行期门控）────────────
+# 背景（报告 39 §5，真机实测）：
+#   权重域修好后，NPU 输出与 CPU 按 HWC 读只 1.19% 一致；**按 CHW 重排后
+#   76.51% 逐字节一致、其余恰好差 -1、|差|>1 为 0** ⇒ 计算对、布局错。
+#
+#   源码定位：lower_operations() 尾部本来有 detranspose 收口，条件是
+#   `exp_layout != act_layout`；但上面的 etna_ml_copy_layout() 把**图输出**的
+#   exp_layout 也继承成了卷积的 NCHW ⇒ 条件恒假 ⇒ detranspose 永不插入。
+#   真机日志里 "Adding transpose"/"Adding detranspose" 出现次数均为 0。
+#
+#   本补丁只把「无消费者的图输出」的 exp_layout 改回 NHWC，让原有逻辑自然触发。
+#
+#   构建：TEFLON_ODETRANS_PATCH=1 ；运行：TEFLON_ODETRANS=1（不设 = 与上游一致）
+#
+# ⚠️ 默认关闭。
+if [ "${TEFLON_ODETRANS_PATCH:-0}" = "1" ]; then
+	echo "==> [3k3/6] 打【修复】图输出 NCHW→NHWC 收口"
+	PATCHER_ODT="$SCRIPT_DIR/patch-etnaviv-output-detranspose.py"
+	MLODT="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_ODT" ]; then
+		echo "ERROR: 设了 TEFLON_ODETRANS_PATCH=1 却缺 $PATCHER_ODT"
+		exit 1
+	fi
+	if [ ! -f "$MLODT" ]; then
+		echo "ERROR: 找不到 $MLODT"
+		exit 1
+	fi
+	python3 "$PATCHER_ODT" "$MLODT" || {
+		echo "ERROR: 图输出收口补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未打补丁的 .so，结论无效）。"
+		exit 1
+	}
+else
+	echo "==> [3k3/6] 图输出收口补丁：默认关闭（设 TEFLON_ODETRANS_PATCH=1 启用）"
+fi
+
 # ---------------------------------------------------------------- #
 # 4. meson 交叉配置
 # ---------------------------------------------------------------- #

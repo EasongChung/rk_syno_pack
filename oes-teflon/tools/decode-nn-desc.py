@@ -68,7 +68,17 @@ FIELDS = [
     ("out_image_circular_buf_end_addr_plus_1", 26), ("unused8", 6),
     # /* 20,21 */
     ("in_image_circular_buf_size", 26), ("unused9", 6),
-    ("in_image_circular_buf_end_addr_plus_1", 26),
+    ("in_image_circular_buf_end_addr_plus_1", 26), ("unused10", 6),
+    # /* 22 */
+    ("coef_zero_point", 8), ("out_zero_point", 8),
+    ("kernel_direct_stream_from_VIP_sram", 1), ("depthwise", 1),
+    ("post_multiplier_15_to_22", 8), ("unused11", 6),
+    # /* 23..26 */
+    ("unused12", 32),
+    ("unused13", 4), ("unused14", 28),
+    ("unused15", 4), ("unused16", 28),
+    ("further1", 32), ("further2", 32), ("further3", 32), ("further4", 32),
+    ("further5", 32), ("further6", 32), ("further7", 32), ("further8", 32),
 ]
 
 # 关键字段：解码后单独高亮（判断作业配置是否自洽）
@@ -80,6 +90,7 @@ KEY = ("layer_type", "kernel_xy_size", "kernel_z_size", "kernel_y_size",
        "kernel_cache_start_address", "kernel_cache_end_address",
        "image_cache_start_address", "image_cache_end_address", "post_shift",
        "post_multiplier", "post_multiplier_1_to_6", "post_multiplier_7_to_14",
+       "coef_zero_point", "out_zero_point", "depthwise",
        "relu", "kernel_pattern_msb")
 
 
