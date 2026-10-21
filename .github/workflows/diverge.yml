@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
           python tools/oes/convert_to_int8.py --src tools/oes/models/model_float16.tflite \
             --workdir work --outdir out --calib-dir calib --num-calib 300 \
+            --clean-calib \
             --eval-dir eval --frontend-num 50 --skip-quant
           ls -la work/
 
