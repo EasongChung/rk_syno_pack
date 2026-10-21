@@ -707,15 +707,19 @@ def _validate_savedmodel(sm_dir, onnx_path):
     assert c > 0.999, 'backend mismatch, cosine=%.5f' % c
 
 
-def representative_dataset(calib_dir, num, float_io):
+def representative_dataset(calib_dir, num, float_io, files=None):
     # ★ 校准分布必须与服务端真实输入一致：归一化 float32 NHWC [-1,1]。
     # （float_io 只决定模型 I/O 的 dtype，不改变校准分布；此前 full-int 路
     # 误喂 0~255 原始值，导致 activation 量化尺度全错，回归 top1=0.01。）
     from PIL import Image
     import numpy as np
-    files = sorted(glob.glob(os.path.join(calib_dir, '*')))
-    files = [f for f in files
-             if f.lower().endswith(('.jpg', '.jpeg', '.png'))][:num]
+    if files is None:
+        files = sorted(glob.glob(os.path.join(calib_dir, '*')))
+        files = [f for f in files
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))][:num]
+    else:
+        # ★ 清洗后的显式文件列表（清洗由 ort_quant.clean_calib_files 做）
+        files = list(files)[:num]
     print('calib files available: %d (need %d)' % (len(files), num), flush=True)
     assert len(files) >= min(num, 50), 'too few calibration images'
     rng = np.random.default_rng(7)
@@ -831,12 +835,24 @@ def stage_quant_dynamic(sm_dir, out_path):
         out_path, len(model)), flush=True)
 
 
-def stage_quant(sm_dir, out_path, calib_dir, num_calib, float_io):
+def stage_quant(sm_dir, out_path, calib_dir, num_calib, float_io,
+                clean_calib=False, clean_k=3.0, float_onnx=None, workdir='work'):
     import tensorflow as tf
     conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    # ★ 标定集清洗（离群图会把 MinMax 上界拉爆 ~46 倍 ⇒ 有效级数只剩 ~7 级 ⇒ 整网退化）。
+    #   清洗实现在 ort_quant.clean_calib_files（按 k×median 阈值剔除），原先**只**接在
+    #   ORT QDQ 路线上；MLIR per-tensor 路线没有 ⇒ 这条路线出的模型是坏的
+    #   （concept_int8_pertensor 的 6 个退化张量 + 100% 饱和）。
+    calib_files = None
+    if clean_calib:
+        assert float_onnx and os.path.exists(float_onnx), \
+            'clean_calib 需要 float onnx（%s）' % float_onnx
+        from ort_quant import clean_calib_files
+        calib_files = clean_calib_files(float_onnx, calib_dir, num_calib,
+                                        clean_k, workdir)
     conv.representative_dataset = representative_dataset(
-        calib_dir, num_calib, float_io)
+        calib_dir, num_calib, float_io, files=calib_files)
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     if float_io:
         conv.inference_input_type = tf.float32
@@ -953,6 +969,10 @@ def main():
     ap.add_argument('--eval-dir', default='eval')
     ap.add_argument('--frontend-num', type=int, default=50)
     ap.add_argument('--skip-frontend-check', action='store_true')
+    ap.add_argument('--clean-calib', action='store_true',
+                    help='量化前剔除标定集离群图（k×median 阈值，见 ort_quant.clean_calib_files）')
+    ap.add_argument('--clean-k', type=float, default=3.0,
+                    help='离群图判定阈值倍数（× 标定集激活幅度中位数）')
     ap.add_argument('--skip-quant', action='store_true',
                     help='只跑到 SavedModel 为止（供 diverge 等只需 ONNX 的流程）')
     args = ap.parse_args()
@@ -972,10 +992,19 @@ def main():
     if args.skip_quant:
         print('SKIP-QUANT: stop after SavedModel (graph_path kept)', flush=True)
         return
+    # float onnx：清洗要用它逐图测激活幅度（concept_split.onnx 由
+    # stage_onnx_to_savedmodel 顺带产出；没有就退回 concept_mid.onnx）
+    float_onnx = os.path.join(args.workdir, 'concept_split.onnx')
+    if not os.path.exists(float_onnx):
+        float_onnx = onnx_path
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8.tflite'),
-                args.calib_dir, args.num_calib, float_io=False)
+                args.calib_dir, args.num_calib, float_io=False,
+                clean_calib=args.clean_calib, clean_k=args.clean_k,
+                float_onnx=float_onnx, workdir=args.workdir)
     stage_quant(sm_dir, os.path.join(args.outdir, 'concept_int8_floatio.tflite'),
-                args.calib_dir, args.num_calib, float_io=True)
+                args.calib_dir, args.num_calib, float_io=True,
+                clean_calib=args.clean_calib, clean_k=args.clean_k,
+                float_onnx=float_onnx, workdir=args.workdir)
     stage_quant_dynamic(sm_dir, os.path.join(args.outdir, 'concept_dyn.tflite'))
     try:
         gp = open(os.path.join(args.workdir, 'graph_path.txt')).read().strip()
