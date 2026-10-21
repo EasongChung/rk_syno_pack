@@ -896,7 +896,7 @@ jobs:
             grep -n -A4 'och patch: v7 也要写回' "$NN"
             echo
             echo "=== create_coeffs_v7 选路（etnaviv_ml_nn_v7.c）==="
-            grep -n -B2 -A10 'och-pcl\] SEL' "$V7"
+            grep -n -B2 -A10 'och-pcl\] SEL' "$V7" || echo "  (diag 关闭：v7 里没有 [och-pcl] SEL)"
             echo
             echo "=== 本轮可证伪预测（设备上机时应逐条对上；不符即证伪报告 21）==="
             echo "CQ-OUT dw=1 visited=2196   （不是 535824）"
