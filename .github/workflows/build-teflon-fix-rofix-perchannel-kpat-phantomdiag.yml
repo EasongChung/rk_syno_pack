@@ -115,7 +115,7 @@ env:
 
 jobs:
   build:
-    name: build libteflon.so FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT (UNSTRIPPED evidence, NOT deliverable)
+    name: build libteflon.so (mode=${{ inputs.mode || 'phantomdiag' }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -884,7 +884,9 @@ jobs:
           chk 1 'uint8_t (*map_out)[out_dim]'        "$NN" 'requantize_weights 写侧 out_dim'
           chk 1 'unsigned src_ic = depthwise ? oc : ic;' "$NN" 'depthwise 对角线取权重'
           chk 0 'nn_core_version >= 8 && poperation->conv.depthwise' "$NN" 'v7 写回条件已去掉'
-          chk 2 '[och-pcl] SEL'                      "$V7" 'v7 两处选路都插了诊断'
+          # ★ 诊断打印的数量随 TEFLON_PERCHANNEL_DIAG 变（交付模式 diag=0 ⇒ 一处都不该有）
+          if [ "${TEFLON_PERCHANNEL_DIAG:-1}" = "1" ]; then exp_pcl=2; else exp_pcl=0; fi
+          chk "$exp_pcl" '[och-pcl] SEL'              "$V7" 'v7 两处选路都插了诊断（数量随 diag 开关）'
           [ "$ok" = 1 ] || { echo "ERROR: 布局补丁未完整落地"; exit 1; }
           # 取证：把改后的三个函数原样带走，供 review 与设备侧对撞
           {
@@ -1157,12 +1159,14 @@ jobs:
           echo "STRING-CHECK: [och-wc] absent (diag switch really off)"
           # ★ 反向门：RODIAG（read_outputs 越界取证）的字符串也一个都不该在 ——
           #   它是本轮新增的第三个诊断开关，误开会让交付产物多出运行期打印与体积。
-          # ★ 本变体就是要 RODIAG ⇒ 必须存在，否则产物没有诊断价值
-          if ! strings -a "$SO" | grep -qF '[och-ro]'; then
-            echo "ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去"
-            exit 1
+          # ★ RODIAG 的存在性随开关走：取证模式必须有，交付模式必须没有
+          if [ "$TEFLON_RODIAG" = "1" ]; then
+            if ! strings -a "$SO" | grep -qF '[och-ro]'; then
+              echo "ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去"
+              exit 1
+            fi
+            echo "STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)"
           fi
-          echo "STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)"
           # ★ 反向门：本轮把 ALIASDIAG / CREATEDIAG 置 0，
           #   它们的字符串**一个都不该在**产物里（否则就是拿错产物）。
           for probe in '[och-alias]' '[och-create]'; do
