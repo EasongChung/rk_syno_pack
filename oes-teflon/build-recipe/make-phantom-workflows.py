@@ -27,6 +27,7 @@
 """
 
 import os
+import re
 import sys
 
 
@@ -133,6 +134,18 @@ POSITIVE_DIAG = """
                      '[och-pcdomain]' \\
                      'TEFLON_PCDOMAIN' \\
                      'TEFLON_WFILL'; do
+            # ★ 交付模式没有这些诊断/探针补丁 ⇒ 它们的标记**本就不该在**产物里。
+            #   （取证模式才是「必须在」⇒ 不跳过）
+            case "$pat" in
+              'och-patch-v7-phantom-clamp'|'[och-ro]'|'[och-ro]   head='|\
+              '[och-ro]   sample '|'[och-wd]'|'[och-td]'|'[och-coef]'|\
+              '[och-roundmode]'|'TEFLON_ROUNDMODE'|'TEFLON_WFILL')
+                if [ "$TEFLON_MODE" = "delivery" ]; then
+                  echo "  ok(skipped): $pat（交付模式无此诊断/探针）"
+                  continue
+                fi
+                ;;
+            esac
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
             else
@@ -225,6 +238,47 @@ DELIVERY_STRINGS = """          # ★ 交付版的额外门：三个修复的标
 """
 
 
+# ══════════════════════════════════════════════════════════════════
+# 双模式化：同一个 workflow 派发出两种产物
+# ══════════════════════════════════════════════════════════════════
+#
+# 为什么需要：GitHub 的 workflow_dispatch **只能派发默认分支（main）上可见的
+# workflow**。本仓的构建 workflow 只在 teflon-npu 分支上，而 main 属于 OEC
+# （禁止碰）⇒ 新建一个 delivery workflow 文件是**派发不出来**的。
+#
+# 解法：给已被 GitHub 收录的 phantomdiag workflow 加一个 `mode` 输入，
+#   mode=phantomdiag（默认）→ 取证产物：诊断全开、带 DWARF、不 strip
+#   mode=delivery          → 交付产物：修复默认开、诊断全关、strip
+# env 与产物级门都按 `${{ inputs.mode }}` 切换。
+#
+# 表达式的写法用 GitHub 的 `cond && a || b` 惯用法（cond 为真取 a，否则取 b）。
+
+MODE_INPUT = """      mode:
+        description: 'phantomdiag（取证产物：诊断全开、带 DWARF）| delivery（交付产物：修复默认开、诊断全关、strip）'
+        required: false
+        default: 'phantomdiag'
+"""
+
+# env 里「取证值 → 交付值」的映射
+MODE_ENV = [
+    ("  TEFLON_NNDUMP: '1'", "0"),
+    ("  TEFLON_KPAT: '1'", "0"),
+    ("  TEFLON_RODIAG: '1'", "0"),
+    ("  TEFLON_PHANTOM_CLAMP: '1'", "0"),
+    ("  TEFLON_PHANTOM_GATE: '1'", "1"),
+    ("  TEFLON_WDOM_PATCH: '1'", "1"),
+    ("  TEFLON_ODETRANS_PATCH: '1'", "1"),
+    ("  TEFLON_PCDOMAIN_PATCH: '1'", "1"),
+    ("  TEFLON_STDINC_PATCH: '1'", "1"),
+    ("  TEFLON_ROUNDMODE_PATCH: '1'", "0"),
+    ("  TEFLON_DEBUG_INFO: '1'", "0"),
+    ("  TEFLON_NO_STRIP: '1'", "0"),
+    # PERCHANNEL_DIAG 不在 base env 里，但 build-teflon.sh 默认 1 ⇒ 交付版必须显式关
+    #   （否则产物里会带 [och-pcl] 的诊断打印）
+    ("  TEFLON_PERCHANNEL_DIAG: '1'", "0"),
+]
+
+
 def build(base: str, mode: str) -> str:
     src = open(base, encoding="utf-8").read()
     out = src
@@ -240,6 +294,16 @@ def build(base: str, mode: str) -> str:
 
     for label, old, new in common_rules(None if mode == "delivery" else mode):
         sub(label, old, new)
+
+
+        def sub_re(label, pattern, new, expect=1):
+            """正则替换（对手数空格不敏感）。"""
+            nonlocal out
+            n = len(re.findall(pattern, out))
+            if n != expect:
+                raise SystemExit("ERROR: 「%s」正则命中 %d 次（期望 %d）" % (label, n, expect))
+            out = re.sub(pattern, lambda _m: new, out)
+            print("  [ok] %s" % label)
 
     if mode == "fix":
         sub("env: + CLAMP/GATE（ROFIX 保持 1）",
@@ -285,18 +349,136 @@ def build(base: str, mode: str) -> str:
         sub("正/反控制块", ANCHOR_SUMMARY, POSITIVE_DIAG + "\n" + ANCHOR_SUMMARY)
         # ★ Verify artifact 步（step 33）里还有两处与 ROFIX 强绑定的硬门，
         #   run 39406884649 实测：`ERROR: 产物里找不到 [och-rofix]`。
+        # ── 双模式化（phantomdiag ↔ delivery 共用本文件）──
+        sub("workflow_dispatch 加 mode 输入",
+            "      mesa_tag:\n"
+            "        description: 'Mesa tag（需带 vendored TFLite 头）'\n"
+            "        required: false\n"
+            "        default: 'mesa-26.2.5'\n",
+            "      mesa_tag:\n"
+            "        description: 'Mesa tag（需带 vendored TFLite 头）'\n"
+            "        required: false\n"
+            "        default: 'mesa-26.2.5'\n" + MODE_INPUT)
+
+        # env：先加 TEFLON_MODE（verify 步的 shell 要读它）
+        sub("env 加 TEFLON_MODE",
+            "  TEFLON_FIX_V7: '1'",
+            "  TEFLON_MODE: ${{ inputs.mode || 'phantomdiag' }}\n"
+            "  TEFLON_FIX_V7: '1'")
+
+        # env：取证值 → 按 mode 切换
+        #   ★ 用 replace 而不是 % 格式化来拼 `${{ }}`：% 格式化**不**折叠花括号
+        #     （那是 f-string / str.format 的行为）⇒ 直接写字面量最稳。
+        for env_line, deliv_val in MODE_ENV:
+            key = env_line.strip().split(":")[0]
+            orig = env_line.strip().split("'")[1]
+            new_line = ("  %s: ${{ inputs.mode == 'delivery' && '%s' || '%s' }}"
+                        % (key, deliv_val, orig))
+            if env_line in out:
+                sub("env 按 mode 切换: %s" % key, env_line, new_line)
+            else:
+                # 该开关在 base env 里没有（PERCHANNEL_DIAG）⇒ 插到 PERCHANNEL 后面
+                sub("env 插入 %s" % key,
+                    "  TEFLON_PERCHANNEL: '1'",
+                    "  TEFLON_PERCHANNEL: '1'\n" + new_line)
+
+        # 产物级门：交付模式要多查「修复标记在 / 诊断标记不在」
+        sub("产物级门：按 mode 追加交付版检查",
+            "            echo \"STRING-CHECK: $probe absent (diag switch really off)\"\n"
+            "          done\n",
+            "            echo \"STRING-CHECK: $probe absent (diag switch really off)\"\n"
+            "          done\n"
+            "          if [ \"$TEFLON_MODE\" = \"delivery\" ]; then\n"
+            + DELIVERY_STRINGS.replace("          ", "            ") + "          fi\n")
+
+        # DWARF 硬门 → 按 mode 切换（取证要 DWARF，交付要 strip）
+        sub("DWARF/strip 硬门按 mode 切换",
+            "          if ! readelf -S \"$SO\" | grep -q '\\.debug_info'; then\n"
+            "            echo \"ERROR: 产物缺 .debug_info —— NO_STRIP/DEBUG_INFO 未生效，无法 addr2line\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"DWARF: OK (.debug_info present)\"\n",
+            "          if [ \"$TEFLON_MODE\" = \"delivery\" ]; then\n"
+            "            if readelf -S \"$SO\" | grep -q '\\.debug_info'; then\n"
+            "              echo \"ERROR: 交付产物里还有 .debug_info —— NO_STRIP 未生效\"\n"
+            "              exit 1\n"
+            "            fi\n"
+            "            echo \"STRIP: OK (.debug_info absent)\"\n"
+            "          else\n"
+            "            if ! readelf -S \"$SO\" | grep -q '\\.debug_info'; then\n"
+            "              echo \"ERROR: 产物缺 .debug_info —— NO_STRIP/DEBUG_INFO 未生效\"\n"
+            "              exit 1\n"
+            "            fi\n"
+            "            echo \"DWARF: OK (.debug_info present)\"\n"
+            "          fi\n")
+
+        # 产物名按 mode 切换
+        sub("产物名按 mode 切换",
+            "          name: libteflon-fix-rofix-perchannel-kpat-phantomdiag\n",
+            "          name: libteflon-${{ inputs.mode == 'delivery' && 'delivery'"
+            " || 'fix-rofix-perchannel-kpat-phantomdiag' }}\n")
+
+        # ★ 诊断打印的数量随 TEFLON_PERCHANNEL_DIAG 变：
+        #   交付模式 diag=0 ⇒ v7 里一处都不该有 ⇒ 期望 0（不是 2）。
+        sub_re("布局补丁落地检查：诊断数量随 diag 开关",
+               r"          chk 2 '\[och-pcl\] SEL'[^\n]*\n",
+               "          # ★ 诊断打印的数量随 TEFLON_PERCHANNEL_DIAG 变"
+               "（交付模式 diag=0 ⇒ 一处都不该有）\n"
+               "          if [ \"${TEFLON_PERCHANNEL_DIAG:-1}\" = \"1\" ]; then"
+               " exp_pcl=2; else exp_pcl=0; fi\n"
+               "          chk \"$exp_pcl\" '[och-pcl] SEL'              \"$V7\""
+               " 'v7 两处选路都插了诊断（数量随 diag 开关）'\n")
+
+        # 产物自带的 BUILD-INFO 正文也要随模式：交付版不能自称「只收集证据」
+        sub("BUILD-INFO 正文随模式走",
+            '            echo "########## FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL - CANDIDATE, NOT DELIVERABLE (numerics unverified) ##########"\n',
+            '            if [ "${TEFLON_MODE:-phantomdiag}" = "delivery" ]; then\n              echo "########## DELIVERY BUILD — 交付候选产物（数值已在设备上验证，见报告 47）##########"\n              echo "fixes_default_on=TEFLON_WDOMAIN(per-tensor 权重 +128) / TEFLON_ODETRANS(图输出 NCHW->NHWC) / TEFLON_PCDOMAIN(per-channel 权重域)"\n              echo "disable_one=设 TEFLON_WDOMAIN=0 / TEFLON_ODETRANS=0 / TEFLON_PCDOMAIN=0 单独关掉某一个（不设=修复生效）"\n              echo "safety_on=FIX_V7 / OCFIX / FSGUARD / ROFIX / PHANTOM_GATE(out_c%8!=0 回落 CPU)"\n              echo "diagnostics_off=NNDUMP / RODIAG / ALIASDIAG / CREATEDIAG / WCDIAG / KPAT / FORCE-PARTIAL / ROUNDMODE / R5GUARD / PHANTOM_CLAMP"\n              echo "stripped=yes（无 .debug_info）"\n              echo "known_limit1=per-axis(per-channel)量化达不到逐字节一致：驱动把各通道 scale 压成单一 scale（upstream 明确声明的损失）"\n              echo "known_limit2=实测与 TFLite CPU 约 78% 一致、其余 <=1 LSB；per-tensor 模型可达逐字节一致（与精确整数数学 100% 相同）"\n              echo "known_limit3=out_c%8!=0 的卷积回落 CPU（幻影通道，GATE 兜底）：零挂死风险，但少加速"\n              echo "verified_on_device=三模型回归：c248 合成(per-tensor)=与精确整数数学 100.0000% / 官方 MobileNetV1=与 CPU 99.70% / c248-perchannel=与 CPU 78.36% 且不再饱和"\n              echo "reports=verify/reports/42 43 44 46 47（本仓）；详见本仓 AGENTS.md「交付版」节"\n            else\n              echo "########## FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL - CANDIDATE, NOT DELIVERABLE (numerics unverified) ##########"\n            fi\n')
+
+        # ★ 这道门查的是**函数名**（在符号表里）⇒ strip 之后必然查不到
+        #   ⇒ 只能对未 strip 的取证产物生效。
+        sub("产物级门：函数名检查随 NO_STRIP 走",
+            '          if ! strings -a "$SO" | grep -qF \'tensor_quantization_supported_per_axis\'; then\n            echo "ERROR: 产物里找不到 tensor_quantization_supported_per_axis —— 新判定没进二进制"\n            exit 1\n          fi\n          echo "STRING-CHECK: tensor_quantization_supported_per_axis PRESENT"\n',
+            '          # ★ 这条查的是**函数名** ⇒ 它在符号表里，**strip 之后就没了**\n          #   （交付模式 NO_STRIP=0 ⇒ 查不到是正常的）。\n          #   ⇒ 只在未 strip 的取证产物上查；交付模式由上一条\n          #   「och-patch-perchannel-quant（真字面量）」证明补丁已落地。\n          if [ "${TEFLON_NO_STRIP:-0}" = "1" ]; then\n            if ! strings -a "$SO" | grep -qF \'tensor_quantization_supported_per_axis\'; then\n              echo "ERROR: 产物里找不到 tensor_quantization_supported_per_axis —— 新判定没进二进制"\n              exit 1\n            fi\n            echo "STRING-CHECK: tensor_quantization_supported_per_axis PRESENT"\n          else\n            echo "ok(skipped): tensor_quantization_supported_per_axis（strip 产物没有符号表）"\n          fi\n')
+
+        # ★ 「调试开关必须真的开了」只对**取证变体**成立：交付模式是 strip 的
+        #   （NO_STRIP=0）⇒ 「strip：跳过」「调试信息：开启」恰恰**不该**出现。
+        sub("构建日志断言：调试段随 NO_STRIP 走",
+            '          for pat in \'strip：跳过（保留调试段\' \\\n                     \'调试信息：开启（-g3）\'; do\n            if grep -qF "$pat" "$L"; then\n              echo "  OK(present): $pat"\n            else\n              echo "  ERROR: 本构建必须有「$pat」——调试开关没生效"\n              ok=0\n            fi\n          done\n',
+            '          for pat in \'strip：跳过（保留调试段\' \\\n                     \'调试信息：开启（-g3）\'; do\n            # ★ 交付模式是 **strip** 的（NO_STRIP=0）⇒ 这两条恰恰**不该**出现\n            if [ "${TEFLON_NO_STRIP:-0}" != "1" ]; then\n              echo "  ok(skipped): $pat（交付模式：产物 strip，无调试段）"\n              continue\n            fi\n            if grep -qF "$pat" "$L"; then\n              echo "  OK(present): $pat"\n            else\n              echo "  ERROR: 本构建必须有「$pat」——调试开关没生效"\n              ok=0\n            fi\n          done\n')
+
+        # ★ 断言清单里有几条只对**取证变体**成立（CLAMP 的两条）⇒ 交付模式
+        #   （PHANTOM_CLAMP=0）构建日志里不会有它们的消息 ⇒ 必须随开关跳过。
+        sub("构建日志断言：CLAMP 相关随开关跳过",
+            '            if grep -qF "$pat" "$L"; then\n              echo "  OK: $pat"\n            else\n              echo "  ERROR: 构建日志里缺少「$pat」"\n              ok=0\n            fi\n',
+            '            if grep -qF "$pat" "$L"; then\n              echo "  OK: $pat"\n            else\n              # ★ 有些断言只对**取证变体**成立（CLAMP 等）⇒ 开关关着时跳过，不算失败。\n              #   （交付模式 PHANTOM_CLAMP=0 ⇒ 构建日志里当然没有钳位补丁的消息）\n              case "$pat" in\n                \'[3g2/6] 打【修复】幻影通道 out_channel 钳位\'|\'[phantom-clamp] 已加幻影通道钳位\')\n                  if [ "${TEFLON_PHANTOM_CLAMP:-0}" != "1" ]; then\n                    echo "  ok(skipped): $pat（CLAMP 开关关闭）"\n                    continue\n                  fi\n                  ;;\n              esac\n              echo "  ERROR: 构建日志里缺少「$pat」"\n              ok=0\n            fi\n')
+
+        # ★ 取证块里的 grep 在交付模式会**返回 1**（diag=0 ⇒ v7 里没有 [och-pcl] SEL）
+        #   ⇒ set -e 把整步判失败（run 39575572902 就是这么挂的）。
+        #   ⇒ 必须显式容忍「无匹配」。
+        sub("取证块：grep 容忍无匹配",
+            "            grep -n -B2 -A10 'och-pcl\\] SEL' \"$V7\"\n",
+            "            grep -n -B2 -A10 'och-pcl\\] SEL' \"$V7\""
+            " || echo \"  (diag 关闭：v7 里没有 [och-pcl] SEL)\"\n")
+
+        # job 名：两种模式共用一个名字会误导（取证/交付的开关集完全不同）
+        sub_re("job 名按 mode 中性化",
+               r"    name: build libteflon\.so FIX_V7\+OCFIX\+FSGUARD\+ROFIX\+PERCHANNEL[^\n]*\n",
+               "    name: build libteflon.so (mode=${{ inputs.mode || 'phantomdiag' }})\n")
+
         sub("Verify artifact：RODIAG 反门 → 正门",
             "          if strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
             "            echo \"ERROR: 产物里出现 [och-ro] —— RODIAG 取证开关误开，这不是交付产物\"\n"
             "            exit 1\n"
             "          fi\n"
             "          echo \"STRING-CHECK: [och-ro] absent (RODIAG switch really off)\"\n",
-            "          # ★ 本变体就是要 RODIAG ⇒ 必须存在，否则产物没有诊断价值\n"
-            "          if ! strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
-            "            echo \"ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去\"\n"
-            "            exit 1\n"
-            "          fi\n"
-            "          echo \"STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)\"\n")
+            "          # ★ RODIAG 的存在性随开关走：取证模式必须有，交付模式必须没有\n"
+            "          if [ \"$TEFLON_RODIAG\" = \"1\" ]; then\n"
+            "            if ! strings -a \"$SO\" | grep -qF '[och-ro]'; then\n"
+            "              echo \"ERROR: 产物里找不到 [och-ro] —— RODIAG 没打进去\"\n"
+            "              exit 1\n"
+            "            fi\n"
+            "            echo \"STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)\"\n"
+            "          fi\n")
     elif mode == "delivery":
         # ── 交付版：修复默认开、诊断全关、strip ──
         # 1) 整个 env 块换掉（base 的 env 是取证配置：NNDUMP/KPAT/NO_STRIP=1）
