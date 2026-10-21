@@ -71,41 +71,47 @@ on:
         description: 'Mesa tag（需带 vendored TFLite 头）'
         required: false
         default: 'mesa-26.2.5'
+      mode:
+        description: 'phantomdiag（取证产物：诊断全开、带 DWARF）| delivery（交付产物：修复默认开、诊断全关、strip）'
+        required: false
+        default: 'phantomdiag'
 
 env:
   MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
+  TEFLON_MODE: ${{ inputs.mode || 'phantomdiag' }}
   TEFLON_FIX_V7: '1'
   TEFLON_OCFIX: '1'
   TEFLON_FSGUARD: '1'
   TEFLON_ROFIX: '1'
   TEFLON_PERCHANNEL: '1'
-  TEFLON_NNDUMP: '1'
-  TEFLON_KPAT: '1'
+  TEFLON_PERCHANNEL_DIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
+  TEFLON_NNDUMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
+  TEFLON_KPAT: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ B-diag：两条幻影补丁 + read_outputs 取证（★ ROFIX 必须为 1；取证叠加在 ROFIX 之上，
   #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）
-  TEFLON_PHANTOM_CLAMP: '1'
-  TEFLON_PHANTOM_GATE: '1'
-  TEFLON_RODIAG: '1'
+  TEFLON_PHANTOM_CLAMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
+  TEFLON_PHANTOM_GATE: ${{ inputs.mode == 'delivery' && '1' || '1' }}
+  TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。
-  TEFLON_WDOM_PATCH: '1'
+  TEFLON_WDOM_PATCH: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   # ★ 图输出 NCHW→NHWC 收口（同样运行期 TEFLON_ODETRANS 门控）
-  TEFLON_ODETRANS_PATCH: '1'
+  TEFLON_ODETRANS_PATCH: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   # ★ 显式 std 头文件（纯卫生，无行为变化）
-  TEFLON_STDINC_PATCH: '1'
+  TEFLON_STDINC_PATCH: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   # ★ 舍入模式探针：编进产物，运行期由 TEFLON_ROUNDMODE=0..3 覆盖，
   #   不设 = 与上游逐字节一致。用于实测哪个值等价于 TFLite 的四舍五入。
-  TEFLON_ROUNDMODE_PATCH: '1'
+  TEFLON_ROUNDMODE_PATCH: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ per-channel 权重折叠后的域修复（报告 46）：
   #   signed 分支多减 0x80 ⇒ 非对角权重 0→128 ⇒ 输出饱和到 255。
   #   运行期由 TEFLON_PCDOMAIN 门控，不设 = 与上游逐字节一致。
-  TEFLON_PCDOMAIN_PATCH: '1'
+  TEFLON_PCDOMAIN_PATCH: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   TEFLON_ALIASDIAG: '0'
   TEFLON_CREATEDIAG: '0'
   TEFLON_DIAG: '0'
   TEFLON_WCDIAG: '0'
-  TEFLON_DEBUG_INFO: '1'
-  TEFLON_NO_STRIP: '1'
+  TEFLON_DEBUG_INFO: ${{ inputs.mode == 'delivery' && '0' || '1' }}
+  TEFLON_NO_STRIP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
 
 jobs:
   build:
@@ -1067,11 +1073,19 @@ jobs:
           readelf -sW "$SO" | grep -E 'tflite_plugin_(create|destroy)_delegate'
           # ★ 本构建的**目的**就是带 DWARF：缺 .debug_info 说明开关没生效，
           #   那样崩溃点再变就无法 addr2line —— 等于白跑一轮，必须当场失败。
-          if ! readelf -S "$SO" | grep -q '\.debug_info'; then
-            echo "ERROR: 产物缺 .debug_info —— NO_STRIP/DEBUG_INFO 未生效，无法 addr2line"
-            exit 1
+          if [ "$TEFLON_MODE" = "delivery" ]; then
+            if readelf -S "$SO" | grep -q '\.debug_info'; then
+              echo "ERROR: 交付产物里还有 .debug_info —— NO_STRIP 未生效"
+              exit 1
+            fi
+            echo "STRIP: OK (.debug_info absent)"
+          else
+            if ! readelf -S "$SO" | grep -q '\.debug_info'; then
+              echo "ERROR: 产物缺 .debug_info —— NO_STRIP/DEBUG_INFO 未生效"
+              exit 1
+            fi
+            echo "DWARF: OK (.debug_info present)"
           fi
-          echo "DWARF: OK (.debug_info present)"
           echo "=== .debug_* sections ==="
           readelf -S "$SO" | grep -oE '\.debug_[a-z_]+' | sort -u | tr '\n' ' '; echo
           # FIX_V7 的修复代码在二进制里：grep 的是 **printf 格式串**
@@ -1158,6 +1172,23 @@ jobs:
             fi
             echo "STRING-CHECK: $probe absent (diag switch really off)"
           done
+          if [ "$TEFLON_MODE" = "delivery" ]; then
+            # ★ 交付版的额外门：三个修复的标记**必须在**，诊断/实验标记**必须不在**
+            for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]'; do
+              if ! strings -a "$SO" | grep -qF "$pat"; then
+                echo "ERROR: 产物里缺少 $pat —— 该修复没进二进制，交付产物会带缺陷"
+                exit 1
+              fi
+              echo "STRING-CHECK: $pat PRESENT (fix really in .so)"
+            done
+            for probe in '[och-nn]' '[och-fp]' '[och-pcl]' 'och-patch-v7-phantom-clamp'; do
+              if strings -a "$SO" | grep -qF "$probe"; then
+                echo "ERROR: 产物里出现 $probe —— 诊断/实验开关误开，这不是交付产物"
+                exit 1
+              fi
+              echo "STRING-CHECK: $probe absent"
+            done
+          fi
 
       # ★ ROFIX 改写了 read_outputs 自身 ⇒ 675a1091 的内部偏移与后续函数地址
       #   **按设计作废**（本产物已 strip，没有 DWARF，addr2line 无从谈起）。
@@ -1372,7 +1403,7 @@ jobs:
       - name: Upload artifact (B-diag — FIX_V7+OCFIX+FSGUARD+PERCHANNEL+NNDUMP+KPAT + PHANTOM_CLAMP + PHANTOM_GATE + RODIAG, ROFIX ON + superimposed)
         uses: actions/upload-artifact@v4
         with:
-          name: libteflon-fix-rofix-perchannel-kpat-phantomdiag
+          name: libteflon-${{ inputs.mode == 'delivery' && 'delivery' || 'fix-rofix-perchannel-kpat-phantomdiag' }}
           path: artifact/
           retention-days: 14
           if-no-files-found: error
