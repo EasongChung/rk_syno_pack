@@ -88,11 +88,20 @@ NEW = """         if (tensor->exp_layout == ETNA_ML_LAYOUT_ANY &&
           * 让驱动原有的 detranspose 逻辑自然触发。
           * 运行期门控：TEFLON_ODETRANS=1 才生效。
           */
-         if (getenv("TEFLON_ODETRANS") != NULL &&
+         /* 门控语义（2026-10-21 交付版）：**默认开**，TEFLON_ODETRANS=0 才关。
+          *   不设   -> 修复生效（交付默认）
+          *   =0     -> 关闭（与上游逐字节一致）
+          *   =1/其它 -> 生效**并打印**（调试用）
+          */
+         const char *och_ot = getenv("TEFLON_ODETRANS");
+         int och_ot_on = (och_ot == NULL) || (och_ot[0] != '0');
+         int och_ot_log = (och_ot != NULL) && (och_ot[0] != '0');
+         if (och_ot_on &&
              !etna_ml_find_consumer(poperations, count, poperation->output_tensors[i]->index) &&
              tensor->act_layout == ETNA_ML_LAYOUT_NCHW) {
-            ML_DBG("[och-odetrans] graph output tensor %d NCHW -> expect NHWC.\\n",
-                   poperation->output_tensors[i]->index);
+            if (och_ot_log)
+               ML_DBG("[och-odetrans] graph output tensor %d NCHW -> expect NHWC.\\n",
+                      poperation->output_tensors[i]->index);
             tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;
          }
 """
@@ -116,6 +125,16 @@ def apply(path):
     return 0
 
 
+def _gate_check(text, env, prefix):
+    """门控语义的行为级检查（真编译真跑三种状态）。"""
+    try:
+        from gate_semantics_check import check_gate
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gate_semantics_check import check_gate
+    return check_gate(text, env, prefix)
+
+
 def selftest(mesa_src):
     ok = True
     real = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml.c")
@@ -134,9 +153,14 @@ def selftest(mesa_src):
             print("  [BAD] 正控制：应用到真实源码失败")
             return False
         out = io.open(dst, encoding="utf-8").read()
+        _gate_ok, _gate_msg = _gate_check(out, "TEFLON_ODETRANS", "och_ot")
+        if not _gate_ok:
+            print("        %s" % _gate_msg)
         for cond, desc in [
             (MARKER in out, "标记已写入"),
             ("TEFLON_ODETRANS" in out, "运行期门控存在"),
+            (_gate_ok, "门控语义行为级正确（unset=开且不打印 / =0=关 / =1=开且打印）"),
+
             ("tensor->exp_layout = ETNA_ML_LAYOUT_NHWC;" in out, "只改 exp_layout"),
             (out.count("getenv(\"TEFLON_ODETRANS\")") == 1, "门控只出现一次"),
             ("[och-odetrans]" in out, "C 代码自带产物可查的标记"),

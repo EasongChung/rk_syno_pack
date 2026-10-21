@@ -120,7 +120,9 @@ NEW = """               if (operation->weight_signed) {
                    */
                   int32_t och_requant = (int32_t)round(dequantized / operation->weight_scale);
                   int32_t och_qu = och_requant + operation->weight_zero_point;
-                  if (getenv("TEFLON_PCDOMAIN") != NULL) {
+                  /* 门控语义（2026-10-21 交付版）：**默认开**，TEFLON_PCDOMAIN=0 才关 */
+                  const char *och_pd = getenv("TEFLON_PCDOMAIN");
+                  if (och_pd == NULL || och_pd[0] != '0') {
                      map_out[oc][ic][w][h] = (uint8_t)CLAMP(och_qu, 0, 255);
                   } else {
                      map_out[oc][ic][w][h] = (uint8_t)((int8_t)och_requant +
@@ -234,6 +236,16 @@ int main(void) {
         os.unlink(path)
 
 
+def _gate_check(text, env, prefix):
+    """门控语义的行为级检查（本补丁只有开/关两态）。"""
+    try:
+        from gate_semantics_check import check_gate_simple
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gate_semantics_check import check_gate_simple
+    return check_gate_simple(text, env, prefix)
+
+
 def selftest(mesa_src):
     ok = True
     real_nn = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn.c")
@@ -281,10 +293,15 @@ def selftest(mesa_src):
         if not _compile_ok:
             print('        编译输出: %s' % _compile_msg.strip()[:300])
 
+        _gate_ok, _gate_msg = _gate_check(out, "TEFLON_PCDOMAIN", "och_pd")
+        if not _gate_ok:
+            print("        %s" % _gate_msg)
         for cond, desc in [
             (MARKER in out, "标记已写入"),
             ('getenv("TEFLON_PCDOMAIN")' in out, "运行期门控存在"),
             (out.count('getenv("TEFLON_PCDOMAIN")') == 1, "门控只出现一次"),
+            (_gate_ok, "门控语义行为级正确（unset=开 / =0=关 / =1=开）"),
+
             ("int32_t och_requant" in out, "中间量用 int32（不截断）"),
             ("CLAMP(och_qu, 0, 255)" in out, "夹到 uint8 域 [0,255]"),
             ("- 0x80" in out, "未设门控时保留上游原样（int8 域）"),

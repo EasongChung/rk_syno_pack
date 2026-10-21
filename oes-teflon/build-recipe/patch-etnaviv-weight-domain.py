@@ -82,14 +82,23 @@ NEW = """   operation->weight_tensor = malloc(weight_size);
     *
     * 运行期门控：不设 TEFLON_WDOMAIN 时行为与上游逐字节一致。
     */
-   if (getenv("TEFLON_WDOMAIN") != NULL &&
+   /* 门控语义（2026-10-21 交付版）：**默认开**，TEFLON_WDOMAIN=0 才关。
+    *   不设   -> 修复生效（交付默认）
+    *   =0     -> 修复关闭（与上游逐字节一致）
+    *   =1/其它 -> 修复生效**并打印**（调试用；交付版默认不刷屏）
+    */
+   const char *och_wd = getenv("TEFLON_WDOMAIN");
+   int och_wd_on = (och_wd == NULL) || (och_wd[0] != '0');
+   int och_wd_log = (och_wd != NULL) && (och_wd[0] != '0');
+   if (och_wd_on &&
        poperation->conv.weight_tensor->is_signed &&
        poperation->conv.weight_tensor->scales == NULL) {
       uint8_t *och_wp = (uint8_t *)operation->weight_tensor;
       for (unsigned och_i = 0; och_i < weight_size; och_i++)
          och_wp[och_i] = (uint8_t)(och_wp[och_i] + 128);
-      fprintf(stderr, "[och-wdom] weights shifted +128: size=%u (signed=1 per_tensor=1)\\n",
-              weight_size);
+      if (och_wd_log)
+         fprintf(stderr, "[och-wdom] weights shifted +128: size=%u (signed=1 per_tensor=1)\\n",
+                 weight_size);
    }
 """
 
@@ -115,6 +124,16 @@ def apply(path):
     return 0
 
 
+def _gate_check(text, env, prefix):
+    """门控语义的行为级检查（真编译真跑三种状态）。"""
+    try:
+        from gate_semantics_check import check_gate
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from gate_semantics_check import check_gate
+    return check_gate(text, env, prefix)
+
+
 def selftest(mesa_src):
     ok = True
     real = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn.c")
@@ -133,9 +152,14 @@ def selftest(mesa_src):
             print("  [BAD] 正控制：应用到真实源码失败")
             return False
         out = io.open(dst, encoding="utf-8").read()
+        _gate_ok, _gate_msg = _gate_check(out, "TEFLON_WDOMAIN", "och_wd")
+        if not _gate_ok:
+            print("        %s" % _gate_msg)
         checks = [
             (MARKER in out, "标记已写入"),
             ("TEFLON_WDOMAIN" in out, "运行期门控存在"),
+            (_gate_ok, "门控语义行为级正确（unset=开且不打印 / =0=关 / =1=开且打印）"),
+
             ("scales == NULL" in out, "per-tensor 判据存在"),
             ("is_signed" in out, "signed 判据存在"),
             (out.count("och_wp[och_i] = (uint8_t)(och_wp[och_i] + 128)") == 1,

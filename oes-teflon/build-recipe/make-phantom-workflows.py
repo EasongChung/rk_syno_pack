@@ -31,25 +31,26 @@ import sys
 
 
 def common_rules(suffix):
-    return [
-        (
+    """通用变换。suffix=None 时**不改 workflow 名**（delivery 模式自己改名）。"""
+    rules = []
+    if suffix is not None:
+        rules.append((
             "workflow 名",
             "name: build-teflon-fix-rofix-perchannel-kpat\n",
             "name: build-teflon-fix-rofix-perchannel-kpat-%s\n" % suffix,
-        ),
-        # ★ BUILD-INFO 台账：run 39407410761 / 39407423126 的产物里**没有**记录
-        #   PHANTOM_CLAMP / GATE / RODIAG（只靠编译期标记证明）。开关台账应随产物走，
-        #   否则「这个 .so 到底开了什么」只能靠人回忆。以后每轮必带。
-        (
-            "BUILD-INFO 台账补三个开关",
-            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"\n',
-            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}'
-            ' TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0}'
-            ' TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}'
-            ' TEFLON_RODIAG=${TEFLON_RODIAG:-0}"\n',
-        ),
-    ]
-
+        ))
+    # ★ BUILD-INFO 台账：run 39407410761 / 39407423126 的产物里**没有**记录
+    #   PHANTOM_CLAMP / GATE / RODIAG（只靠编译期标记证明）。开关台账应随产物走，
+    #   否则「这个 .so 到底开了什么」只能靠人回忆。以后每轮必带。
+    rules.append((
+        "BUILD-INFO 台账补三个开关",
+        'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}"\n',
+        'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}'
+        ' TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0}'
+        ' TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}'
+        ' TEFLON_RODIAG=${TEFLON_RODIAG:-0}"\n',
+    ))
+    return rules
 
 ENV_ANCHOR = "  TEFLON_KPAT: '1'\n"
 
@@ -157,6 +158,73 @@ POSITIVE_DIAG = """
 """
 
 
+# ══════════════════════════════════════════════════════════════════
+# 交付版（delivery）：修复**默认开**、诊断/实验全关、strip 过的 .so
+# ══════════════════════════════════════════════════════════════════
+#
+# 与 phantom* 变体的区别：那些是**取证**产物（诊断全开、带 DWARF、不 strip）；
+# 交付版反过来 —— 诊断全关、strip，修复默认生效（产品侧不设任何环境变量）。
+#
+# 开关集合的依据（报告 42/43/44/46）：
+#   开  FIX_V7   v7 calculate_bias_correction 的 depthwise/addition 修复
+#   开  OCFIX    write_core 的 out_channel 钳位（防越界）
+#   开  FSGUARD  不自洽卷积回退 CPU
+#   开  ROFIX    read_outputs 范围对齐 invoke（RODIAG 也依赖它）
+#   开  PERCHANNEL  per-axis 量化的接管门 + 布局契约 + 域修复
+#   开  GATE     out_c%8!=0 的卷积不接管（幻影通道的**兜底**，零挂死风险）
+#   开  WDOM/ODETRANS/PCDOMAIN  三个修复（**门控语义已改成默认开**）
+#   关  NNDUMP/RODIAG/ALIASDIAG/CREATEDIAG/WCDIAG  诊断（体积 + 刷屏）
+#   关  CLAMP    被 GATE 取代（且是那条高危路线）
+#   关  KPAT/FPARTIAL/ROUNDMODE  实验/探针
+#   关  R5GUARD  P0 未做，误命中率未知
+#   开  STDINC   纯卫生（补显式头文件）
+
+DELIVERY_ENV = """env:
+  MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
+  TEFLON_FIX_V7: '1'
+  TEFLON_OCFIX: '1'
+  TEFLON_FSGUARD: '1'
+  TEFLON_ROFIX: '1'
+  TEFLON_PERCHANNEL: '1'
+  TEFLON_PERCHANNEL_DIAG: '0'
+  TEFLON_PHANTOM_GATE: '1'
+  TEFLON_PHANTOM_CLAMP: '0'
+  TEFLON_WDOM_PATCH: '1'
+  TEFLON_ODETRANS_PATCH: '1'
+  TEFLON_PCDOMAIN_PATCH: '1'
+  TEFLON_STDINC_PATCH: '1'
+  TEFLON_ROUNDMODE_PATCH: '0'
+  TEFLON_NNDUMP: '0'
+  TEFLON_KPAT: '0'
+  TEFLON_FPARTIAL: '0'
+  TEFLON_R5GUARD: '0'
+  TEFLON_RODIAG: '0'
+  TEFLON_ALIASDIAG: '0'
+  TEFLON_CREATEDIAG: '0'
+  TEFLON_DIAG: '0'
+  TEFLON_WCDIAG: '0'
+  TEFLON_DEBUG_INFO: '0'
+  TEFLON_NO_STRIP: '0'
+"""
+
+DELIVERY_STRINGS = """          # ★ 交付版的额外门：三个修复的标记**必须在**，诊断/实验标记**必须不在**
+          for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]'; do
+            if ! strings -a "$SO" | grep -qF "$pat"; then
+              echo "ERROR: 产物里缺少 $pat —— 该修复没进二进制，交付产物会带缺陷"
+              exit 1
+            fi
+            echo "STRING-CHECK: $pat PRESENT (fix really in .so)"
+          done
+          for probe in '[och-nn]' '[och-fp]' '[och-pcl]' 'och-patch-v7-phantom-clamp'; do
+            if strings -a "$SO" | grep -qF "$probe"; then
+              echo "ERROR: 产物里出现 $probe —— 诊断/实验开关误开，这不是交付产物"
+              exit 1
+            fi
+            echo "STRING-CHECK: $probe absent"
+          done
+"""
+
+
 def build(base: str, mode: str) -> str:
     src = open(base, encoding="utf-8").read()
     out = src
@@ -170,7 +238,7 @@ def build(base: str, mode: str) -> str:
         out = out.replace(old, new)
         print("  [ok] %s" % label)
 
-    for label, old, new in common_rules(mode):
+    for label, old, new in common_rules(None if mode == "delivery" else mode):
         sub(label, old, new)
 
     if mode == "fix":
@@ -229,6 +297,74 @@ def build(base: str, mode: str) -> str:
             "            exit 1\n"
             "          fi\n"
             "          echo \"STRING-CHECK: [och-ro] PRESENT (RODIAG really in .so)\"\n")
+    elif mode == "delivery":
+        # ── 交付版：修复默认开、诊断全关、strip ──
+        # 1) 整个 env 块换掉（base 的 env 是取证配置：NNDUMP/KPAT/NO_STRIP=1）
+        i_env = out.index("env:\n  MESA_TAG:")
+        j_env = out.index("\njobs:", i_env)
+        out = out[:i_env] + DELIVERY_ENV.rstrip("\n") + out[j_env:]
+
+        sub("workflow 名",
+            "name: build-teflon-fix-rofix-perchannel-kpat\n",
+            "name: build-teflon-delivery\n")
+
+        # 头部说明：base 写的是「交付候选轮 / 数值未验证，NOT DELIVERABLE」，
+        # 交付版必须改口径（否则文档与产物自相矛盾）。
+        sub("头部说明",
+            "# 【交付候选轮 / 数值未验证，NOT DELIVERABLE】四处修复 + per-channel 量化门（UNSTRIPPED）",
+            "# 【交付版】三个修复默认开（per-tensor 权重域 / 图输出收口 / per-channel 域）\n"
+            "#   + 四处安全修复（FIX_V7 / OCFIX / FSGUARD / ROFIX）+ per-channel 门与布局契约\n"
+            "#   + 幻影通道形状门控 GATE（out_c%8!=0 回落 CPU，零挂死风险）\n"
+            "#   诊断与实验开关全关（NNDUMP / RODIAG / ALIASDIAG / CREATEDIAG / WCDIAG\n"
+            "#   / KPAT / FORCE-PARTIAL / ROUNDMODE 探针 / R5GUARD），产物已 strip。\n"
+            "#   ★ 修复的运行期门控语义：**默认开**，TEFLON_WDOMAIN=0 / TEFLON_ODETRANS=0 /\n"
+            "#     TEFLON_PCDOMAIN=0 可单独关掉某一个（设 =1 则额外打印，供调试）。")
+
+        sub("job 名",
+            "name: build libteflon.so FIX_V7+OCFIX+FSGUARD+ROFIX+PERCHANNEL+NNDUMP+KPAT"
+            " (UNSTRIPPED evidence, NOT deliverable)\n",
+            "name: build libteflon.so DELIVERY"
+            " (fixes default-on, diagnostics off, stripped)\n")
+
+        # 2) 产物级字符串检查：加交付版专属的正/反门
+        sub("产物级门：修复标记必须在 / 诊断标记必须不在",
+            "            echo \"STRING-CHECK: $probe absent (diag switch really off)\"\n"
+            "          done\n",
+            "            echo \"STRING-CHECK: $probe absent (diag switch really off)\"\n"
+            "          done\n" + DELIVERY_STRINGS)
+
+        # 3) DWARF 硬门反过来：交付版是 strip 的
+        sub("DWARF 硬门 → strip 硬门",
+            "          if ! readelf -S \"$SO\" | grep -q '\\.debug_info'; then\n"
+            "            echo \"ERROR: 产物缺 .debug_info —— NO_STRIP/DEBUG_INFO 未生效，无法 addr2line\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"DWARF: OK (.debug_info present)\"\n",
+            "          if readelf -S \"$SO\" | grep -q '\\.debug_info'; then\n"
+            "            echo \"ERROR: 交付产物里还有 .debug_info —— NO_STRIP 未生效\"\n"
+            "            exit 1\n"
+            "          fi\n"
+            "          echo \"STRIP: OK (.debug_info absent)\"\n")
+
+        # 4) 上传步骤名 + 产物名
+        sub("上传步骤名",
+            UPLOAD_BASE,
+            "      - name: Upload artifact (DELIVERY — fixes default-on, diagnostics off,"
+            " stripped)\n")
+        sub("产物名", ARTIFACT, "          name: libteflon-delivery\n")
+
+        # 5) BUILD-INFO 台账：把交付版的开关集记进产物
+        sub("BUILD-INFO 台账补交付开关",
+            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}'
+            ' TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0}'
+            ' TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}'
+            ' TEFLON_RODIAG=${TEFLON_RODIAG:-0}"\n',
+            'TEFLON_NO_STRIP=${TEFLON_NO_STRIP}'
+            ' TEFLON_WDOM_PATCH=${TEFLON_WDOM_PATCH:-0}'
+            ' TEFLON_ODETRANS_PATCH=${TEFLON_ODETRANS_PATCH:-0}'
+            ' TEFLON_PCDOMAIN_PATCH=${TEFLON_PCDOMAIN_PATCH:-0}'
+            ' TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}"\n')
+
     elif mode in ("clamp", "gate"):
         # ★★ 为什么必须分开：两个补丁都改「接管/写通道」这条链。
         #   GATE 对 out_c % 8 != 0 的卷积**直接 return false**（回退 CPU），
@@ -305,7 +441,8 @@ def main() -> int:
         print("== 生成 %s ==" % mode)
         text = build(base, mode)
         suffix = {"fix": "phantomfix", "diag": "phantomdiag",
-                  "clamp": "phantomclamp", "gate": "phantomgate"}[mode]
+                  "clamp": "phantomclamp", "gate": "phantomgate",
+                  "delivery": "delivery"}[mode]
         path = os.path.join(outdir, "build-teflon-fix-rofix-perchannel-kpat-%s.yml" % suffix)
         os.makedirs(outdir, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
