@@ -946,6 +946,16 @@ jobs:
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
             else
+              # ★ 有些断言只对**取证变体**成立（CLAMP 等）⇒ 开关关着时跳过，不算失败。
+              #   （交付模式 PHANTOM_CLAMP=0 ⇒ 构建日志里当然没有钳位补丁的消息）
+              case "$pat" in
+                '[3g2/6] 打【修复】幻影通道 out_channel 钳位'|'[phantom-clamp] 已加幻影通道钳位')
+                  if [ "${TEFLON_PHANTOM_CLAMP:-0}" != "1" ]; then
+                    echo "  ok(skipped): $pat（CLAMP 开关关闭）"
+                    continue
+                  fi
+                  ;;
+              esac
               echo "  ERROR: 构建日志里缺少「$pat」"
               ok=0
             fi
@@ -983,6 +993,11 @@ jobs:
           # 否则产物没有 DWARF，崩溃点再变时 addr2line 无从谈起，等于白跑一轮。
           for pat in 'strip：跳过（保留调试段' \
                      '调试信息：开启（-g3）'; do
+            # ★ 交付模式是 **strip** 的（NO_STRIP=0）⇒ 这两条恰恰**不该**出现
+            if [ "${TEFLON_NO_STRIP:-0}" != "1" ]; then
+              echo "  ok(skipped): $pat（交付模式：产物 strip，无调试段）"
+              continue
+            fi
             if grep -qF "$pat" "$L"; then
               echo "  OK(present): $pat"
             else
@@ -1019,6 +1034,16 @@ jobs:
                      '[och-pcdomain]' \
                      'TEFLON_PCDOMAIN' \
                      'TEFLON_WFILL'; do
+            # ★ 交付模式没有这些诊断/探针补丁 ⇒ 它们的标记**本就不该在**产物里。
+            #   （取证模式才是「必须在」⇒ 不跳过）
+            case "$pat" in
+              'och-patch-v7-phantom-clamp'|'[och-ro]'|'[och-ro]   head='|              '[och-ro]   sample '|'[och-wd]'|'[och-td]'|'[och-coef]'|              '[och-roundmode]'|'TEFLON_ROUNDMODE'|'TEFLON_WFILL')
+                if [ "$TEFLON_MODE" = "delivery" ]; then
+                  echo "  ok(skipped): $pat（交付模式无此诊断/探针）"
+                  continue
+                fi
+                ;;
+            esac
             if strings -a "$SO" | grep -qF "$pat"; then
               echo "  OK(positive): $pat"
             else

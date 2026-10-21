@@ -63,6 +63,9 @@ def run(cmd, cwd=None):
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
+LOG = []          # 累积补丁器的 stdout —— 等价于 CI 的构建日志
+
+
 def apply_patch(patcher, target, extra=None):
     args = [sys.executable, os.path.join(BR, patcher), target] + (extra or [])
     r = run(args)
@@ -70,6 +73,7 @@ def apply_patch(patcher, target, extra=None):
         print("  [BAD] 补丁失败 %s -> %s\n        %s"
               % (patcher, os.path.basename(target), (r.stderr or "")[:300]))
         return False
+    LOG.append(r.stdout or "")
     return True
 
 
@@ -100,6 +104,9 @@ def main(argv):
         steps.append(("v7-biasfix", lambda: apply_patch("patch-etnaviv-v7-biasfix.py", ml_v7)))
         steps.append(("ocfix", lambda: apply_patch("patch-etnaviv-outchannel-clamp.py", ml_v7)))
         steps.append(("fsguard", lambda: apply_patch("patch-etnaviv-filter-shape-guard.py", ml)))
+        if sw["TEFLON_PHANTOM_CLAMP"] == "1":
+            steps.append(("phantom-clamp",
+                          lambda: apply_patch("patch-etnaviv-phantom-clamp.py", ml_v7)))
         if sw["TEFLON_PHANTOM_GATE"] == "1":
             steps.append(("phantom-gate", lambda: apply_patch("patch-etnaviv-phantom-gate.py", ml)))
         if sw["TEFLON_ROFIX"] == "1":
@@ -158,6 +165,33 @@ def main(argv):
             print("  [%s] v7 里 '%s' 出现 %d 次 ⇒ %s"
                   % ("ok" if (n == exp_pcl and (n > 0 or tolerated)) else "BAD",
                      pat, n, "grep 有匹配" if n else "grep 会返回 1（必须 || true 容忍）"))
+
+        # 交付模式：产物里**必须**有的标记（照抄 workflow 的正控制清单里
+        #   「交付模式仍要求存在」的那几条）—— 用源码里的字符串近似检查
+        print("\n=== 交付模式：必须存在的标记（源码级近似）===")
+        src_all = mlc + nn + v7      # nn 是 nn.c 的**内容**（ml_nn 是路径）
+        must = ["[och-wdom]", "TEFLON_WDOMAIN",
+                "[och-odetrans]", "TEFLON_ODETRANS",
+                "[och-pcdomain]", "TEFLON_PCDOMAIN",
+                "och-patch-v7-phantom-gate", "[och-rofix]"]
+        for pat in must:
+            present = pat in src_all
+            print("  [%s] %s %s" % ("ok" if present else "BAD", pat,
+                                    "在" if present else "缺（交付产物会缺这个修复！）"))
+            ok = ok and present
+
+        # 构建日志里的消息（workflow 的「Assert both fixes actually applied」查的就是它）
+        print("\n=== 构建日志里必须有的消息（照抄 workflow 的清单）===")
+        log_all = "".join(LOG)
+        log_must = ["[och-fix]", "[och-ocfix]", "[och-fsguard]", "[och-rofix]",
+                    "[perchannel]", "[och-pgate]"]
+        if sw["TEFLON_PHANTOM_CLAMP"] == "1":
+            log_must += ["[phantom-clamp]"]
+        for pat in log_must:
+            present = pat in log_all
+            print("  [%s] %s %s" % ("ok" if present else "BAD", pat,
+                                    "在" if present else "缺（构建日志里没有这条！）"))
+            ok = ok and present
 
         # 交付模式：诊断类字符串**不该**在源码里
         print("\n=== 交付模式：诊断类标记不该出现在源码里 ===")
