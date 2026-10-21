@@ -749,7 +749,9 @@ def representative_dataset(calib_dir, num, float_io, files=None):
     return gen
 
 
-def stage_quant_legacy(sm_dir, out_path, calib_dir, num_calib):
+def stage_quant_legacy(sm_dir, out_path, calib_dir, num_calib,
+                        clean_calib=False, clean_k=3.0, float_onnx=None,
+                        workdir='work'):
     """诊断/备选：旧量化器（experimental_new_quantizer=False）全整型。
 
     背景（实测）：MLIR 新量化器对 0 值 Pad 常量产出退化 scale 1.33e36
@@ -759,8 +761,17 @@ def stage_quant_legacy(sm_dir, out_path, calib_dir, num_calib):
     import tensorflow as tf
     conv = tf.lite.TFLiteConverter.from_saved_model(sm_dir)
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    # ★ 同样接上标定集清洗：离群图会把 MinMax 上界拉爆 ~46 倍
+    #   （实测 legacy 标定只有 cos=0.888 / top1=0.73 ⇒ 门 e 要求 0.98 ⇒ 不可交付）
+    calib_files = None
+    if clean_calib:
+        assert float_onnx and os.path.exists(float_onnx), \
+            'clean_calib 需要 float onnx（%s）' % float_onnx
+        from ort_quant import clean_calib_files
+        calib_files = clean_calib_files(float_onnx, calib_dir, num_calib,
+                                        clean_k, workdir)
     conv.representative_dataset = representative_dataset(
-        calib_dir, num_calib, False)
+        calib_dir, num_calib, False, files=calib_files)
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     conv.inference_input_type = tf.uint8
     conv.inference_output_type = tf.uint8
@@ -1017,7 +1028,9 @@ def main():
     stage_quant_mixed(sm_dir, os.path.join(args.outdir, 'concept_mixed.tflite'),
                       args.calib_dir, args.num_calib)
     leg = stage_quant_legacy(sm_dir, os.path.join(args.outdir, 'concept_legacy.tflite'),
-                             args.calib_dir, args.num_calib)
+                             args.calib_dir, args.num_calib,
+                       clean_calib=args.clean_calib, clean_k=args.clean_k,
+                       float_onnx=float_onnx, workdir=args.workdir)
     print('CONVERT DONE legacy=%s' % leg, flush=True)
     try:
         import transplant as tp
