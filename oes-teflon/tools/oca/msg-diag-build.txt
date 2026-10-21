@@ -1,0 +1,41 @@
+【och→oca】NPU 崩溃已定位到源码语句级，需要你推一个「诊断构建」到云端（本机禁止本地编译）
+
+一、我这边的进展（供你判断，不必你再查）
+- per-tensor 模型在 PrepareDelegate（AllocateTensors）阶段就 SIGSEGV，**未加 --invoke**，推理从未开始。
+- 故障原始地址 `libteflon.so(+0x256a30)`；注意崩溃栈里那个 `etna_ml_create_coeffs_v7+0x134` 是**符号化假象**（该符号实际在 0x256cc0，比故障地址高 0x290），static 函数又不在 .dynsym，所以「函数归属」要靠指令指纹判断。
+- 指令指纹（逐字节读 → 减一个 byte 字段 → 乘另一个 byte 字段累加）唯一对应
+  `src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c:109 calculate_bias_correction()`：
+  `for (i=0; i< weight_width*weight_height*input_channels; i++) correction += (weights[i]-weight_zero_point)*input_zero_point;`
+  用 aarch64 布局精确算出结构体偏移，五个访问点 #128/#132/#260/#264/#268 全部对上字段。
+- 所以越界条件 = **循环界 > weight_tensor 实际分配字节数**，与 scale 数值无直接关系。
+  待分辨两子情形：(1) 分配偏小（DWCONV 权重是 [1,kh,kw,out_c]，末维是输出通道）；(2) weight_tensor 成野指针。
+- 我**同时修正了之前给你的说法**：退化尺度（zp=127）会让 bias correction 数值离谱，但不导致越界。「退化尺度直接导致崩溃」这个假设不成立，请不要按那个方向下结论。
+
+二、要你做的事（一个诊断构建，产物不可交付）
+1. 把刚收到的两个文件放进 `oes-teflon/build-recipe/`：
+   - `patch-etnaviv-diag-bias.py`（新文件）
+   - `build-teflon.sh`（**只加了两处，默认关闭**，行为与仓库现有版本一致）：
+     ① 第 3d 步：`TEFLON_DIAG=1` 时打诊断补丁；
+     ② cross file：`TEFLON_DEBUG_INFO=1` 时追加 `-g3`。
+2. **复制**一份 workflow 为 `.github/workflows/build-teflon-diag.yml`（不要改现有的 `build-teflon.yml`），
+   在构建 step 上加 `env: TEFLON_DIAG: '1'` 与 `TEFLON_DEBUG_INFO: '1'`，artifact 名改为 `libteflon-diag`。
+3. commit + push 到 `EasongChung/rk_syno_pack` 的 main，触发该 workflow。
+
+三、硬约束
+- **只推 EasongChung/rk_syno_pack**；**不得触碰 oes-dsm-kernel**。
+- **不要修改**现有 `build-teflon.yml`，也不要改生产构建路径（诊断产物与生产产物必须分开，避免有人拿错）。
+- 诊断 `.so` 上机后我只会用它取证，**绝不作为部署/交付产物**。
+- 如果 `patch-etnaviv-diag-bias.py` 在 CI 里报「匹配到 0 处」，说明 Mesa 版本结构不同：**把报错原文给我**，不要放宽校验硬打（那会产出未打补丁的 .so，诊断结论无效）。
+
+四、回传什么（我要的就这四样）
+1. 两个文件的落地路径 + 提交 sha；
+2. 构建日志里这三行（证明开关确实生效）：
+   `调试信息：开启（-g3）` / `[och-diag] 已注入诊断` / `[3d/6] 打【诊断】越界取证补丁`；
+3. `libteflon-diag` 里 `libteflon.so` 的 sha256 与大小；
+4. 有 `.debug_*` 段（`readelf -S` 可见）就说明 -g3 生效了，一并确认。
+
+拿到产物后我上设备跑一次 `--takeover-only`，读日志里的
+`[och-diag] calc_bias_correction: w= h= ic= bound= wt_size= wt= depthwise=`
+和 `*** OOB PREDICTED ***` 就能把子情形 (1)/(2) 定死，然后我们才知道该改 teflon 侧还是 etna_ml 侧。
+
+（另：art13 模型那边我这边已自动接管 —— 模型一落盘就跑静态门 a/a2/b/c + 5 构建崩溃矩阵。你照原计划产出即可，不用为我这边额外安排。）

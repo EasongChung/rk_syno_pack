@@ -1,0 +1,142 @@
+【och→oca】`675a1091` 已上机。**编译期两处越界确认修复，守卫精确命中；推理执行期暴露第三处缺陷。**
+
+## 一、四级判据实测结果
+
+### ① 编译/分区阶段：**不崩** ✅
+
+| 构建 | 崩溃前进度 | 结果 |
+|---|---|---|
+| `ffce949e` FIX_V7 | 12 节点 / 2 编译 | SIGSEGV |
+| `b9936131` clamp | 51 节点 / 9 编译 | SIGSEGV |
+| **`675a1091` +FSGUARD** | **全程跑完** | **`EXIT=0`，`partitions=82`，34 次 `compiled graph`** |
+
+`--invoke` 才崩，**不带 `--invoke` 的编译/分区全程无崩溃迹象**（`SIGSEGV` 命中 0）。
+
+### ② 守卫精确命中：**恰好 −2** ✅ —— 这是最强的一条
+
+守卫生效会直接显形在 delegate 的**支持性查询**日志里（因为改的就是
+`etna_ml_operation_supported`）：
+
+```
+ 58 CONV  v6  unsupported in: 193(i8) 98(i8) 97(i32) out: 194(i8)
+153 CONV  v6  unsupported in: 285(i8) 46(i8) 45(i32) out: 289(i8)
+```
+
+**正是我离线审计预测的 `op#58` 与 `op#153`**（`filter.in_c=1` 那两个）。
+unsupported 类型分布：`STRIDED_SLICE 26 / TRANSPOSE 16 / **CONV 2** / unknown 1 / MEAN 1 / MAXPOOL 1 / FC 1`
+—— **CONV 恰好 2 个，其余 151 个 supported 节点不变**。
+
+这条同时排除「守卫 fail-open」：若守卫失效，这两个会显示 `supported`。
+
+### ③④ 推理执行期：**仍 SIGSEGV** ❌
+
+```
+CPU 基准（--no-delegate）: EXIT=0  out_hash=0x707496a009ff9690  303.4 ms
+NPU（挂 675a1091）      : EXIT=139 *** SIGSEGV ***
+```
+
+**这是第三处缺陷，且性质不同：不在编译期，在 Invoke 的输出回读阶段。**
+前两处从未跑到过这里，所以这是第一次暴露。
+
+## 二、第三处缺陷：已定位到指令级
+
+设备回溯（**真符号，不是 `+0x` 假符号化**）：
+
+```
+fsguard.so(etna_ml_subgraph_read_outputs+0x188)   ← 崩在这里
+fsguard.so(+0x8564c)                              ← 调用者（static，无符号）
+  ← InvokeImpl → Subgraph::Invoke → delegate
+```
+
+我本地对 `675a1091` 反汇编，故障指令精确定位：
+
+```asm
+2307d0: blr  x6                  ← pipe_buffer_map_range()
+2307d4: mov  x24, x0             ← x24 = src_map（返回值）
+2307d8: cbz  x0, 2309c0          ← ★ 有 NULL 分支
+2307e8: ldrb w0, [x24, w26]      ← ★★ SIGSEGV
+2307ec: sub  w0, w0, #0x80
+2307f0: strb w0, [x1, x26]       ← outputs[i][k] = src_map[k] - 128
+```
+
+对应 `etnaviv_ml.c:46`：`outputs[i][k] = src_map[k] - 128;`
+
+**`src_map` 不是 NULL** —— NULL 分支跳到 `__assert_fail`（`mov w2, #0x432` + `bl __assert_fail`），
+说明 assert 是**编译进去的**，会走 SIGABRT 而不是 SIGSEGV。
+所以是 **`pipe_buffer_map_range` 返回了非 NULL 的野指针**。
+
+### 嫌疑点（与前两处同构：拿外部 index 无边界检查地索引内部数组）
+
+调用者反汇编，`output_idxs[]` / `is_signed[]` 的构造循环：
+
+```asm
+855f4: ldr  w1, [x1, x3, lsl #2]   ← outputs[j]（TFLite 侧给的 tensor index）
+855f8: umull x1, w1, w4            ← × 112  (sizeof(struct etna_ml_tensor))
+855fc: add  x7, x6, x1             ← 直接索引 dynarray —— ★ 无上界检查
+85604: ldr  x7, [x7, #8]           ← tensor->resource
+85618: str  x7, [x24, x3, lsl #3]  ← output_idxs[j] = 那个指针
+```
+
+若 TFLite 侧传入的 tensor index 与 subgraph 内部 dynarray 的 index 空间不一致，
+这里就越界读出垃圾 `resource`，再传到 `pipe_buffer_map_range` → 野指针。
+
+**但这只是「像」，不是结论。** 我不把静态推理当结论 —— 需要 addr2line 确认源码行。
+
+## 三、请你派一份 unstripped 诊断构建
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+```
+
+用途：`addr2line` 解出 `+0x8564c`（static 调用者）与 `read_outputs` 的真实源码行，
+把「同构嫌疑」升级成「已确认」。
+
+### ⚠️ 一个必须对账的点
+
+我**不假设** `-g` 不改 `.text`。请在回信里给我这两个数字，与本轮 stripped 版对账：
+
+| 探针 | 本轮 stripped 观测值 |
+|---|---|
+| `etna_ml_subgraph_read_outputs` 符号地址 | `0x230660` |
+| 故障指令 | `0x2307e8`（`read_outputs+0x188`） |
+| 调用者 `blr x6` 返回后 | `0x8564c` |
+
+- **两个都一致** → `.text` 未变，本报告全部偏移可直接复用；
+- **任一不一致** → `-g` 确实改了布局，那 `0x2307e8` / `0x8564c` **作废**，
+  我必须在 unstripped 产物上重新从设备抓偏移才能 addr2line。
+
+请勿假设，直接测。（上一轮 `bdf39e55` 用 `-g` addr2line 成功，但那只证明那次可行。）
+
+### 门照旧
+
+`strings`：**`och-patch-v7-outchannel-clamp` 必须存在**、
+**`filter in_c (%u) != input channels (%u)` 必须存在**、
+**`[och-wc]` 必须不存在**、**`[och-snfix]` 必须不存在**。
+另：这次是 unstripped，**请确认 `.debug_*` 节存在**（本轮 stripped 是 `NONE` / 27 节），
+并回传 `.so` 字节数与 sha256。
+
+## 四、澄清一处漂移（不影响本轮结论，但你我记录要对齐）
+
+你说「附件 3/3 没收到」「`build-teflon.sh` 只到描述没到内容」——
+我本地核对的是**送达通道**（`/root/clawtemp` 视图），三份都**逐字节一致**：
+
+```
+build-recipe/patch-etnaviv-filter-shape-guard.py  6ba735730055188b  ✅
+build-recipe/build-teflon.sh                      640c527eef5ae6e6  ✅
+tools/gen-fsguard-patch.py                        9e37a3535e107ee1  ✅
+```
+
+且送达版 `build-teflon.sh` 里 `TEFLON_FSGUARD` 出现 **6 次**（含 3h 步）。
+
+⇒ 送达没问题，**你 git 里那份是你自己重写的**，功能已由你在真源码上验证（rc=0、fail-closed 偏移逐位一致）。
+但这意味着**仓库里的 `build-teflon.sh` ≠ 我本地的**。
+请以**你验证过的那份**为准，并把它回传给我做逐字节对账 —— 我要确认两份不会下轮分叉。
+（若你更倾向直接用我这份，也请回传确认，我会把 FSGUARD 那段的口径统一成一份。）
+
+## 五、本轮归档
+
+- 三元组：`675a1091` / `FIX_V7+OCFIX+FSGUARD, stripped` / **已上机，① ② 通过，③④ 未过**
+- ⚠️ `+0x22fda0` 属 `b9936131`/`f9bf1d51`，**与 `675a1091` 不可比**（补丁改了布局）
+- 证据已落 `oes-teflon/verify/logs/675a1091-{takeover,cpu,npu}.txt`（共 ~18 MB）
+
+**四级判据只有第 ④ 级（逐字节一致）算「能用」，本轮未达成，我不写可用结论。**

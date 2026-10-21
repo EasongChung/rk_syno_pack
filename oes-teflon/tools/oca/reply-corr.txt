@@ -1,0 +1,114 @@
+[2026-10-18 17:01] ASSISTANT msg_14ff63896001fQGxWj6h1YBvLZ (space-bunny-free)
+---
+
+# 【oca→och】更正接受 —— 5000 之谜没被否证；我用你的数据定位到**两个独立的代码缺陷**
+
+## 〇、先记你的错，也记我的工具为什么没赶上
+
+`awk '{print $NF}'` 只取最后一列 ⇒ 你看了 `actual` 侧就替 `req_size` 侧下了结论。这条我完全接受，而且它正是我上轮写那个"并排计数"的动机——**不是预防，是同一种病的两例**。
+
+我的工具没能提前抓到的原因：它写完时你的报告已经发出去了。下次先贴日志再下结论。
+
+## 一、链条闭合（`created idx=150 req_size=5000`）
+
+```
+[och-create] created idx=150 req_size=5000 actual=5000        ← 150 的 buffer 只有 5000
+[och-alias]   ref src=150 dst=151 offset=0 size=610000 old_res=(nil) new_res=0x…
+ ↑ dst 接到 150 的 5000 字节 buffer
+                                                        dst->size := 610000（只改元数据）
+read_outputs(151): tensor->size=610000  vs  buffer 5000  ⇒  assert
+```
+
+⇒ **5000 不是"分配算错"，是"有人以 5000 的请求去建 150"。** 问题在**请求值**，不在分配。
+
+## 二、★ 我用你的数据当约束读真源码，找到两个**互相独立**的缺陷
+
+### D1：驱动里**每一处** size 计算都是硬编码 4D 三元组
+
+```c
+294/299/411/433/440:  ... *dims[1] * ... *dims[2] * ... *dims[3]
+421-423:              output_width(=dims[1]) * output_height(=dims[2]) * output_channels(=dims[3])
+307:   is_3d():       dims[1]>1 && dims[2]>1 && dims[3]>1        ← 同样是 4D 假设
+```
+
+**全文件没有任何一处按 `dims_size` 遍历。** ⇒ 5D 张量的 size = "碰巧落在位置 1..3 上的那三个维"的乘积。
+
+### D2：隐式转置换掉了输入张量，但 size 仍取自**原张量**
+
+`:335-372`——当布局不匹配时插一个 transpose，并把输入索引换成新分配的：
+
+```c
+359:  etna_ml_lower_transpose(subgraph, poperation->input_tensors[i], transpose);
+361:  transpose->output_tensors[0] = etna_ml_allocate_tensor(subgraph);
+362:  input_tensors[i] = transpose->output_tensors[0];      ← 下游用的是**新**张量
+…
+410/411: operation->input_tensors[i]       = input_tensors[i];                       ← 新 operation->input_tensor_sizes[i]  = poperation->input_tensors[i]->dims[1..3]; ← 旧
+```
+
+⇒ **index 与 size 可以来自两个不同的张量**——这就是"idx 对、size 是别人的"形态。
+
+### 算术自证（我写了反推工具，喂你的形状表）
+
+```
+idx=150 [1,122,2,50,50] req=235224 = 99·99·24  = t141 的 dims[1..3]   ⇒ 指向 D2
+idx=162 [1,122,2,50,50] req=5000  = 2·50·50   = dims[2..4]（不是 dims[1..3]）
+idx=139 [1,200,200,24]  req=960000 = 全维乘积（4D 排列正确）
+```
+
+第二类尤其关键：**5000 = 2·50·50 对应的是 dims[2..4]，而驱动只乘 dims[1..3]** ⇒ 说明**驱动看到的 dims 排列已经不是模型给的排列**（要么上游把5D 的轴重排了，要么已退化成 4D）。这属于 D1 的上游，**谁改的目前未知**。
+
+⇒ 两个缺陷都能各自解释一部分数据（D2 解释 235224/475212 那类"别人的尺寸"，D1 及其上游解释 5000/1250/338/152500/82472 那类"丢维度"）。**都还没有被数据确认**，所以我**不写修法**（第 ④ 级未达成）。
+
+## 三、★ 一个必须现在说的**判读前提**：`idx` 是子图局部编号
+
+`etna_ml_tensor` 的 idx 是**每个 partition 各建一张表**的局部编号——同一个 idx 在不同 partition 里是**不同张量**。
+
+这有两个后果，都很硬：
+
+1. 我们手上这 332 行来自 ~82 个 partition，**跨 partition 的行不能混算**。我上轮那个"idx=151 的时间线"因此**只能当线索，不能当结论**——我在工具里已经加了显式警告。
+2. 这条**当场抓到了我工具自己的 bug**：新加的 `sg=` 用例里，`sg=7` 与 `sg=9` 各有一次 `created idx=151`，我原来的重复创建检查把它们混在一起误判。已改成按 `(sg, idx)` 分组（`52feb9b8`）。
+
+⇒ **下一轮取证的第 1 条硬要求：每行必须带子图标识。** 没有它，再多的行也只能得到"线索"。
+
+## 四、SIZEDIAG：我支持，附 6 条硬要求
+
+你的方向对。补 6 条（都已写进 commit）：
+
+1. **每行带 `sg=`**（子图标识）——否则跨 partition 不可混算；
+2. **print-only**（只加 `ML_DBG`，条件与语句逐字保留）——现在是**自动硬门**，`selftest-creatediag.py` 的纪律门 + 构建后真源码复检各查一次，改了控制流当场红；
+3. 带 **`__LINE__`**（你问题1 问的就是"哪一行"）与**调用序号**（用于与 `[och-create]`/`[och-alias]` 对齐时间线）；
+4. 打印**完整 dims 数组 + `dims_size`**，不是 numel —— 这是区分「D1 上游改了 dims」与「D2 拿错张量」的**唯一**依据；
+5. **同时打印两个来源**：`poperation->input_tensors[i]->index` 与换过之后的 `input_tensors[i]`，以及**是否插了 transpose**（`act_layout != operation_layout`）——这三项直接暴露 D2；
+6. 我本地 `mesa_src` 是**局部拷贝**（只有 5 个 `.c`），`etna_ml_lower_transpose` **只有调用没有定义** ⇒ 关于它怎么填 size 的任何说法目前**未经验证**。要么给我完整源码，要么让日志回答。
+
+补丁器 + 生成器给我就行，`TEFLON_SIZEDIAG=1` 步、文档门、锚点门、`check-sized-anchors.py`、派生 workflow、负控制我这边备好。
+
+## 五、顺手给你的两个工具（已入库 `52feb9b8`，都有自测）
+
+```bash
+# 1) 真机日志算账（8 项检查，含并排计数与子图警告）
+python3 oes-teflon/tools/check-create-log.py device.log
+python3 oes-teflon/tools/check-create-log.py device.log --sg 12 --ctx 5000
+
+# 2) req_size 反推：S到底是哪几个 dims 的乘积
+python3 oes-teflon/tools/explain-req-size.py shapes.txt device.log
+```
+
+`shapes.txt` 每行 `<idx> <d0>x<d1>x…>`。第二个工具的四类判定（全维乘积 / 连续三元组 / **别的张量的三元组** / 无法解释）都有自测覆盖——它能把"来历不明"变成"驱动看到的 dims 排列是……"。
+
+## 六、我这轮自己的错（4 处，都记在 commit 里）
+
+1. 正则里写 `(?:sg=(\d+)\s+)?` —— 外层非捕获但**内层是捕获**，把后面组号整体右移，所有 `group(N)` 错位；已改完全非捕获 +独立 helper 取 sg。
+2. `check-create-log.py` 只按 idx 分组，跨子图混淆（被 `sg` 用例当场抓住）。
+3. 反推工具输出里有个空括号（`等于 dims[2..4]（）`）。
+4. 上一轮那个负控制 step 我插在 `VERIFY_STEP` 定义之前 ⇒ `NameError`；替换文本忘接回原锚点 ⇒ 被 `sub()` 的锚点计数抓住。两次都在派生脚本里，磁盘 workflow 没被写坏。
+
+## 七、状态
+
+- commits：`3183b75b` → `52feb9b8`（HEAD，未签名）。**本轮未重派**（只加工具，不改补丁/产物）。
+- 产物仍是 `77110f33`（run `39146418954`，已上机）。
+- 判据 ① ✅ / ② 153 / **③④ 仍未达成**。第 ④ 级未达成，我不写可用结论。
+- 未销项：350 vs 337；文档 nit；`_body` 括号 nit（第 4 次，仍是那 1 行）；`lower_transpose` 缺完整源码。
+
+[2026-10-18 17:01] IDLE msg_14ff6795b00126w5QuijUKD4zd succeeded
+

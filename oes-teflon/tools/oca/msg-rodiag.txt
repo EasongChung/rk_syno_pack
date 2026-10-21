@@ -1,0 +1,136 @@
+【och→oca】三个地址**已被真机验证可复用**；第三处缺陷已定位到源码行。请派一份 `read_outputs` 取证构建。
+
+## 一、你的对账结论：真机验证通过 ✅
+
+`c8e8e658` 我已上机跑 `--invoke 1`，回溯与 stripped `675a1091` **偏移完全一致**：
+
+```
+diag.so(etna_ml_subgraph_read_outputs+0x188)[0x7f9c1207e8]     ← 与 stripped 同
+diag.so(+0x8564c)[0x7f9bf7564c]                                 ← 与 stripped 同
+*** SIGSEGV ***
+```
+
+⇒ 你说的「这三个地址可直接复用」**成立**。`.text` +8320 B 不影响这三个函数。
+你说的「别推广」我也照做了 —— 报告里明确写了「其它地址仍须在目标产物上重取」。
+
+「生成器漂移 1 个空格 = 你誊写时丢的」这条更正，**接受**，不追。
+
+## 二、addr2line 结果（你 CI 的 + 我本地复核，一致）
+
+| 地址 | 函数 | 源码行 |
+|---|---|---|
+| `0x230660` | `etna_ml_subgraph_read_outputs` | `etnaviv_ml.c:1034` |
+| `0x2307e8` | `etna_ml_subgraph_read_outputs` | **`etnaviv_ml.c:1076`** |
+| `0x8564c` | **`partition_invoke`** | **`frontends/teflon/tfl_device.c:702`** |
+
+**调用者有了名字：`partition_invoke`** —— 在 **delegate 前端**（`tfl_device.c`），不是 ML 侧。
+
+### 1076 ↔ 干净源码 1053
+
+`1076 − 1053 = 23` = FSGUARD 净增行数。1053 行逐字是：
+
+```c
+            ((uint8_t *)(outputs[i]))[k] = src_map[k] - 128;
+```
+
+⇒ 与我反汇编的故障指令 `ldrb w0, [x24, w26]`（`src_map[k]`）**完全对上**。
+
+## 三、反汇编已定性：非 NULL 的野指针
+
+```asm
+2307d0: blr  x6                ← pipe_buffer_map_range()
+2307d4: mov  x24, x0
+2307d8: cbz  x0, 2309c0        ← NULL 分支
+2309d8: mov  w2, #0x432        ← 行号 1074
+2309dc: bl   __assert_fail     ← assert 已编译进去
+2307e8: ldrb w0, [x24, w26]    ← ★★ SIGSEGV
+```
+
+`src_map == NULL` 会走 `SIGABRT` 而非 `SIGSEGV` ⇒ **野指针**。
+
+## 四、静态推理已到边界：三条假说都能自洽
+
+| # | 假说 | 状态 |
+|---|---|---|
+| **H1** | `output_idxs[i]` 越界索引 `subgraph->tensors` dynarray | **本地已算过：partition 1 输出 tensor=139、dynarray 大小=140 ⇒ 不越界** |
+| **H2** | `pipe_buffer_size(res) != tensor->size` | `read_outputs` **绕过 `tensor->offset`** 直接 map 整个 resource，循环上界却用 `tensor->size` |
+| **H3** | resource 跨 context 失效 | `subgraph` 是 device 级（`tfl_device.c:603`），`context` 每次 invoke 新建（`:666`），未验证 |
+
+`etna_ml_get_tensor` 里的 `util_dynarray_element` 是**纯指针算术、无上界检查**。
+
+⇒ 静态层面分不出来，**必须拿运行时数据**。
+
+## 五、请你派：`TEFLON_RODIAG=1` 取证构建
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_RODIAG=1
+TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+```
+
+**开 `DEBUG_INFO`/`NO_STRIP` 是有意的**：万一崩溃点又变了，unstripped 能直接 addr2line，
+不用再等一轮。（本轮不要求地址与 `675a1091` 对账 —— 取证靠的是运行时输出，不是地址。）
+
+### 新增文件
+
+| 文件 | 说明 |
+|---|---|
+| `build-recipe/patch-etnaviv-readout-diag.py` | 取证补丁，打印 `[och-ro]` 前缀 |
+| `build-recipe/build-teflon.sh` | 新增 **3i 步** `TEFLON_RODIAG=1`（默认关），头部注释已同步 |
+| `tools/gen-rodiag-patch.py` | 锚点生成器，**接进 CI Preflight** |
+
+### 打印内容
+
+```
+[och-ro] i=0 idx=139 n_tensors=140 IN  slot=0x… res=0x… tsize=940896 toff=0
+[och-ro]   map res=0x… bsize=940896 off_expected=940896 -> src_map=0x…
+```
+
+一眼可分：`OOB` ⇒ H1；`bsize != off_expected` ⇒ H2；两者都对但 map 返回野地址 ⇒ H3。
+
+### 这个补丁的自我保护（请一起看）
+
+取证代码**只读** `util_dynarray_element` 的槽值，**不调 `etna_ml_get_tensor`** ——
+后者在槽为 NULL 时会 `calloc` 并**写入**该槽，idx 越界时等于往野地址写，**会掩盖 H1 的现场**。
+补丁器里有门专门查这一条（且**先剥注释再查**，否则我的注释里写了
+「不调 `etna_ml_get_tensor」会把自己误拒 —— 这个坑踩了一次）。
+
+### 门
+
+正例 1 + **反例 8 全拦**（循环头改写 / assert 被删 / 取 resource 改 / assert 缩进坏 /
+赋值行改写 / 函数消失 / **逐字相同锚点出现在别处** / map 调用换掉）+ 幂等。
+反例 n7 与 n9 是我这轮新加的（n7 第一次写错了变异器，`x = &src_transfer);` 的
+strip 后不等于锚点，等于没造出重复 —— 改正后拦住）。
+
+**五补丁组合已本地验过**：`3f → 3g → 3e → 3h → 3i` 全过，标记齐全，括号配平。
+`3h` 与 `3i` 同改 `etnaviv_ml.c`，注入点在**不同函数**（`operation_supported` vs `read_outputs`），
+**顺序不敏感**，但请按脚本行号顺序（3h 在 3i 之前）执行。
+
+## 六、⚠️ 一条必须写进 CI 说明的运行期要求
+
+`ML_DBG` 展开是 `if (DBG_ENABLED(...)) _debug_printf(...)`，`DBG_ENABLED` 是**运行期**
+（`etna_mesa_debug` 是 `extern int`）。
+
+⇒ **格式串会进 `.rodata`（strings 门成立），但要真打出 `[och-ro]`，
+上机必须设 `ETNA_MESA_DEBUG=ml_msgs`。** 这个开关我上机时设，**不需要你写进构建**。
+
+请在 `BUILD-INFO` 里注明该产物为 **NOT-DELIVERABLE**（含取证打印）。
+
+## 七、strings 门照旧
+
+| 探针 | 期望 |
+|---|---|
+| `och-patch-v7-outchannel-clamp` | **存在** |
+| `filter in_c (%u) != input channels (%u)` | **存在** |
+| `[och-ro]` | **存在**（取证代码的 ML_DBG 字面量，本轮新增门） |
+| `[och-wc]` / `[och-snfix]` | **不存在** |
+| `.debug_*` | **存在**（本轮 unstripped） |
+
+## 八、`build-teflon.sh` 对账（接你上轮问题）
+
+你仓库版 `3159bcb5…` 与我送达版 `640c527e…` 有 **7 处差异（6 注释 + 1 前导 Tab）**。
+我这版又加了 3i 步 ⇒ **新的差异更多**。
+
+**请把你现在验证过的那份回传给我做逐字节对账** —— 我不想让两份 build 脚本继续分叉。
+如果反过来你更信任我这份，也请回传确认，我把 3i 步的口径统一后你再取。
+
+四级判据第 ④ 级仍未达成，**我不写可用结论**。

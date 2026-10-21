@@ -1,0 +1,114 @@
+[2026-10-18 07:05] ASSISTANT msg_14dd40890001gDig8sPxd80Oz5 (space-bunny-free)
+两个文件已落盘并过全部本地门，但**这一轮我同样不触发构建** —— 有两个问题 CI 回答不了，其中一个会让守卫**静默失效**。
+
+## 一、已落盘（本地门全过）
+
+| 项 | 状态 |
+|---|---|
+| `patch-etnaviv-strided-normal-fix.py` | ✅ **已删除**（恒等变换，且从未提交，库里无残留） |
+| `patch-etnaviv-filter-shape-guard.py` | ✅ 新增，6956 字节，逐字落地未改动 |
+| `build-teflon.sh` | ✅ rev9：头部 `TEFLON_FSGUARD` 段 + 3h 步；`典型修复构建` 改为 `FIX_V7=1 OCFIX=1 FSGUARD=1` |
+| 七个开关 | ✅ `FIX_V7 / OCFIX / FSGUARD / DEBUG_INFO / NO_STRIP / WCDIAG / DIAG` 全 `:-0` |
+| 步骤序号 | ✅ `3b 3c 3d 3e 3f 3g 3h` |
+| `sh -n` / `py_compile` / AST 未定义名 / 文档一致性门 / clamp 自检 | ✅ 全过（`RESULT: ALL PASS`） |
+
+我改的只有一处笔误：`[ "${TEFLON_FSGUARD:-0}" = 1 ]` → `= "1"`（与其它六个开关一致）。
+
+---
+
+## 二、⛔ 拦下点 1：`break;` 可能是**静默失效**
+
+你写的是 `break;   /* supported 保持 false */`。这条注释是**对函数结构的假设**，不是事实。若函数是常见形态：
+
+```c
+   switch (operation->type) {
+   case PIPE_ML_OPERATION_TYPE_CONVOLUTION:
+      ...
+      break;              /* ← 注入点 */
+   ...
+   }
+
+   return true;            /* ← break 落到这里 = 仍然「支持」 */
+```
+
+那 `break` 只跳出 `switch`，函数照样返回 `true` ⇒ **守卫完全不生效**：构建成功、我的门全绿、真机继续崩在 `+0x22fda0`。这是比编译报错更糟的结果。
+
+**CI 回答不了这个** —— 两种写法都能编译通过，构建产物看不出区别。只有源码能回答。
+
+**请你给我这段**（`etna_ml_operation_supported` 末尾 ~15 行 + `case PIPE_ML_OPERATION_TYPE_CONVOLUTION:` 到下一个 `case:`/`default:` 的片段）：
+
+```sh
+awk '/^etna_ml_operation_supported/,/^}/' mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c | tail -25
+```
+
+**判据**：
+
+| 看到的形态 | `break` 是否 = 拒绝 |
+|---|---|
+| 尾部是 `return true;`，且 case体内**没有**既有的 `break;` 拒绝惯例 | ❌ **fail-open**，必须改成 `return false;` |
+| 尾部是 `return supported;`，case体内有 `supported = true;` 收尾 | ✅ 正确，现有 `break` 已是拒绝惯例 |
+| 尾部是 `return false;`（default 分支之后统一 return） | ❌ 其它 case 全落空，函数根本不可用 |
+
+---
+
+## 三、⛔ 拦下点 2：`ML_DBG` 在非 debug 构建里被编译掉 ⇒ **你提的 `strings` 门也不成立**
+
+你同时说了两句互相矛盾的话：
+
+> 「FSGUARD 用的是 `ML_DBG` 格式串，那是**真字面量**、编译后一定在 `.rodata`」
+> 「`ML_DBG` 的输出需要 `ETNA_ML_DEBUG` 才会打印」
+
+如果 `ML_DBG` 是 Mesa 常见的这种定义：
+
+```c
+#ifdef DEBUG
+#define ML_DBG(fmt, args...) debug_printf(...)
+#else
+#define ML_DBG(fmt, args...)          /* 空 */
+#endif
+```
+
+**空展开意味着那个格式串根本不进二进制** ⇒ `strings | grep 'filter in_c'` 在交付轮**必然红**。这是同一个陷阱的第三次出现（注释 marker、`[och-wc]`、现在这个）。
+
+**请给我 `etnaviv_ml.h` 里的那行**：`grep -n 'define ML_DBG' mesa/src/gallium/drivers/etnaviv/etnaviv_ml.h`
+
+- 若**未被 `#ifdef DEBUG` 包住** ⇒ 你的 strings 门成立，我照写。
+- 若**被包住** ⇒ 需要一个独立于 `ML_DBG` 的编译期标记。建议沿用 OCFIX 已有的写法，**加在同一个补丁文件里**（不要第二个补丁器打同一个文件，避免顺序耦合）：
+
+```c
+/* och patch: filter 深度与输入通道一致性守卫 */
+__attribute__((used)) static const char och_marker_fsguard[] =
+   "och-patch-filter-shape-guard";
+```
+
+这样 `strings | grep -q 'och-patch-filter-shape-guard'` 就是**真门**，且与 `ML_DBG` 是否编译无关。
+
+---
+
+## 四、连带一条：`接管数 -2` 要按模型全量算，不是崩溃分区算
+
+守卫是**模型全量**生效的（`etna_ml_operation_supported` 对每个卷积都判），而你给的 `op#58 / op#153` 是**崩溃分区**里的两个。
+
+请给**全模型**满足 `filter.dims[3] != input.dims[3]` 且非 depthwise 的算子**总数**。理由：按模型有效性，正常 `CONV_2D` 的 `filter[3] == 输入通道` **恒成立**，所以守卫**只该命中模型非法的那几个**。于是：
+
+| 接管数下降 | 判定 |
+|---|---|
+| 恰好 = 全量不匹配数 | ✅ 守卫精确生效，dims 解读正确 |
+| 明显更多 | ⚠️ dims 顺序/布局解读错了，误杀合法卷积 |
+| **0** | ⚠️ **守卫没生效**（fail-open），**不是回归** |
+| 少 1~2 个 | ⚠️ 审计漏了同型算子 |
+
+因为 `ML_DBG` 在交付轮不打日志，**接管数就是守卫唯一可观测的证据** —— 第 ② 级从「参考项」变成**承重项**。「接管数没降」请一律读作「守卫未生效」。
+
+---
+
+## 五、本轮状态
+
+- ✅ 两个文件已落盘、过门
+- ❌ **未提交、未推送、未触发任何 workflow**（och 那 8 个 netfilter 头文件的改动我也不会带进去）
+- ⏸ 等你回：**① `etna_ml_operation_supported` 尾部结构**（决定 `break` 要不要改成 `return false`）、**② `ML_DBG` 定义那行**（决定 strings 门怎么写）、**③ 全模型不匹配算子数**（把第 ② 级判据钉死）
+
+这三点一到，我改 `build-teflon-fix.yml`（env + `[3h/6]` `[och-fsguard]` 日志断言 + Preflight + 正向/反向 strings 门 + 文档一致性门加 FSGUARD 断言）→ 提交推送 → cancel 顺带触发的生产 workflow → 派发 fix workflow → 回四样。一次到位。
+
+[2026-10-18 07:05] IDLE msg_14dd43bbc001PqQ4VKAgTJuiwp succeeded
+

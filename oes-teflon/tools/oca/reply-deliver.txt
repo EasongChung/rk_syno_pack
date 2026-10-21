@@ -1,0 +1,67 @@
+[2026-10-17 15:00] ASSISTANT msg_14a608e04001fi37u6OUuBHOIy (space-bunny-free)
+下载完成。本地实算 sha256 并与 CI 声明值比对：
+  [tool:shell] {"command": "cd D:\\clawtemp\\oes-teflon-v7fix; Write-Output \"=== Get-FileHash 实算 ===\"; Get-FileHash -Algorithm SHA256 libteflon.so,libdrm.so.2 | ForEach-Object { $_.Hash.ToLower() + \"  \" + (Split-Path $_.Path -Leaf)...
+
+[2026-10-17 15:00] ASSISTANT msg_14a609a930012m8C31jRKCqyf9 (space-bunny-free)
+sha256 **MATCH**。附上 BUILD-INFO 内容：
+  [tool:read] {"path": "D:\\clawtemp\\oes-teflon-v7fix\\BUILD-INFO.txt"}
+
+[2026-10-17 15:00] ASSISTANT msg_14a60a04e001v1JjXhyPo6ynCN (space-bunny-free)
+## 给 och 的回执 —— 三行
+
+### 1️⃣ 落盘目录
+
+```
+D:\clawtemp\oes-teflon-v7fix\
+```
+
+artifact 全量落盘（新建目录，**未覆盖任何既有目录**）：
+
+| 文件 | 大小 (B) |
+|---|---|
+| `libteflon.so` | **11,975,792** |
+| `libdrm.so.2` | 133,896 |
+| `BUILD-INFO.txt` | 510 |
+| `SHA256SUMS` | 237 |
+| `build-diag.log` | 156,403 |
+| `teflon_dlopen` | 70,848 |
+
+### 2️⃣ sha256（本机 `Get-FileHash` 实算，非抄 CI）
+
+```
+ffce949e954c9ef300482364e98580688a0b1631d9b74e8dd9bace0227443e48  libteflon.so
+2d9d3c8d24be2cabf6ff8af026928ffc6b1f7782d4b8f19f859f6a0918a40ab3  libdrm.so.2
+f639159b98798428c5bcaf7a65a5aca7a9b4a35b7895feefcdfc7bde38454079  teflon_dlopen
+```
+
+**`libteflon.so` 与你给的 `ffce949e…e48` 一致**（MATCH 已判定），与 artifact 内 `SHA256SUMS` 三个文件全部一致。
+
+### 3️⃣ 大小
+
+`libteflon.so` = **11,975,792 B**（与你 CI 日志 `-rwxr-xr-x … 11975792` 一致）
+
+---
+
+### 附：`BUILD-INFO.txt` 全文（你复核时可对照）
+
+```
+mesa_tag_env=mesa-26.2.5
+mesa_tag_binary=26.2.5mesa-ddaf85e353-git
+TEFLON_FIX_V7=1  TEFLON_DIAG=0
+teflon_debug_info=1
+target=aarch64 / glibc 2.31 sysroot (Debian bullseye)
+toolchain=aarch64-linux-gnu
+build_date=2026-10-17T13:46:43Z
+```
+
+`mesa_tag_binary` = **`mesa-26.2.5` @ `ddaf85e353`** —— 这是从二进制里 `strings` 出的版本串，**可与你本地 `third_party/mesa-src-26.2.5` 的 `git rev-parse HEAD` 直接比对**。这是第三个「CI 用的确实是同一份 26.2.5 源码」的交叉证据（另两个：fix 补丁匹配到恰好 1 处、diag 补丁锚点也命中）。
+
+### 确认你的两项裁决
+
+- ✅ `TEFLON_NO_STRIP` **不加** —— 脚本零改动
+- ✅ art13 线**不赶工** —— 我这边不动，等你第 ④ 级结论
+
+我只做了「下载 + 校验 + 报数」，**没碰设备、没碰模型线**。你的三级独立复核（sha256 / strings / `nm -D`）请照原计划走，我不代你确认。
+
+[2026-10-17 15:00] IDLE msg_14a60b17a001akXhrPUg1vRujk succeeded
+

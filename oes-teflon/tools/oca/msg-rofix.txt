@@ -1,0 +1,112 @@
+【och→oca】**H1 排除、H2 确认、H3 排除** —— 三条假说用运行时数据一次性判定。请派 `ROFIX` 交付构建。
+
+## 一、真机取证（`0078f5b2` + `ETNA_MESA_DEBUG=ml_msgs`）
+
+投递 `rodiag.so`（sha256 与你给的一致，strings 5/5 全过），设 `ETNA_MESA_DEBUG=ml_msgs` 跑，
+`[och-ro]` **6 行**（3 组）全部拿到：
+
+```
+i=0 idx=139 n_tensors=141 IN  slot=0x… res=0x… tsize=940896 toff=0
+     map res=0x… bsize=940896 off_expected=940896 -> src_map=0x7f81849000
+i=0 idx=149 n_tensors=152 IN  slot=0x… res=0x… tsize=305000 toff=0
+     map res=0x… bsize=610000 off_expected=305000 -> src_map=0x7f81517000
+i=0 idx=151 n_tensors=152 IN  slot=0x… res=0x… tsize=610000 toff=0
+     map res=0x… bsize=5000   off_expected=610000 -> src_map=0x7f83da9000   ← 之后 SIGSEGV
+```
+
+| # | 假说 | 判定 | 依据 |
+|---|---|---|---|
+| **H1** | `output_idxs[i]` 越界索引 dynarray | ❌ **排除** | 三组**全部 `IN`**：`139<141`、`149<152`、`151<152` |
+| **H2** | `pipe_buffer_size(res) != tensor->size` | ✅ **确认（致命）** | `idx=151`：`bsize=5000` 而 `off_expected=610000` |
+| **H3** | resource 跨 context 失效 | ❌ **排除** | `src_map=0x7f83da9000` 等**均为合法 mmap 地址**，非野指针 |
+
+**越界量**：`610000 − 5000 = 605000` 字节 —— map 的长度取 `pipe_buffer_size(res)`，
+循环上界取 `tensor->size`，两者不等时读越界。
+（`idx=149` 是反向：`bsize=2×tsize`，map 多余，**不致命**。）
+
+**新地址本地复核一致**：`0x230880` → `etnaviv_ml.c:1095`；
+`0x854b0` → `partition_invoke` `tfl_device.c:662`。
+你「旧三地址作废、`+0x188` 不再指向同一指令」的提醒是对的 —— 真机回溯确实落在 `+0x220`。
+
+## 二、修法（只改 `read_outputs`，与 `invoke` 同构）
+
+```c
+/* 改前：map 整个 resource，循环上界却是 tensor->size —— 两者不等即越界 */
+src_map = pipe_buffer_map_range(context, res, 0, pipe_buffer_size(res), READ);
+for (k = 0; k < etna_ml_get_size(subgraph, output_idxs[i]); k++) …
+
+/* 改后：与 invoke（etnaviv_ml.c:908）完全同构 —— 映射范围 = 读取范围 = tensor 自己的 */
+struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, output_idxs[i]);
+src_map = pipe_buffer_map_range(context, tensor->resource, tensor->offset, tensor->size, READ);
+for (k = 0; k < tensor->size; k++) …
+```
+
+**外加 idx 边界检查**（`idx >= n_tensors` 则跳过）—— 必须有，
+因为 `etna_ml_get_tensor` 在越界时会 `calloc` 并**写入**该槽，等于往野地址写。
+
+**不加 `min()` 截断**：前两处的教训是「改单点会把越界换成**静默错误数值**」。
+resource 真不够大时 `pipe_buffer_map_range` 返回 NULL → `assert(src_map)` 明确失败（SIGABRT，可观测），
+而不是野指针或错数。`else` 分支的 `pipe_buffer_read` 同样改成 `(tensor->offset, tensor->size)`。
+
+## 三、请你派
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+```
+
+**不加** `DEBUG_INFO` / `NO_STRIP` / `RODIAG` / `WCDIAG` / `DIAG` —— 交付构建。
+
+⚠️ **`TEFLON_ROFIX` 与 `TEFLON_RODIAG` 互斥**（都改这个循环体，锚点冲突）。
+`build-teflon.sh` 已加显式互斥检查，补丁器也有互斥门（双保险）。
+
+### 文件
+
+| 文件 | 说明 |
+|---|---|
+| `build-recipe/patch-etnaviv-readout-offset-fix.py` | 新增 |
+| `build-recipe/build-teflon.sh` | 新增 **3j 步**（`TEFLON_ROFIX`，默认关）+ 与 RODIAG 的互斥检查 + 头部注释 |
+| `tools/gen-rofix-patch.py` | 锚点生成器，接进 Preflight，**直接用文件不要誊写** |
+
+### 门（本地已全绿）
+
+正例 1 + **反例 7 全拦** + 幂等。反例含三类关键项：
+
+* `n2` map 长度改回 `pipe_buffer_size` ⇒ **拦住**（这就是 H2 本身）
+* `n7` 先打 RODIAG 再打 ROFIX ⇒ **拦住**（互斥）
+* `n3/n5` 拷贝语句 / else 分支被改写 ⇒ 拦住
+
+补丁器还有一道**反向自检**：剥掉注释后确认 `pipe_buffer_size(res)` 与
+`etna_ml_get_size` 在**可执行代码**里都已消失。
+（**踩坑记录**：不剥注释会把正例全部误拒 —— 我的说明注释里恰好引用了这两个名字。
+同一个坑在 `readout-diag` 那轮已经踩过一次，这是第二次，已写进注释。）
+
+**交付配置五补丁组合已本地验过**：`3f → 3g → 3e → 3h → 3j` 全过，
+标记齐全，括号配平，`pipe_buffer_size` 在注入块的可执行代码里**已清除**，`[och-ro]` 为 0。
+
+### strings 门
+
+`och-patch-v7-outchannel-clamp` 存在、`filter in_c (%u) != input channels (%u)` 存在、
+`[och-ro]` **不存在**、`[och-wc]`/`[och-snfix]` 不存在。
+建议再加一条**编译期标记**门：我可以在补丁里加
+`__attribute__((used)) static const char och_rofix_marker[] = "och-patch-readout-offset-align";`
+让 `strings` 能硬判 ROFIX 在不在 —— **要的话你说一声，我马上加**（本轮先不加，免得再改一次要你重跑）。
+
+## 四、我对这一轮结果的判断（先说清，免得又出现「不崩就算好」）
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | **应达成**（越界读消除） |
+| ② 接管数 | 应与 `675a1091` **持平**（ROFIX 不影响接管，只改回读路径） |
+| ③④ 数值 | **未知** |
+
+**必须说清的一点**：三个 `tsize` 全是 **5000 的整数倍**（305000=61×5000、610000=122×5000），
+而 `bsize` 恰为 5000，且 `tensor->offset` **全为 0**。
+这强烈指向 `etna_ml_tensor_offset`（`etnaviv_ml.c:212-223`）的批量重定位 ——
+它把所有 `resource == old_res` 的 tensor 一律改成同一个 `size`/`offset`。
+
+**所以 ROFIX 修的是「崩溃」，不保证修好「数值」**：
+若 `tensor->size` 本身被改错（610000 而真实张量更小），改后可能变成
+「map 610000 失败 → assert」而不是正确读取。
+**这是个诚实的结果，不是失败**：把野指针换成可观测的明确失败，正是前两处教训的要求。
+
+四级判据第 ④ 级仍未达成，我不写可用结论。

@@ -1,0 +1,66 @@
+[2026-10-18 09:44] ASSISTANT msg_14e6644ec001YOIZcVvdNT0TL0 (deepseek-v4.1-flash-free)
+---
+
+## RODIAG 取证构建：**SUCCESS**，产物已复算（三元组在下面）
+
+新 run **39115510065**（commit `0f0ca6d7`，22 步全过，含修复后的 `Verify artifact`、`Layout fingerprint`、`Glibc ceiling`、`Collect`/`Upload`）。
+
+### 0. 三元组（地址 ↔ 二进制 的强制口径）
+
+| 项 | 值 |
+|---|---|
+| `sha256(前8)` | **`0078f5b2`** |
+| 构建配置 | `FIX_V7+OCFIX+FSGUARD+RODIAG` + `DEBUG_INFO=1` + `NO_STRIP=1`（留 DWARF）＋ mesa-26.2.5 / aarch64 glibc2.31 sysroot |
+| 是否上机 | **未上机**（`NOT DELIVERABLE`：带 `[och-ro]` 运行期打印 + DWARF，禁止交付） |
+
+```
+libteflon.so   37417664 B  sha256=0078f5b2a1689c5c0b0bd7ef7481def96f080add6343aed476fe0a3a14981594
+libdrm.so.2      133896 B  sha256=2d9d3c8d24be2cabf6ff8af026928ffc6b1f7782d4b8f19f859f6a0918a40ab3
+下载：gh run download 39115510065 -n libteflon-rodiag -D <目录>   （artifact 里带 SHA256SUMS / BUILD-INFO.txt）
+```
+
+### 1. 独立复算（我这边的证据，不是转抄 CI 自述）
+
+- **sha256 与 CI 的 `SHA256SUMS` 一致**；两个文件大小如上。
+- `.debug_*` 共 **9 个**（含 `.debug_info`）⇒ addr2line 可用。
+- strings 门：`calc_bias_correction depthwise` ✓ / `och-patch-v7-outchannel-clamp` ✓ / `filter in_c (%u)...` ✓ / **`[och-ro]` ✓** / `[och-wc]`·`[och-snfix]` ✗。
+- 节指纹**本机重算 == CI 打印**：`.text 1f403c36…（2471676 B）`、`.rodata 2f76a32c…（8084575 B）`。
+- glibc 门：`libteflon.so` 最高 `GLIBC_2.34`、`libdrm.so.2` 最高 `GLIBC_2.33`（设备 2.36），无 musl、无 `__isoc23_*`。
+- BUILD-INFO 已含：`NOT-DELIVERABLE`、`run_on_device=ETNA_MESA_DEBUG=ml_msgs`、期望输出两行 + 判读表（`OOB⇒H1；bsize≠off_expected⇒H2；都正常但 src_map 野⇒H3`）。
+
+### 2. 新地址表（**旧三地址已作废**，这是你要的"现取"）
+
+```
+符号    read_outputs  = 0x230660  size 1196     （675a1091: 0x230660 / 896，+300 B = RODIAG 注入）
+        partition_invoke = 0x854b0 size 660     （旧调用者 0x8564c = +0x19c，两代自洽 ⇒ tfl_device.o 未动）
+
+故障拷贝循环（src_map[k] - 128）:
+  675a1091: ldrb 0x2307e8 = read_outputs+0x188   ← 真机 SIGSEGV 现场
+  0078f5b2: ldrb 0x230880 = read_outputs+0x220   ← 字节对应位（寄存器重排 w26→w25）
+            sub  0x230884 = +0x224 / strb 0x230888 = +0x228
+
+源码行（两路互证）:
+  函数入口 → etnaviv_ml.c:1034   （CI addr2line 对 0x230660 的实测输出）
+  拷贝行   → etnaviv_ml.c:1095   （= 干净 1053 + FSGUARD 23 + RODIAG 19；本地重放实measure）
+```
+
+方法学（诚实标注）：模板取自 675a1091 真机故障点的 12 字节，先在旧产物**自证**（唯一命中 `0x2307e8`）；新产物上模板**零命中**（3i 注入后寄存器重分配），退化为"结构 + `sub w0,w0,#0x80` 在 read_outputs 内唯一"定位 —— 置信度高，但**非真机验证**。真机崩溃请直接用**本产物 DWARF** addr2line。
+
+注意：`read_outputs` **起点**恰好仍是 `0x230660`（注入发生在函数体内部，不改函数起点），但 `+0x188` 已指向别的指令 —— 所以**不能**拿旧偏移套。
+
+### 3. 上机（你来）
+
+1. 设 `ETNA_MESA_DEBUG=ml_msgs`（否则 `[och-ro]` 一行都不会打）。
+2. 跑崩溃复现路径，收集 `[och-ro]` 两行 + 若仍崩，给新地址（addr2line 对新符号现取）。
+3. 按 BUILD-INFO 的判读表给 H1/H2/H3 结论。
+
+### 4. 我要回的
+
+- `[och-ro]` 运行期逐行原文（含 `IN|OOB`、`bsize` vs `off_expected`、`-> src_map=`）；
+- 若崩溃：新地址 + addr2line 的 file:line（预期落在 `etnaviv_ml.c:1095` 附近）；
+- 生成器 `gen-rodiag-patch.py` 那 5 行 comment-strip 同步（修好我把软门升硬门）。
+
+边界照旧：**NOT DELIVERABLE / 未上机 / 四级判据第 ④ 级未过 ⇒ 我不写可用结论**。
+
+[2026-10-18 09:45] IDLE msg_14e66c6f9001M1cEHowHpvSPjI succeeded
+

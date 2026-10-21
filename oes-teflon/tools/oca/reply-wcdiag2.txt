@@ -1,0 +1,85 @@
+[2026-10-17 17:13] ASSISTANT msg_14adade59001sNaJbcXgIJhuyP (space-bunny-free)
+  [tool:shell] {"command": "$log = gh run view 39052586740 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; ($log -split \"`n\") | Where-Object { $_ -match 'OK: |ALL SWITCH|DEBUG-SECTIONS|DEBUG-LINE|STRING-CHECK|^[0-9a-f]{64}\\...
+
+[2026-10-17 17:13] ASSISTANT msg_14adb142c001ufohirXD66045b (space-bunny-free)
+## 给 och —— 四样齐了，**但有一件事必须先说，否则你会把两份数据混起来**
+
+### ⚠️ 0️⃣ 最重要：这一轮的 12 个地址**不是**上次崩溃的地址
+
+同一批数值地址，在两个不同二进制里指向**完全不同的代码**：
+
+| 二进制 | 是否在真机崩过 | `0x256a60` 归属 |
+|---|---|---|
+| `69aeeb34…` / `ffce949e…`（**无 WCDIAG**） | ✅ **崩过，就是它** | `write_core_interleaved` **:345** |
+| `bdf39e55…`（**有 WCDIAG**） | ❌ 没上过机 | `append_bits` **:162**（内联自 `write_core_interleaved:325`） |
+
+**WCDIAG 往 `write_core_interleaved` 里插了约 15 条指令，后面全部后移。** 所以：
+
+> **真机崩溃点的权威归属仍是第一轮那条：`write_core_interleaved` :345。**
+> 本轮的 `:162`/`:325` 是新二进制的信息，**不是崩溃点**。
+
+我上一轮预判过「布局会变、地址可能失效」—— 实际没越界（门没报），但**语义已经换了**，所以这条预判的后果比预想的更隐蔽。
+
+### 1️⃣ 四样交付
+
+| 项 | 值 |
+|---|---|
+| 提交 sha | **`7cb46caa`**（workflow）／`43d0e108`（rev5 脚本 + wcdiag 补丁 + 生成器） |
+| `.so` sha256 | `bdf39e55b56e5c2d9348de82a2e142ea9dacf29a3605d6a840db4bb0f8346cf9` |
+| `.so` 字节数 | **37,415,744** |
+| `.debug_*` | `DEBUG-SECTIONS: PRESENT (.debug_info 已确认)` ＋ `DEBUG-LINE: PRESENT` |
+
+**六行日志断言全过**：
+```
+OK: 调试信息：开启（-g3）
+OK: [3e/6] 打【修复】v7
+OK: [och-fix] 已修复 v7 calculate_bias_correction
+OK: [3f/6] 打【诊断】write_core_interleaved
+OK: [och-wc] 已注入 out_channel 诊断
+ALL SWITCH ASSERTIONS PASSED
+```
+外加二进制门：`STRING-CHECK: [och-wc] present`、`fix printf present`、`OOB warning string present`；`OK: 全部产物符号版本 <= 设备 glibc 2.36`。
+
+CI `39052586740` = **success（14/14 步，含 artifact 上传）**。
+
+### 2️⃣ 本轮 12 个地址的完整归属（`-i` 给出内联链）
+
+`.text = 0x84ab0..0x2e108c`；`write_core_interleaved.isra.0` 起始 **0x256790**
+
+| 地址 | 内层（实际指令所在） | 外层（内联进去的函数） | 距符号 |
+|---|---|---|---|
+| `0x256a30` | `append_bits` :155 | `write_core_interleaved` :325 | +672 |
+| `0x256a4c` | `append_bits` **:162** | :325 | +700 |
+| `0x256a54` | `append_bits` :161 | :325 | +708 |
+| `0x256a58` | — | `write_core_interleaved` :327 (disc 1) | +712 |
+| `0x256a5c` | `append_bits` :160 | :325 | +716 |
+| **`0x256a60`** | **`append_bits` :162** | :325 | +720 |
+| `0x256a64` | `append_bits` :160 | :325 | +724 |
+| `0x256a74` | — | `write_core_interleaved` :385 | +740 |
+| `0x256a78` | — | `write_core_interleaved` :385 | +744 |
+| `0x256a80` | — | `write_core_interleaved` :387 | +752 |
+| **`0x255710`** | **`wb_stream_write` :191**（delta=**0**，就是函数入口） | — | +0 |
+| `0x256cc0` | — | `write_core_interleaved` :356 | +1328 |
+
+**两条与你先前读法相关的事实**（我只报事实，不推断）：
+
+1. **`0x255710` 是 `wb_stream_write` 本身**，不是你当时描述的「每元素调一次 helper」—— 它就是流写入函数。
+2. **`append_bits` 被内联进了 `write_core_interleaved`**（所以 `.isra.0`）。这意味着第一轮 `:345` 那一行若调用了 `append_bits`，**故障指令可能实际在 `append_bits` 内**，而 DWARF 在无 WCDIAG 那版只给了最外层一帧 —— 因为我第一轮用的确实是 `-f -i -C`，它只给一帧说明**那版没有内联帧**。⇒ 「345 行 vs `append_bits`」这个区别，本轮数据**不能**回溯到崩溃那版。
+
+### 3️⃣ 一个现实问题：**你要上机的那个 `.so` 现在是 37 MB**
+
+取 `[och-wc]` 数字必须把这版 WCDIAG 二进制放到设备上，但 37 MB 里 **36.9 MB 是 DWARF，设备根本不需要**。
+
+**我的建议**：在 `Collect artifact` 里多产出一份 **stripped 副本**（同一份二进制，只去掉调试段，代码字节完全相同）：
+
+```
+artifact/libteflon-nodebug.so     ← 约 12 MB，传这个上设备
+artifact/libteflon.so             ← 37 MB，留作 addr2line
+```
+
+传输量回到你已验证过的量级，且**不需要新一轮设计**：用 `aarch64-linux-gnu-strip --strip-unneeded` 从 unstripped 那份剥一份出来，代码不变。
+
+**要我就加吗？** 加的话我只改 `Collect artifact` 一步（不动构建、不动任何开关），跑一轮约 4 分钟。另外我会同时给你新二进制的 `write_core_interleaved.isra.0 = 0x256790` —— 你在新设备上拿到新崩溃偏移后，直接减 `0x256790` 就能知道落在函数内哪个位置，然后我按 `fault_addrs` 输入重新 dispatch 出一行答案，不用再等一轮。
+
+[2026-10-17 17:14] IDLE msg_14adb33f0001diRh0Faxo0aUj5 succeeded
+

@@ -96,7 +96,7 @@ MARKER = "och patch: write_core_interleaved out_channel diagnostics"
 # ↓↓↓ 逐字锚点（由 tools/gen-wcdiag-patch.py 从真实源码提取，勿手改）↓↓↓
 OLD = __OLD__
 NEW = __NEW__
-# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
 
 def main() -> int:

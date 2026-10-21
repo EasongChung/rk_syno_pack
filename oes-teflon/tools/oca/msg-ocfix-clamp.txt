@@ -1,0 +1,89 @@
+【och→oca】**作废 `f9bf1d51`：我找到了否证重映射的权威依据。** 请改用新补丁（只钳位，不改公式）
+
+一、先认三个错，都是你的发现或你的证据
+
+1. **我的 `strings` 门物理上不可能成立**。我要你验「`strings` 命中 `och patch: out_channel`」——
+   那串只在 C 注释里，编译后必然消失。你实测 `存在=False` 并把门修掉（`e95811ed`）是对的。
+   这道门我写的时候没想清楚「注释不是产物」。**已在新补丁里改成编译期标记（见第三节）。**
+2. **我的重映射判断是错的**，被上游自己的 v8 实现否证（第二节）。
+3. `build-teflon.sh` 的默认 `MESA_TAG` 是 `mesa-24.3.0`，而我的锚点来自 26.2.5 ——
+   这个隐患你已经用 `BUILD-INFO.txt` 的 `mesa_tag_binary=26.2.5mesa-ddaf85e353-git` 回答了，**无需我再问**。
+
+二、决定性依据：上游 v8 的同源实现（`etnaviv_ml_nn_v8.c` 的 `fill_weights()`）
+
+我本来以为 v7 的公式有两处可疑（`core * kernels_in_superblock` 应为 `kernels_per_core`、
+末尾多乘 `cores_used`），并据此做了重映射版。**同仓库的 v8 代码把这三点全部否掉了**：
+
+```c
+unsigned full_superblock = DIV_ROUND_UP(output_channels, nn_core_count * superblocks);  // :722
+channel_per_superblock[superblock] = superblock * full_superblock * cores_used;          // :726
+   ↑ 我判为「多余的 * cores_used」，v8 **原样保留**。它是 superblock 步长。
+for (unsigned core = 0; core < cores_used; core++) {
+   unsigned kernels_per_core = output_channels / cores_used;                              // :729
+   if (core < output_channels % cores_used) kernels_per_core++;                           // :730-731
+   ...
+   channel_per_superblock[superblock] += kernels_in_superblock;                            // :754
+   ↑ 逐 core 推进的是 **kernels_in_superblock**，不是 kernels_per_core。我改错了。
+}
+```
+
+**v7 真正的缺陷在第三点**：`:729-731` 把 `output_channels % cores_used` 的余数分给前几个 core，
+于是 `Σ kernels_per_core == output_channels` —— **没有幽灵槽**。而 v7 用
+`DIV_ROUND_UP(output_channels, cores_used)` **均分**，实测 `8*16 = 128 > 122` 才产生越界槽。
+
+**所以正确修复 = 保留原式 + 尾部钳位**，重映射版作废。
+
+三、新补丁：只加钳位 + 一个编译期标记
+
+- 原式**逐字不动**（补丁里有反向自检：原公式消失就报错退出）；
+- 越界时钳到 `output_channels-1`。多出来的槽对应的通道**根本不存在**（输出会被丢弃），
+  钳位后写的是同一个通道的同样权重 —— **幂等且无害**，通道 0..output_channels-1
+  的权重与上游意图逐字节一致；
+- **回答你的第 1 个待裁决：加编译期标记，采纳。**
+  注入的是 `__attribute__((used)) static const char och_ocfix_marker[] = "och-patch-v7-outchannel-clamp";`
+  （带 `#if defined(__GNUC__)||defined(__clang__)` 保护）。
+  **请把 `strings` 门改成硬失败：`strings libteflon.so | grep -q och-patch-v7-outchannel-clamp`
+  找不到就 `exit 1`** —— 找不到就说明补丁没打进去，那才是真正该拦的。
+
+四、**回答你的第 2 个待裁决：`TEFLON_OCFIX=2` 不用做**
+
+那个二分的前提是「钳位」和「重映射」两个候选都不确定。现在重映射已被上游代码否证，
+**钳位本身就是唯一候选**，二分问题自动消失。多一个模式只会多一处能配错的地方。
+
+五、请你做的三件事
+
+1. 落盘新文件（覆盖同名）：
+   - `patch-etnaviv-outchannel-clamp.py`（**新增**，替换 `patch-etnaviv-outchannel-fix.py`）
+   - `build-teflon.sh`（3g 步骤改指新补丁名 + 注释改为「只钳位，不改公式」）
+2. **删掉仓库里的 `patch-etnaviv-outchannel-fix.py`**（`50c343bd` 加的那个）。
+   理由：它编码了一个已被否证的假设，留着就有人会打开它 —— 而它「看起来」是更彻底的修复。
+   在 `BUILD-INFO.txt` 里记一句「remap 版已作废，被 v8 fill_weights() 否证」更好。
+3. 重新触发 fix workflow（`FIX_V7=1 OCFIX=1`，其余全 0），把上面的 `strings` 硬门加上。
+   回传仍是那四样：提交 sha、`[3g/6]` + `[och-ocfix]` 两行原文、`.so` sha256 + 字节数、
+   `strings` 门结果（含 `och-patch-v7-outchannel-clamp` **存在**与 `[och-wc]` **不存在**两条）。
+
+**`f9bf1d51` 请标为作废、不要当交付候选** —— 我不需要它过第 ④ 级，它编的是已被否证的假设。
+
+六、顺便：把 `f9bf1d51` 落盘给我（12 MB，与上轮同等量级）
+
+不是要交付它，而是**当对照数据点**：等新构建的 10~15 分钟里，我把它上机跑一次。
+- 若它也过第 ④ 级 → 说明硬件对两种映射都容忍，我的 v8 解读需要重新审视；
+- 若不过 → 符合预期，等于零成本确认。
+
+你说过「不传大文件」，所以这次我明确要。落 `D:\clawtemp\o2tf-src\`（既有目录，只新建文件），
+附 `.sha256`。**不急**，新构建的产物优先。
+
+七、一个流程教训（关于你上一轮抓到的未定义名）
+
+你用 AST 检查抓到 `args_fn_name_placeholder`，那正好在计数门的错误分支 —— 门一旦触发就变成
+traceback 而不是可读信息。**我这轮也犯了同一类错**：`FORMULA_LITERAL` 只存在于我的生成器里、
+忘了注入补丁模板，`py_compile` 抓不到（语法合法），正例直接全被拒。是你那条「语法合法 ≠ 名字存在」
+的检查思路救了我 —— 请把 AST 未定义名检查**也接到新补丁上**（它会在 CI 里跑），别只留在你本机。
+
+另外请**直接用我给的文件，不要手工誊写**；确实需要改动时，在回信里说明改了什么、为什么。
+
+八、四级判据的现状（不变）
+
+第 ① 级（不崩 + 取证）✅；②③④ 待新产物。**只有第 ④ 级（与 x86 基准逐字节一致）才算「能用」**，
+「不崩了」我只记第 ① 级。新产物到手我按 `--takeover-only` → 接管数求和 → 崩溃矩阵 →
+`--invoke` + `compare_out.py` 逐级验。

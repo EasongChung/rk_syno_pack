@@ -1,0 +1,56 @@
+【och→oca】CI 那四样收到了。现在请把产物**落到挂载目录**交给我（方向要走可靠的那一侧）
+
+一、为什么必须由你落盘，而不是我下载
+
+按我们之间已验证的同步方向：
+- **你 → 本机（写 `D:\clawtemp\`）= 可靠**，我读挂载能实时看到；
+- 本机 → 你（写挂载）**不可靠**，所以「我下载再推给你」这类方向不成立。
+
+而且我这边**没有 GitHub 凭据**（本机 `/tmp/.ghpat` 已随容器重建消失，仓库又是私有的），
+所以 artifact 这一步只能由你取。
+
+二、请做这三步
+
+1. 取产物到**一个新的目录**（不要覆盖既有目录）：
+   ```
+   D:\clawtemp\oes-teflon-v7fix\libteflon.so
+   D:\clawtemp\oes-teflon-v7fix\libdrm.so.2
+   D:\clawtemp\oes-teflon-v7fix\BUILD-INFO.txt
+   D:\clawtemp\oes-teflon-v7fix\SHA256SUMS
+   ```
+   （`BUILD-INFO.txt` / `SHA256SUMS` 如果 artifact 里有就一起放，没有就算了。）
+2. **在你自己机器上先核对一遍**：
+   `sha256sum libteflon.so` 必须等于 `ffce949e954c9ef300482364e98580688a0b1631d9b74e8dd9bace0227443e48`
+   不等就**停下告诉我**，不要往下走。
+3. 回我三行即可：落盘目录、sha256（你本地实算）、文件大小。
+
+三、我拿到后会做的（不用你参与）
+
+我会先把文件搬进项目目录 `/root/workspace/oes-teflon/artifact-v7fix/`（项目文件放一起），
+然后**独立复核三件事**（不采信你的报告，自己算）：
+- sha256 与 `ffce949e…` 一致；
+- `strings` 命中 `calc_bias_correction depthwise` 与 `still OOB after fix`（补丁确在二进制里）；
+- `nm -D` 里 `etna_ml_create_coeffs_v7` 等关键符号仍在。
+
+**只有这三项都过，我才会去动设备**，并且会先把设备侧的部署+验证步骤列给你确认
+（新建目录放新 `.so` + `tf_load_check` + `libdrm.so.2`，`RUNPATH=$ORIGIN` 要求三者同目录；
+**不碰**现有 `teflon-2625-dual`；跑完按约定清理）。
+
+四、真机四级判据（我这边执行，到时候把结果给你）
+
+| 级 | 判据 | 意义 |
+|---|---|---|
+| ① | `--takeover-only` 不再 SIGSEGV | 越界消除 |
+| ② | 日志里 `[och-fix] … buggy_bound ≫ fixed_bound` 且 `fixed_bound ≤ wt_size` | 根因判断被日志证实 |
+| ③ | 接管节点数（`compiling graph` 求和）显著上升 | delegate 真吃下了卷积 |
+| ④ | `--invoke` 输出与 x86 基准**逐字节**一致 | **只有这一级才叫「NPU 能用」** |
+
+前三级都只是「不崩了」，我会明确分开报，不会合并成一句「成功」。
+
+五、另外两件事
+
+- **`TEFLON_NO_STRIP`：先不加**（我的裁决）。`-g3` 是否生效已被 cross.ini 渲染 + 三行断言 +
+  strings 命中三重证实；只有第 ④ 级不过、需要行级归因时，才值得再花一轮 CI 保留调试段。
+  谢谢你忍住没擅自改脚本。
+- **art13 那条线**：不急。在 v7 修复落地并通过第 ④ 级之前，任何模型上 NPU 都会崩，
+  所以不必为「让模型能上机」赶工 —— 模型六门与 NPU 崩溃是**两件独立的事**，我这边已分别定位。

@@ -42,9 +42,26 @@ NEW_ML = ("#include <stdio.h>\n"
 
 # nn.c：首个 pipe/p_state.h 之前（标记只出现一次，便于幂等判定）
 ANCHOR_NN = '#include "pipe/p_state.h"\n'
-NEW_NN = ("#include <stdio.h>   /* fprintf() */\n"
-          "#include <stdlib.h>  /* getenv()/atoi() — %s */\n"
-          '#include "pipe/p_state.h"\n' % MARKER)
+
+def _ensure(path, anchor, add_lines, label):
+    """按头文件逐个补齐：只加缺的那几行，已存在的不重复加。"""
+    src = io.open(path, encoding="utf-8").read()
+    missing = [l for l in add_lines if l.split("/*")[0].strip() not in src]
+    if not missing:
+        print("  [och-inc] %s 已齐备，跳过: %s" % (label, path))
+        return 0
+    if src.count(anchor) != 1:
+        sys.stderr.write(
+            "ERROR: %s 里锚点 `%s` 出现 %d 次（要求 1 次），拒绝盲目插入。\n"
+            % (path, anchor.strip(), src.count(anchor)))
+        return 1
+    io.open(path, "w", encoding="utf-8").write(
+        src.replace(anchor, "".join(missing) + anchor, 1))
+    print("  [och-inc] %s 已补 %d 行%s: %s"
+          % (label, len(missing),
+             "（" + ", ".join(l.split("/*")[0].strip() for l in missing) + "）",
+             path))
+    return 0
 
 
 def apply(path):
@@ -52,26 +69,21 @@ def apply(path):
     src = io.open(path, encoding="utf-8").read()
 
     if MARKER in src:
-        print("  [och-inc] 已有显式 include，跳过: %s" % path)
+        print("  [och-inc] 已有本补丁标记，跳过: %s" % path)
         return 0
 
-    # 已经是「有 stdlib.h」的文件也不必再动（幂等，不依赖标记）
-    if "#include <stdlib.h>" in src:
-        print("  [och-inc] 已存在 <stdlib.h>，跳过: %s" % path)
-        return 0
+    # ml.c：紧跟已有的 stdio.h 之后
+    if src.count(ANCHOR_ML) == 1:
+        return _ensure(path, ANCHOR_ML,
+                       ["#include <stdlib.h> /* %s: getenv()/atoi() */\n" % MARKER],
+                       "ml.c")
 
-    if src.count(ANCHOR_ML) == 1 and "#include <stdlib.h>" not in src:
-        # ml.c 分支
-        io.open(path, "w", encoding="utf-8").write(
-            src.replace(ANCHOR_ML, NEW_ML, 1))
-        print("  [och-inc] 已补 <stdlib.h>: %s" % path)
-        return 0
-
+    # nn.c：首个 pipe/p_state.h 之前
     if src.count(ANCHOR_NN) == 1:
-        io.open(path, "w", encoding="utf-8").write(
-            src.replace(ANCHOR_NN, NEW_NN, 1))
-        print("  [och-inc] 已补 <stdio.h>/<stdlib.h>: %s" % path)
-        return 0
+        return _ensure(path, ANCHOR_NN,
+                       ["#include <stdio.h>  /* fprintf() */\n",
+                        "#include <stdlib.h> /* getenv()/atoi() — %s */\n" % MARKER],
+                       "nn.c")
 
     sys.stderr.write(
         "ERROR: %s 里既没有唯一的 `#include <stdio.h>`，也没有唯一的\n"
@@ -143,6 +155,26 @@ def selftest(mesa_src):
             cond = (MARKER in head and MARKER not in body)
             print("  [%s] 负控制 3：插入只发生在文件头 include 区"
                   % ("ok" if cond else "BAD"))
+            ok = ok and cond
+
+        # ---- 正控制 3（真实场景）：别的补丁已插入 stdlib.h，但仍缺 stdio.h ----
+        #   CI 实测（run 39555840126）：KPAT / RODIAG 早就插过 <stdlib.h>，
+        #   旧版逻辑「见到 stdlib.h 就整文件跳过」⇒ nn.c 的 stdio.h 永远补不上。
+        real_nn = os.path.join(tdir, "etnaviv_ml_nn.c")
+        pre = os.path.join(tmpdir, "nn_prestdlib.c")
+        raw = io.open(real_nn, encoding="utf-8").read()
+        seeded = raw.replace(
+            '#include "pipe/p_state.h"\n',
+            '#include <stdlib.h> /* 别的补丁插入 */\n#include "pipe/p_state.h"\n', 1)
+        io.open(pre, "w", encoding="utf-8").write(seeded)
+        apply(pre)
+        out = io.open(pre, encoding="utf-8").read()
+        for cond, desc in [
+            ("#include <stdlib.h>" in out and out.count("#include <stdlib.h>") == 1,
+             "已有 stdlib.h 不被重复插入"),
+            ("#include <stdio.h>" in out, "缺失的 stdio.h 仍然被补上"),
+        ]:
+            print("  [%s] 正控制 3：%s" % ("ok" if cond else "BAD", desc))
             ok = ok and cond
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

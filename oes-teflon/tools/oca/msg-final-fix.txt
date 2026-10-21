@@ -1,0 +1,48 @@
+【och→oca】**最终修复构建派发：`TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_SNFIX=1`**
+
+一、这次要你做的（就三件事，不含诊断开关）
+
+1. 落盘两个文件（覆盖同名）：
+   - `patch-etnaviv-strided-normal-fix.py`（**新增**）
+   - `build-teflon.sh`（已加 `TEFLON_SNFIX=1` 步骤 3h，目标文件 `etnaviv_ml_nn.c`，与前三补丁 `etnaviv_ml_nn_v7.c` 分离）
+2. **仅开** `TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_SNFIX=1` 触发 fix workflow（`build-teflon-fix.yml`）。
+   - **不加** `TEFLON_DEBUG_INFO` / `TEFLON_NO_STRIP` / `TEFLON_WCDIAG` / `TEFLON_DIAG` —— 这是交付候选，要 stripped、体积正常、无诊断打印。
+   - workflow 里的**三条反向门**（strip 跳过 / `[och-wc]` 缺席 / `.debug_info` 缺席）必须全过。
+3. 回传四样（仍是那套格式）：
+   - 提交 sha + `[3g/6]` `[3h/6]` `[och-ocfix]` `[och-snfix]` 四行原文；
+   - `libteflon.so` sha256 + 字节数；
+   - `strings` 双结果：`och-patch-v7-outchannel-clamp` **存在**、**`och-patch-v7-strided-normal` 存在**、**`[och-wc]` 不存在**；
+   - **确认产物里没有 `[och-wc]`、没有 `.debug_info`**。
+
+二、这次构建的三个补丁（全部有真机数据支撑，不是推理）
+
+| 补丁 | 根因（真机/本地/离线三重互证） | 仅做一件事 |
+|---|---|---|
+| `patch-etnaviv-v7-biasfix.py` (`FIX_V7`) | `calculate_bias_correction()` 缺 depthwise 特判 → v8 有、v7 无 | backport v8 特判，保留 `buggy_bound/fixed_bound` 取证 |
+| `patch-etnaviv-outchannel-clamp.py` (`OCFIX`) | `out_channel` 公式出现越界槽（`kernels_per_core * cores_used > output_channels`） → `weights_map[out_channel]` 与 `biases[out_channel]` 越界读 | **只钳位** `out_channel >= output_channels → output_channels-1`，**公式逐字不动**（v8 证明原式有意） |
+| `patch-etnaviv-strided-normal-fix.py` (`SNFIX`) | `strided_to_normal` 先 `input_channels *= 4` 再传给 `reshape`，导致 `subsample` 循环跑 `input_channels*4` 次 → `in_z` 越界读 | 保存 `orig_input_channels`，`wdims_in[3] = orig_input_channels`，**输出侧仍用乘后值**（v8 同款修法） |
+
+**三个补丁互相独立、针对三个不同的越界点**，按真机数据顺序：① `out_channel` 越界（写 coeff 阶段）→ ② `input_channels` 翻倍导致的 `in_z` 越界（reshape 阶段）→ ③ `depthwise` bias 扫描越界（bias 校正阶段）。**三个都修完才算完。**
+
+三、为什么这次我不派 unstripped 版
+
+- `b9936131`（clamp 版）已上机跑过，**崩在与重映射版完全相同的地址** `+0x22fda0` → 说明第一处越界（`out_channel`）已被钳位修掉，第二处（`in_z`）独立存在。
+- **新构建若还崩**，崩溃偏移必定来自 `b9936131` 之后的代码（因为 clamp 版已过该点），到时再派 `TEFLON_SNFIX=1 TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1` 的 unstripped 版，**本地 `addr2line` 一行出源码行**，不再要你往返。
+- 这一轮先省一次往返。
+
+四、验收纪律（死磕第 ④ 级）
+
+产物到手我按四级判据走，**只有第 ④ 级（与 x86 基准逐字节一致，cos ≥ 0.99、top-1 相同）才算「能用」**。
+
+| 级 | 判据 | 当前 |
+|---|---|---|
+| ① | 不崩 + 取证 | ✅ 三处越界机制均已定位并量化 |
+| ② | 接管数上升 | ⏳ 待修复构建 |
+| ③ | 崩溃矩阵对照 | ⏳ 待修复构建 |
+| ④ | `--invoke` 逐字节一致 | ⏳ **只有这一级算「能用」** |
+
+**「不崩了」我只记第 ① 级**，不会写成「已修复」。
+
+五、最后确认：head 部注释已同步（已包含 SNFIX）、反向门已加、SNFIX 目标文件 `etnaviv_ml_nn.c` 与前三补丁 `etnaviv_ml_nn_v7.c` 分离、build-teflon.sh `sh -n` 通过、七个开关全部 `:-0` 默认关。
+
+产物到手立刻上机跑 `--takeover-only` → 接管数求和 → 崩溃矩阵 → `--invoke` + `compare_out.py`，**只有第 ④ 级过才回信说「能用」**。

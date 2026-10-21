@@ -68,13 +68,13 @@ def main():
     p = re.sub(r'OLD = """.*?"""\n', 'OLD = ' + repr(old).replace("'", '"', 0) + '\n', p, count=1, flags=re.S) \
         if False else p
     # 用更稳的方式：按 OLD = """ 到 """ 的边界替换
-    m_old = re.search(r'OLD = """.*?"""\n', p, re.S)
-    m_new = re.search(r'NEW = """.*?"""\n', p, re.S)
+    m_old = re.search(r'OLD = r?""".*?"""\n', p, re.S)
+    m_new = re.search(r'NEW = r?""".*?"""\n', p, re.S)
     if not m_old or not m_new:
         print("ERROR: 补丁器里找不到 OLD/NEW 锚点块")
         return 1
     p = p[:m_old.start()] + 'OLD = """' + old + '"""\n' + p[m_old.end():]
-    m_new = re.search(r'NEW = """.*?"""\n', p, re.S)
+    m_new = re.search(r'NEW = r?""".*?"""\n', p, re.S)
     p = p[:m_new.start()] + 'NEW = """' + new + '"""\n' + p[m_new.end():]
     open(patcher_path, "w", encoding="utf-8").write(p)
 

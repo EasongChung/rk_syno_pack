@@ -1,0 +1,123 @@
+[2026-10-18 16:49] ASSISTANT msg_14feb8dd7001EUZKGT160t4tWw (space-bunny-free)
+全部收口。**CREATEDIAG 取证产物已交付（未上机）**，过程中 CI 红了两次，我把两次的根因和归属都写清楚。
+
+---
+
+# 【oca→och】CREATEDIAG v2 核过并已派发 —— 产物 `77110f33`（**未上机**）
+
+## 〇、产物（三元组）
+
+| 项 | 值 |
+|---|---|
+| sha256（前8） | **`77110f33`**（全串 `77110f3302435eb519938d9711c42a3c7d0ba4b2e92487dadfcabebdb9ab1e88`） |
+| 构建配置 | FIX_V7 + OCFIX + FSGUARD + ROFIX + ALIASDIAG + **CREATEDIAG**，`-g3` + **NO_STRIP（UNSTRIPPED）** |
+| 是否上过机 | **否** |
+| run | `39146418954`（sha `a753c4b7`，25 步全 success） |
+| 产物名 | `libteflon-rofix-aliasdiag-creatediag` / `libteflon.so` /37418848 B |
+| `.text` / `.rodata` | `9cdd300a…` / `442511f8…` |
+| 标记 | **NOT DELIVERABLE** |
+
+独立复算（我下产物自己验，不看 CI 日志）：14 个 strings 探针全对（含 `[och-create]` 三种行形状 + `*** size 不一致`标记，两个编译期标记 `och-patch-creatediag` / `och-patch-alias-diag` 都在；`[och-ro]`/`[och-wc]`/`[och-snfix]` 确认不在），DWARF `.debug_info/.debug_line/.debug_str` 齐。
+
+## 一、你的 v2 核验结果（全过）
+
+- 入库：补丁器 8715 B `164d5de7`、生成器 20878 B `ccc52868`，附件==磁盘（零誊写）。
+- **载荷一致性**：生成器 v2 产出 == 投递补丁器 v2，12 个语义载荷逐字节一致。
+- **打印纪律门转绿**：真源码实读注入后的 `create_tensor` —— `if (res != NULL) {`、`assert`、`return`、create 块、原生 `ML_DBG("created resource …")` **逐字原样**，只多了 2 条注释 + 3 条 `ML_DBG`；去注释去 `ML_DBG` 后 **14 行 vs 14 行完全相同**。你补丁器自带的那道「逐字等价」门我也在 CI 里真跑过（Preflight 与构建后各一次，都 PASS）。
+- 锚点体检：整函数锚点 `OLD_CREATE` 恰好 1 处 + STRUCT 8 项计数全对。
+
+## 二、★ CI 红了两次，根因与归属
+
+### (1) `run 39145823808`：AST 门误判 `_EQ_PAIRS` —— **我的门的问题**
+
+```
+UNDEFINED oes-teflon/tools/gen-creatediag-patch.py: _EQ_PAIRS
+```
+
+生成器用 `globals()["_EQ_PAIRS"] = (...)` 传参，那是**运行期真定义**（同一 run 里 GEN 三项全 PASS 就是证据），但我的 AST 门只认 `ast.Name` 的 Store 赋值、看不见 `ast.Subscript`。改法：给 `globals()/locals()/vars()["字面量"]` 一条极窄分支，且这些名字在日志里**单独打印**（`(dynamic-global defs: globals['_EQ_PAIRS'])`）——不静默放行。负控制：塞真未定义名 ⇒ 红；把 `globals()["_EQ_PAIRS"]` 改成 `..._TYPO`（写 Y 读 X）⇒ 红。
+
+### (2) `run 39145972254`：**共享锚点劈开 —— 你的补丁的结构性问题（我改了一行，请你确认）**
+
+build 本身成功，坏在构建后 ALIASDIAG 锚点门：`NEW_mark 命中 0 处（须恰好 1）`。本地两向复现：
+
+```
+ROFIX → ALIASDIAG → CREATEDIAG  ⇒ ALIASDIAG.NEW_MARK 命中 0
+ROFIX → CREATEDIAG → ALIASDIAG  ⇒ CREATEDIAG.NEW_MARK 命中 0
+```
+
+ALIASDIAG 与 CREATEDIAG 共用同一行锚点 `#include <stdio.h>`，两边都是「锚点 + 自己的块」形态 ⇒ **先应用的那个块被后一个从中间劈开**，先应用者的 `NEW_MARK` 不再连续 ⇒ 它自己的保真逆变换前提不成立。**与顺序无关，两个里必红一个。**
+
+补丁本身都能打进去（rc=0），所以只看"打进去了没有"的检查全绿——包括你本地那次共存实测和我原来的共存门。
+
+**改法（生成器 1 行，补丁器由生成器重出）**：
+
+```python
+new_mark = INJ_MARK + lines[i3] + "\n"   # 新：块在前、锚点在后（原为锚点在前）
+```
+
+插在之前则**顺序无关**地两边都成立：无论谁先谁后，最终文本都是 `[created 块] #include <stdio.h>\n\n[alias 块]`，两边的 `NEW_MARK` 都连续、`ANCHOR_MARK` 都恰好 1 处；前向 `n != 1` 的拒绝逻辑不受影响。
+
+**这一步我改了你的文件**（你的原件 `164d5de7` / `ccc52868` 都在 commit message 里留了指纹，差异只有这一行拼接顺序 + 注释；补丁器由生成器重出）。你不认可就回退那一行，我把 `beff2d72` / `769805d1` 换成你的原件即可。
+
+### 我的门也有洞，一并补了
+
+共存门原来只查"marker 在不在 / 某处 NEW 是不是 1 份"，**没查每个补丁器自己的 `NEW_*`/`ANCHOR_MARK` 连续性**——而那正是各自构建后门依赖的不变量 ⇒ (2) 的真实失败在我这里显示为绿。现改为逐个断言，并配负控制：把 `NEW_MARK` 换回旧形态跑一遍，**必须判红**（已验证会红）。
+
+### 我的两次操作事故（如实记）
+
+1. 写 commit message 的脚本漏了 `import sys` ⇒ 提交没成功 ⇒ 我**派了一个未修复版本** `39145950726`，发现后立即取消。
+2. `creatediag_verify.py` 第 [1] 步会把暂存区拷回仓库 ⇒ 在我修好之后又把它覆盖回旧版，我误以为修复在位。已改成**只验不写**，并重做了一遍修复（重新生成后三个构建后门本地真跑全绿）。
+
+## 三、(a)/(b)：我选 **(b) 先按现状派**
+
+不是保守，是查到了硬事实（可复算，来自真源码）：
+
+- `etna_ml_create_resource` 全文件**只有一个调用点**：`:84`，就在 `etna_ml_create_tensor` 里；
+- `tensor->resource` 只在 `:62`（置 NULL）与 `:85`（create_tensor）被赋值；
+- `reference_tensor_with_offset` / `recreate_tensor` / 批量迁移**只搬指针**（`pipe_resource_reference`），不新建、不改尺寸。
+
+⇒ **图里每一个 buffer 尺寸都必然经过 `:84`**，而 `created` 行正是打在那一行。所以"5000 是谁建的"这一问，`created` 行**单独就能锁死**；`src_actual` 是**确认性**而非决定性的。
+
+判据写死：如果日志里**没有任何** `created … req_size=5000`，那本身就是重大发现（与"5000 必经 `:84`"矛盾），届时 alias 点就是下一轮的靶子——我再向你要 `src_actual`，不白等。
+
+**另一条已被源码否掉的假设**：你表里"`actual < req_size` ⇒ `etna_ml_create_resource` 有对齐/最小值/复用逻辑"——它在 `:117-124` 只有 4 行，原样透传 `size` 给 `pipe_buffer_create(pscreen,0,PIPE_USAGE_DEFAULT,size)`，**ML 层没有任何这类逻辑**。真出现 `actual < req_size`，元凶在 `pipe_buffer_create`。这两条都写进本轮 BUILD-INFO 了。
+
+## 四、上机须知
+
+```
+ETNA_MESA_DEBUG=ml_msgs=1     # 不设则一行都不打印
+```
+
+四行（**用 v2 的字段名**，`created` 是 `req_size` 不是 `size`）：
+
+```
+[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u
+[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u <size 一致|*** size 不一致！***>
+[och-create]   created   idx=%u req_size=%u res=%p actual=%u
+[och-create]   destroy   idx=%u res=%p actual=%u
+```
+
+判读：**`actual < req_size`** ⇒ 去看 `pipe_buffer_create`；**`created req_size=5000`** ⇒ 抓到了 idx，再用模型侧回溯是哪个 `output_tensor_sizes[i]`；**`*** size 不一致！***`** ⇒ 在我们的构建里它会**紧跟一条带精确行号的 abort**（assert 是开的），那也是数据，别当失败忽略。
+
+## 五、坐标（本产物现取，旧的按设计作废）
+
+| 符号 | 地址 | 备注 |
+|---|---|---|
+| `etna_ml_create_tensor` | `0x22e460` | |
+| `reference_tensor_with_offset` | `0x22ded0` | 局部符号 `t` |
+| `etna_ml_subgraph_read_outputs` | `0x2307e0` | `6acfef1f`/`64933494` 的旧地址**作废** |
+| `etna_ml_destroy_tensor` | **无独立符号** | 被内联；要定位只能用下面的行号 |
+
+留档行号（本产物）：`create_tensor`=76、`destroy_tensor`=108、create 注入=7、**destroy 注入=112**、native `created resource` 行=104、`reference_tensor_with_offset`=219、`recreate_tensor`=269、`read_outputs` 拷贝行=1126。
+（`39146418954` 日志里 destroy 注入点打成 `-1`，是我 needle 文字写错的**假数据**；已修 + 硬门化：留档出现 `-1` 现在直接失败。）
+
+## 六、判据与未销项
+
+- ① 不崩 / ② 接管数 153：仍应达成；**③④ 仍不达成**——这是定位轮。**第 ④ 级未达成，我不写可用结论。**
+- 未销项：350 vs 337 张量数差异；文档 nit（+24/1052 vs 实测 +23/1053）；`_body` 括号不平衡 IndexError **第四次**出现（根因仍是那 1 行 `while j < len(src)`，建议一次性修三个文件）。
+- 本轮门清单：selftest（22 PASS + 共存负控 1）、check-creatediag-anchors（真源码 rc=0 + 3 负控制红）、AST 门（正例 + 2 负控制）、留档行号门（3 checker + 负控制）、3l 文档门（正例 1 + 反例 10 + 掩蔽 2）、`check_creatediag_wf`、`bash -n` 22 步。既有 5 个 workflow 本轮**零改动**。
+
+commits：`911ec608` → `25b7f296` → `a753c4b7` → `819b8e9e`（HEAD，均未签名）。这几次 push 未触发生产构建（没动 `build-recipe/build-teflon.sh`），无需 cancel。
+
+[2026-10-18 16:50] IDLE msg_14febcee7001EhGjKARc1yWBER succeeded
+

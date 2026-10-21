@@ -1,0 +1,85 @@
+[2026-10-17 13:33] ASSISTANT msg_14a11b11900137eD9jXuy0aYUd (deepseek-v4.1-flash)
+## 给 och 的中间报告 —— 发现你投递的脚本里有一个会导致构建失败的 bug（已修）
+
+### 一、第一次 CI（`39036750234`）的真实失败原因
+
+**不是补丁问题，是 heredoc 结构问题。**
+
+```
+ERROR: Malformed machine file: Source contains parsing errors:
+  [line 28]: 'else\n'
+  [line 30]: 'fi\n'
+```
+
+**你把 `DBG_ARGS=""` 和 `if/else/fi` 写在了 `cat > cross.ini <<EOF ... EOF` 的 heredoc 内部**，于是：
+
+- shell 的控制流语法被**当成 cross.ini 的内容**写进了文件
+- meson 解析 cross.ini 时直接报 `Malformed machine file`
+- 而 `ninja` 那步的失败被管道/`||` 掩盖，`Build libteflon.so (DIAG)` 看起来还是 success
+
+**证据**（你的原始代码）：
+
+```sh
+c_args = ['--sysroot=$SR', ${SR_INC_MULTI:+...}]     ← 这行本来就在 heredoc 内
+...
+DBG_ARGS=""                     ← 但也写在 heredoc 内了（在 EOF 之前）
+if [ "${TEFLON_DEBUG_INFO:-0}" = "1" ]; then
+	DBG_ARGS="-g3"
+	echo "    调试信息：开启（-g3）"
+else ...
+fi
+c_args = ['--sysroot=$SR', ${DBG_ARGS:+'$DBG_ARGS',} ...]
+...
+EOF
+```
+
+### 二、修复（`af973314`）
+
+把整段 shell 逻辑**移到 `cat > cross.ini <<EOF` 之前**。逻辑一字未改，只挪位置。
+
+本地用**真实脚本的 heredoc 段**实跑渲染，结果：
+
+```
+调试信息：开启（-g3）
+c_args  = ['--sysroot=/fake/sysroot', '-g3', '-isystem', ...]
+cpp_args = ['--sysroot=/fake/sysroot', '-g3', '-isystem', ...]
+OK c_args 含 -g3
+OK cpp_args 含 -g3
+OK 无 shell 控制流
+关闭时无 -g3
+CROSS-INI PROBE PASSED
+```
+
+**开关开/关两种状态都验证过。**
+
+### 三、另外发现并修掉的一个小问题
+
+你补丁末尾 `print("... ⚠️ ...")` 的 emoji 在 Windows GBK 控制台抛 `UnicodeEncodeError`，导致**注入成功后脚本以 rc=1 退出**（成功被误判成失败）。已改为纯文本 `WARNING:`。CI 是 UTF-8 不受影响。
+
+### 四、我的硬门起作用了
+
+第一轮 `Assert DIAG switches actually took effect` 报 failure 时，我一开始以为是自己断言写错了。**查后发现断言是对的**——`[3d/6]` 和 `[och-diag] 已注入诊断` 都在，缺 `调试信息：开启（-g3）` 恰恰是因为上面那个 heredoc bug 让 echo 落在了错误位置。
+
+**如果没这道硬门，这个构建会以 "success" 结束，然后我们拿着一个 cross.ini 损坏的产物上机，得到零信息。**
+
+### 五、CI `39037044419` 正在跑
+
+出来我给你完整四样：路径+sha / 三行日志原文 / `.so` 的 sha256+大小 / `.debug_*` 段确认。
+
+**一处需要你确认的结构性问题**：`build-teflon-diag.yml` 与生产 `build-teflon.yml` 共用 `build-teflon.sh`，所以每次改这个脚本会**同时触发两个 workflow**（我已手动 cancel 生产那个两次）。是否要把诊断逻辑拆成独立的 `build-teflon-diag.sh` 来彻底隔离？
+
+[2026-10-17 13:34] IDLE msg_14a11cfd4001o41HhkeSrs5WbP succeeded
+
+[2026-10-17 13:36] SYNTHETIC msg_14a11b074001oOyzN2XUhcA8Gk
+
+[2026-10-17 13:36] ASSISTANT msg_14a140fc6001ZlgtnczZmOmQX8 (deepseek-v4.1-flash)
+  [tool:shell] {"command": "gh run view 39037044419 --repo EasongChung/rk_syno_pack --json conclusion,status 2>&1; gh api repos/EasongChung/rk_syno_pack/actions/runs/39037044419/jobs 2>&1 | python3 -c \"import json,sys; d=json.load(sys...
+
+[2026-10-17 13:36] ASSISTANT msg_14a1431a70014oxXfN3EZRFwVE (deepseek-v4.1-flash)
+**巨大进展：编译成功，三道开关断言全通过。** 现在卡在 `Verify artifact + debug sections`——查具体哪项：
+  [tool:shell] {"command": "$log = gh run view 39037044419 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Verify artifact*' }; $lines | Where-Object { $_ -match 'DEBUG-S...
+
+[2026-10-17 13:36] ASSISTANT msg_14a1454540010ueaAbgulhwX2D (deepseek-v4.1-flash)
+`test -f libteflon.so` 失败——**产物根本没生成**。查 build 步骤尾部和 ninja 实际结果：
+  [tool:shell] {"command": "$log = gh run view 39037044419 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Build libteflon.so (DIAG)*' }; $lines | Where-Object { $_ -matc...
+

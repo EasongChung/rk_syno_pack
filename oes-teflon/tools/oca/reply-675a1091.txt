@@ -1,0 +1,121 @@
+[2026-10-18 08:20] ASSISTANT msg_14e18a85f001kld83L65H5PMZp (deepseek-v4.1-flash-free)
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; $env:PYTHONIOENCODING='utf-8'; Write-Output '--- read_outputs 判定 ---'; python3 classify_func_diff.py 2>&1 | Select-Object -Last 8 | Out-String; Write-Output '--- 调用者判定 ---'; python...
+
+[2026-10-18 08:20] ASSISTANT msg_14e18ca7a001FA655iUTPZOS1j (deepseek-v4.1-flash-free)
+已完成本轮全部取证与交付。以下是给 och 的回信正文。
+
+---
+
+## 一、诊断产物（unstripped 孪生，**非交付物**）
+
+| 项 | 值 |
+|---|---|
+| 文件 | `libteflon-fix-diag-c8e8e658.so`（交付目录同步有 `.sha256`） |
+| 字节数 | **37,415,704** |
+| sha256 | `c8e8e6582c8e1f02bff3b4645b240978230d5c2b9a28f785dfafc97b22438726` |
+| 三元组 | `c8e8e658` / **FIX_V7=1 + OCFIX=1 + FSGUARD=1, DEBUG_INFO=1, NO_STRIP=1**（DIAG、WCDIAG 均关） / **未上机** |
+| 来源 | run `39109601672`，commit `42c95807`，workflow `build-teflon-fix-diag.yml` |
+
+门核对（在你的清单上逐条实测，非"应该"）：
+- `.debug_*` **9 个**：`.debug_abbrev .debug_aranges .debug_info .debug_line .debug_line_str .debug_loclists .debug_macro .debug_rnglists .debug_str`
+- strings：`och-patch-v7-outchannel-clamp` ✅ 在、`filter in_c (%u) != input channels (%u)` ✅ 在、`[och-wc]` ✅ 无、`[och-snfix]` ✅ 无
+- 构建日志含 `调试信息：开启（-g3）` 与 `strip：跳过`（这两条在诊断版里是**正向门**，见第六节）
+- 附：`libdrm-c8e8e658.so.2`（133,896 B，`2d9d3c8d24be2cab…`）、`BUILD-INFO-c8e8e658.txt`（头部已标 NOT-DELIVERABLE + layout_check 提示）
+
+## 二、你给的三个地址：实测结论（不是假设）
+
+**都能直接复用**，证据分三层：
+
+1. **`.dynsym` 两版都在**（剥离版能打出函数名就是靠它）：
+
+| | stripped `675a1091` | diag `c8e8e658` |
+|---|---|---|
+| `etna_ml_subgraph_read_outputs` | `0x230660` size **896** | `0x230660` size **896** |
+| `etna_ml_subgraph_invoke` | `0x22fc30` size **2600** | `0x22fc30` size **2600** |
+
+2. **函数体逐字节**：`read_outputs` 的 896 字节里只有 36 字节不同（29 个字），**全部是 adrp / add-imm**——`.rodata` 后移了 `0x2080`（如 `add #0x3c0 → #0x440`，正好 +0x80 页内偏移）。**故障点 `+0x188` 那两条指令两版逐字节相同**：`0x387a4b00`(`ldrb w0,[x24,w26]`) / `0x51020000`(`sub w0,w0,#0x80`)；故障点 ±16 字节内无任何差异字。
+
+3. **调用者** `0x8564c` = **`partition_invoke+0x19c`**（static，剥离版只有裸偏移；`tfl_device.c`）。该函数 660 字节里仅 4 个字不同（同属 adrp/add），`0x85648 = d63f00c0` 正是你写的 `blr x6`，返回点及 ±24 字节全同。
+
+CI 上真实 `aarch64-linux-gnu-addr2line` 的输出（我原样转抄）：
+
+```
+--- 0x230660  etna_ml_subgraph_read_outputs   .../drivers/etnaviv/etnaviv_ml.c:1034
+--- 0x2307e8  etna_ml_subgraph_read_outputs   .../drivers/etnaviv/etnaviv_ml.c:1076
+--- 0x8564c   partition_invoke                .../frontends/teflon/tfl_device.c:702
+nm -n:  000000000022fc30 T etna_ml_subgraph_invoke
+        0000000000230660 T etna_ml_subgraph_read_outputs
+```
+
+⚠️ **别推广**：整体 `.text` 两版并不相同（见下节）。这三个地址我验过了，**其它地址仍须在目标产物上重取**，三元组纪律照旧。
+
+## 三、`.text` 多出 8320 字节：你要求"不许假设 `-g` 不改 `.text`"，实测如下
+
+- `.text`：2,475,340 → **2,483,660**（+8320）；`.rodata` **逐字节完全相同**（8,084,431 B，`ccbce1d6e5cc4365`）；`.data.rel.ro` 变了（内含地址表）。
+- 4,062 个导出符号集合**完全相同**、**每个函数的大小都相同**；只有 **648 个地址**变了。
+- 逐块定位：插入块共 4 处（+4096/+4096/+4096/+128 = 12,416），另有 1 个 4096 块的搬家，净 +8,320。**插入内容是 Mesa 的不可达代码**（落在 `nir_search_op_for_nir_op` / `nir_algebraic_impl` / `nir_lower_all_phis_to_scalar` 之间的 NIR 等），其中一块 1024 个字里 1019 个是 `0`（填充）。
+- 机制解释（**标为解释，不是结论**）：构建日志里 meson 打印 `Checking if "gc-sections" links: YES`，即链接期启用了 `--gc-sections`；`-g3` 把 DWARF 重定位带进链接，使一部分本该被 GC 掉的代码被保留。我没有第三方证据把这条钉死。
+- 影响面：多出来的都在 teflon 路径外，`etna_ml_subgraph_*` 等关键函数地址与指令未变（第二节已逐字节验过）。
+
+若你要更硬的证据，我再出一个 `DEBUG_INFO=0 NO_STRIP=1` 的对照构建把尺寸差一分二（一次 ~3 分钟）；**默认不做**，等你要。
+
+## 四、更正上一轮"生成器漂移"的说法——是我错了
+
+那 1 个空格的差异是**我誊写时丢的**，不是发生器漂移。证据：
+- 用 `tools/gen-fsguard-patch.py` 在真 `mesa-26.2.5` 上重新生成、归一 LF 后，与你送达版**逐字节相同**：`6ba735730055188b…`（8,061 B）。
+- 另外做了"两版补丁是否等价"的实测：把重新生成前后的两版补丁各作用在同一份真源码上，**产出的 C 逐字节相同**（`e061c15f6762f084`，45,682 B）——所以你我不可能因此构建出不同产物。
+- 自测门已从「token 流等价 → WARN」收紧为「**逐字节硬门**（仅容 CRLF/LF）」，1 正例 + 8 反例 + 幂等全过，无 WARN。哈希对账：`gen-fsguard-patch.py` = `9e37a3535e107ee1` ✅ MATCH。
+
+## 五、`build-teflon.sh` 对账：不用你 diff，我这边直接比完了
+
+你那份已经在我这儿（`D:\clawtemp\o2tf-src\build-teflon.sh`，`640c527eef5ae6e6…`，49,938 B，与你说的一致）。
+
+- 与我仓库版（`3159bcb5e32e640f…`，50,407 B）共 **7 处差异：6 处注释 + 1 处前导 Tab**。
+- 那 1 处 Tab 在单引号包住的 awk 程序里（`/^[[:space:]]*option\(…` 行首多一个 Tab），awk 忽略前导空白 ⇒ **无功能影响**。
+- 开关与口径计数全等：`TEFLON_FIX_V7 14/14`、`OCFIX 7/7`、`FSGUARD 6/6`、`DEBUG_INFO 6/6`、`NO_STRIP 4/4`、`DIAG 9/9`、`WCDIAG 5/5`、`[3h/6] 2/2`、`patch-etnaviv-filter-shape-guard.py 1/1`、`op#58 2/2`。
+- 实质分歧只有文档口径：我写成 `filter.in_c`（与 mesa 源码字段名一致，交付文档门按此字面串校验），你那份写的是 `filter 深度`；我还补了 2 行注释（越界点其实在 `map_in` 的步长 `input_channels`，不在 `in_z`；接管数下降 2 是预期行为）。
+- **建议以我仓库版为唯一口径**（你若坚持用你那份，我就把门改成同时接受两种写法）。文件已放：`build-teflon.sh.oca-42c95807`、`build-teflon-fix-diag.yml.oca-42c95807`、`selftest-fsguard.py.oca-42c95807`（各带 `.sha256`）。
+
+免誊写核对用 git blob（HEAD = `42c95807`）：`build-teflon.sh`=`81e3626b51c7`、补丁=`74eac463116d`、生成器=`3e3fe5143834`、自测=`c8583b71e497`。
+
+## 六、`etnaviv_ml.c:46` 对账（请你确认）
+
+构建实际用的树：tag `mesa-26.2.5` 的 raw 文件 = commit `ddaf85e353` 的 raw 文件 = 我本地副本，**42868 B、sha256 `06e6ea229ad57997…` 三方全等**。
+
+该树里 `etna_ml_subgraph_read_outputs` 在 **1008**；打 FSGUARD 后（插入 **23** 行）函数在 **1031**、`assert(src_map)` 在 **1074**、`outputs[i][k] = src_map[k] - 128;` 在 **1076**。
+
+你反汇编里的 `mov w2,#0x432` = **1074**，正好等于 patched 树的 `assert(src_map)` 行号 ⇒ 你的偏移与我们这棵树完全对齐；而 **46 应该是笔误**（CI addr2line 给的是 1076）。
+
+## 七、第三处缺陷：源码级事实（结论我还没到，只报能站住的部分）
+
+**被排除的一支**（你怀疑的"index 越界"）：
+- `etna_ml_subgraph_create` 里 `tensor_count = count_tensors(ops)`，而 `count_tensors` 末尾是 `return tensor_count + 1;`（`etnaviv_ml.c:636`）⇒ dynarray 长度 = max_index+1；
+- `etna_ml_create_tensor` 有 `assert(idx < num_elements)`（`:74`），而 ① 级已跑完 82 分区 / 34 图**没有 abort** ⇒ 分区内所有算子用到的 index 都在界内；分区输出张量必然是分区内某算子的输出 ⇒ `output_idxs[i]` 也在界内。
+- 所以"无上界索引 `subgraph->tensors`"这条，**在编译期就会先炸 assert**，与观测不符。（你那段 `umull ×112` 的循环，源码上对应 `tfl_device.c` 的 `fill_operation` 用 `node->inputs->data[i]` 索引 `delegate->tensors`，而 `pipe_tensor.index` 就是同一个 TFLite 张量号——两套索引空间是同一个。）
+
+**仍然成立的形态**：`map` 成功（所以 `assert(src_map)` 不炸）而 `src_map[k]` 越界 ⇒ 只能是 `etna_ml_get_size(idx) > pipe_buffer_size(res)`，即张量自报 `size` 大于其资源。可疑点（**待验证**，不是结论）：
+- `read_outputs` 映射用的是 `0, pipe_buffer_size(res)`（patched 树 1069–1072 行），**没用 `tensor->offset`**；而写输入的 `:908` 用的是 `tensor->offset, tensor->size` —— 两条路径不对称。若输出张量经 `recreate_tensor`（`:560` 会用 `input_size + …` 重建并改写共享者 size）或 alias 出来，就可能自报 size 与资源不匹配，且从 0 读会读错位置。
+
+要一次定论，需要一份临时带打印的构建（打印每个 output 的 `idx / res / tensor->offset / tensor->size / pipe_buffer_size(res)`）。**要不要我做？**你点头我再做，命名与通道照旧。
+
+## 八、顺手修掉的两个坑（你复现时可能踩到）
+
+1. 交付版 `Assert all fixes` 里那两条是**交付专用**反向门（`strip：跳过`、`调试信息：开启（-g3）` 不得出现）。照抄进诊断版 ⇒ 诊断构建**必然失败**（我这边第一次就是这么挂的）。诊断版已改成**正向门**并加 `OK(present)` 断言，`[och-wc]` 的反向门保留。
+2. `v7 biasfix` preflight 的临时文件读写加了显式 UTF-8，避免非 UTF-8 locale 下把正常构建误判为失败。
+
+## 九、归档三元组
+
+| 文件 | 字节 | sha256(前8) | 构建配置 | 上机 |
+|---|---|---|---|---|
+| `libteflon-fix-diag-c8e8e658.so` | 37,415,704 | `c8e8e658` | 3 补丁 + `-g3` + NO_STRIP | **否**（NOT DELIVERABLE） |
+| `libdrm-c8e8e658.so.2` | 133,896 | `2d9d3c8d` | 同上 | 否 |
+| `libteflon-fix-v7-ocfix-fsguard-675a1091.so` | 11,975,792 | `675a1091` | 3 补丁 stripped | 是（①②过，③④未过） |
+
+我同时把 `675a1091` 的 `.sha256` 头部更新为「① 通过 / ② 通过 / ③④ 未过」+ 真机崩溃点（`read_outputs+0x188`）与调用者（`partition_invoke+0x19c` / `tfl_device.c:702`）。**下一轮上机若还要用带 FSGUARD 的版本，请用 `675a1091`（或后续交付版），不要用 `c8e8e658`。**
+
+---
+
+需要你回一句话的三件事：① 诊断产物三元组是否照收；② `-g3`/GC 那条要不要我再出 `DEBUG_INFO=0` 对照构建钉死；③ 第七节的"带打印临时构建"要不要做。
+
+[2026-10-18 08:21] IDLE msg_14e1997a50017ias86apUP49a6 succeeded
+

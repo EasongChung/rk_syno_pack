@@ -1,0 +1,84 @@
+[2026-10-18 12:40] ASSISTANT msg_14f075ed2001h7b86HfKD1d0nc (space-bunny-free)
+构建成功、产物复算全部通过。以下是给 och 的完整回信。
+
+---
+
+## 一、三件套身份（逐字节，**未做任何誊写**）
+
+och 这次是用**会话附件**投递的，我直接从会话库解码附件 base64 落盘，因此不存在我手抄漂移的问题（这也是我处理新投递的首选路径）：
+
+| 文件 | 字节 | sha256（前16） | 备注 |
+|---|---|---|---|
+| `build-recipe/patch-etnaviv-readout-offset-fix.py` | 9404 | `015ed8d41695b0ec` | 与附件解码结果 EQUAL |
+| `build-recipe/build-teflon.sh` | 57271 | `445b271dfadaea07` | 旧版 `7cef0dd2…`/53473 B，**+65/−0** |
+| `tools/gen-rofix-patch.py` | 14802 | `4a10e64547ffedf4` | **首发与「重发」同字节**（我比过了，不是两次不同版本） |
+
+`build-teflon.sh` 的 +65 行只有三处：① 头部 ROFIX 文档块；② 一行「本轮修复构建」示例；③ 3j 步整块（互斥检查 + 补丁器调用 + fail-closed）。`bash -n` 退出 0。3j 位于 3i 之后 ⇒ 双开时先打 3i 再由 3j 报错中止（fail-closed），补丁器层另有第二道互斥门。
+
+## 二、已派发并构建成功
+
+- **run `39128038174`**（`build-teflon-fix-rofix`，workflow_dispatch，commit `d2ab1d7b`），**SUCCESS，3m4s，22 步全绿**。
+- 新 workflow `build-teflon-fix-rofix.yml` 由 `build-teflon-fix.yml` **程序化派生**（17 处替换，带锚点计数校验），`build-teflon-fix.yml` **一字未动**（校验器专门查了）。
+- 开关：`FIX_V7=1 OCFIX=1 FSGUARD=1 ROFIX=1`，`DEBUG_INFO/NO_STRIP/DIAG/WCDIAG/RODIAG` 全 0。
+- 顺带触发的生产 `build-teflon.yml`（run `39128022614`）已 cancel。
+
+## 三、产物（供你上机）
+
+| 项 | 值 |
+|---|---|
+| **三元组** | **`6acfef1f` / `FIX_V7+OCFIX+FSGUARD+ROFIX+stripped` / 未上机** |
+| artifact | `libteflon-fix-rofix`（run 39128038174） |
+| `libteflon.so` | 11975792 B，sha256 `6acfef1f29bcae00…` |
+| `libdrm.so.2` | 133896 B，sha256 `2d9d3c8d24be2cab…`（与历轮一致，未变） |
+| `.text` | 2475612 B，`b1216b587b4729b0…` |
+| `.rodata` | 8084495 B，`c6bb4b619ef307e7…` |
+| glibc 上界 | libteflon 2.34 / libdrm 2.33（设备 2.36）✓ |
+| 构建后源码行号 | `read_outputs` 入口 **1031**、拷贝行 **1102** |
+
+以上 .so 字节数/三段哈希我在本机用纯 Python ELF 解析**复算过一遍，与 CI 日志逐项一致**（复算脚本先在上一轮 RODIAG 产物上空跑验证过解析器正确：`.text 2471676/1f403c36…`、`.rodata 8084575/2f76a32c…` 与历史归档吻合）。strings 门本地独立复核：`[och-rofix]`/`filter in_c`/`och-patch-v7-outchannel-clamp`/`[och-fix]…` **都在**，`[och-ro]`/`[och-wc]`/`[och-snfix]` **都不在**，无 `.debug_*`。
+
+## 四、我的核验（全部实跑）
+
+1. **载荷一致性**：生成器（本地路径替换）对真源码重跑，输出与你的补丁器 **LF 归一后逐字节相等**，MARKER/DIAG_MARKER/STRUCT/OLD/NEW 全同 ⇒ 你重跑生成器不会覆盖出坏版本。
+2. **`selftest-rofix.py`（新写，CI Preflight）**：1 正例 + **13 反例** + 幂等 + 生成器一致性，ALL PASS。反例含你的 n1–n8，另加：`n9` 同形微变（`}  else {` 双空格）专打**字节级锚点门**、`n10` 把 map 长度真改回 `pipe_buffer_size(res)`（H2 本体）、`n11` 上界改回 `etna_ml_get_size`、`n12` 注入 RODIAG 标记。
+3. **真源码五补丁组合**（3g→3e→3h→3j）逐步 rc=0；ROFIX/FSGUARD 顺序无关性也通过。
+4. **`check-rofix-anchors.py`（新写，构建后真源码锚点门）**：逆变换→生成器重抽→5 载荷逐字节一致→生成器产物正例，CI 上 PASS，行号 1031/1102 与我本地重放**完全一致**（算术自洽：干净 1053 +FSGUARD 23 = 1076，ROFIX 净增 26 = 1102）。
+5. **双向互斥实测**：RODIAG→ROFIX 给互斥专有报错；ROFIX→RODIAG 由 STRUCT 计数 0 拦住（RODIAG 补丁器没有反向标记检查，但 fail-closed，成立）。
+6. **语义对照真源码**：`invoke:908` 确为 `pipe_buffer_map_range(pctx, tensor->resource, tensor->offset, tensor->size, …)` + `else` 分支 `pipe_buffer_write(…offset, size…)`，你的改法是严格读写镜像；`etna_ml_get_size` ≡ `tensor->size`（循环上界改写是**精确等价**）；`etna_ml_get_tensor` 槽空时 `calloc` 并写回 ⇒ 越界确实写野地址，边界检查必须有；`util_dynarray_num_elements(&subgraph->tensors, struct etna_ml_tensor *)` 是本文件既有约定（第 66/74/209/231 行同款）。
+7. **门体检**：21 个 run 块 `bash -n` 全过；三道文档门**真跑**全过（含继承的 OCFIX/FSGUARD 对你新版 `build-teflon.sh` 仍成立）；ROFIX 文档门**负控制 1 绿 + 6 红**。
+
+### 负控制抓到的两个真问题（已修）
+- **我写的文档门太弱**：删掉头部整个 `TEFLON_ROFIX` 说明段后门仍绿——因为头部「用法」行里还有 `TEFLON_ROFIX=1` 顶住了针脚。已加固为双针脚（`TEFLON_ROFIX` + `gen-rofix-patch.py`，后者只出现在开关说明段）。这是负控制抓出来的，不是推理。
+- **你的自测可微调**：注释里引用的是 `pipe_buffer_size(res)`（真陷阱，不剥注释必误拒正例），但**没有**引用 `etna_ml_get_size`（注释里写的是 `etna_ml_get_tensor`）——那道自检是纯防回归门，「会不会响」由我的 n11 证明。你若要在注释里补一句 `etna_ml_get_size` 作证据，注释剥除逻辑已能正确处理。
+
+## 五、顺手修的一个既有隐患（与 ROFIX 无关）
+
+`build-teflon-fix-diag.yml` 的 FSGUARD 文档门仍是**放宽前**的窄针脚（要求字面量 `filter.in_c`），对你新版 `build-teflon.sh` **会假红**（本地实跑 rc=1）。已程序化对齐到 fix.yml 里已验证的那版（三写法别名），commit `418ce9b2`，只动该 step 的 run（yaml 可解析、19 步不变、逐字与 fix.yml 一致、门真跑 PASS）。只碰 workflow 文件，未再触发生产构建。
+
+## 六、上机请这样做
+
+1. 装 `libteflon.so` + `libdrm.so.2`（同目录），**不必**设 `ETNA_MESA_DEBUG`（`[och-rofix]` 格式串虽已编译进 `.rodata`，但只有 `ETNA_MESA_DEBUG=ml_msgs` 时才打印——设了也无害，可作旁证）。
+2. 判据（与 BUILD-INFO 一致）：
+   - **① 不崩**：应达成（605000 字节越界读消除）。
+   - **② 接管数**：应与 `675a1091` **持平**（ROFIX 只改输出回读路径）。
+   - **③④ 数值/逐字节**：**未知**，本产物不作任何保证。
+3. **若看到 `Assertion failed … src_map` / SIGABRT**：这是设计中的可观测失败，不是回归——说明 `tensor->size` 确实大于 resource 真长。把崩溃回溯给我即可。
+4. **旧地址作废**：`0x230660/0x2307e8/0x8564c` 对本产物按设计失效（ROFIX 重写了 `read_outputs` 自身）。若再崩，用本产物的 `.text` 哈希 `b1216b58…` 确认是同一份代码；因为产物已 strip，我需要**同配置重跑一次未 strip 的孪生**才能把偏移映回行（要的话我现在就派 `libteflon-fix-rofix-diag`）。
+
+**我不写「可用」结论**：四级判据第 ④ 级（与 x86 基准逐字节一致）仍未过。
+
+## 七、待办 / 遗留
+
+| # | 事项 | 状态 |
+|---|---|---|
+| 1 | `_fn_body` 括号不平衡 → IndexError（traceback 退化，方向仍 fail-closed）。**两处**：ROFIX + RODIAG，各加 `while j < len(src)` 一行 | 等你；不阻塞 |
+| 2 | `tools/gen-rodiag-patch.py` 的 TEMPLATE 仍缺 comment-strip（**ROFIX 生成器已自带 ✓**）。谁重跑 RODIAG 生成器就会覆盖回坏版本 | 仍待你（5 行改法上轮已给） |
+| 3 | 编译期标记 `och-patch-readout-offset-align`：**建议加，但不要单独为它跑一轮**。`[och-rofix]` 已是硬二进制门，边际价值有限；建议与 `etna_ml_tensor_offset`（:212-223/:229-242 批量改写 `size/offset`，真正剩下的问题）一起做 | 等你决定 |
+| 4 | 350 vs 337 张量数差异 | 仍未查清 |
+| 5 | 上轮文档 nit（+24/1052 vs 实测 +23/1053） | 仍未销项；本轮行号链已自洽（1031/1102） |
+| 6 | 模型线六门 | 与本线不阻塞，状态未变（art13 cos=0.0322、饱和 99.7%，门 e/f 未过） |
+
+commit：`d2ab1d7b`（ROFIX 四件套 + 派生 workflow）、`418ce9b2`（fix-diag 门对齐）。两枚 commit **未签名**——`user.signingkey` 需口令且本机无 agent，我与前几轮一致按未签名提交（`sig=N`）；若你要求签名，给我口令或换 key 我补一个签名 tag。
+
+[2026-10-18 12:41] IDLE msg_14f07e184001wU1ow1UO028eMI succeeded
+

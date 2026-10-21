@@ -1,0 +1,94 @@
+[2026-10-18 01:27] ASSISTANT msg_14c9f1f48001y8eTenCuj0HSJJ (space-bunny-free)
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; $env:PYTHONIOENCODING='utf-8:replace'; python3 check_fix_strings.py 2>&1 | Out-String", "timeout": 600000}
+
+[2026-10-18 01:27] ASSISTANT msg_14c9f2abf001vqL3dS0Aa2FxMc (space-bunny-free)
+## 给 och —— 四样齐了，`39086309246` = **success（13/13）**
+
+### 1️⃣ 提交 sha
+
+```
+e95811ed  (main)  修掉我那道不可能的 strings 门
+50c343bd           build-teflon.sh rev6 + patch-etnaviv-outchannel-fix.py + build-teflon-fix.yml
+```
+
+### 2️⃣ 构建日志里的开关自检（**七行全过，含三条反向门**）
+
+```
+==> [3g/6] 打【修复】write_core_interleaved out_channel 映射修正 + 越界钳位
+  [och-ocfix] 已修正 out_channel 映射并加越界钳位: mesa/.../etnaviv_ml_nn_v7.c
+  [och-ocfix] ⚠️ 只算「越界消失」；能否用要看四级判据第 ④ 级（逐字节比对）
+
+OK: [3e/6] 打【修复】v7
+OK: [och-fix] 已修复 v7 calculate_bias_correction
+OK: [3g/6] 打【修复】write_core_interleaved
+OK: [och-ocfix] 已修正 out_channel 映射并加越界钳位
+OK(absent): strip：跳过（保留调试段…
+OK(absent): [och-wc] 已注入 out_channel 诊断
+OK(absent): 调试信息：开启（-g3
+ALL SWITCH ASSERTIONS PASSED
+```
+
+同时 `==> [3d/6] 诊断补丁：默认关闭`、`==> [3f/6] out_channel 取证补丁：默认关闭` —— **诊断开关确实没开**。
+
+### 3️⃣ 产物
+
+| 项 | 值 |
+|---|---|
+| sha256 | **`f9bf1d51156e372cd5cf76859f7c76808235fab052739ee39a32ea38a471e490`** |
+| 字节数 | **11,975,792**（与 stripped 交付候选一致，未变大） |
+| artifact | `libteflon-fix` |
+| 架构 / RUNPATH | `AArch64` / `$ORIGIN` |
+| glibc 上限 | `GLIBC_2.34`（≤ 设备 2.36 ✅） |
+| `debug_sections=` | **空**（确认 stripped） |
+
+**sha256 三方一致**：CI 声明 = artifact 内 `SHA256SUMS` = 我本地实算。
+
+### 4️⃣ `strings` 门 —— 我在你本地之外的独立复核（纯字节搜索，不依赖 CI）
+
+```
+calc_bias_correction depthwise          存在=True   ← v7 printf 格式串（真字面量）
+[och-wc]                                存在=False  ← 诊断开关确实没开 ✅
+[och-fix]                               存在=True
+och patch: out_channel                  存在=False  ← 注释里的 marker，编译后消失
+och patch: v7 calculate_bias_correction 存在=False  ← 同理
+```
+
+**第 3 项你要的「`strings` 命中 `och patch: out_channel`」我做不到 —— 上表第 4 行就是证据。** 那个 marker 只在 C 注释里，编译后不存在。你第 4 项「确认没有 `[och-wc]`」**有效且已过**。
+
+### 5️⃣ 三元组标注
+
+| sha256(前8) | 构建配置 | 上过机 | 状态 |
+|---|---|---|---|
+| `ffce949e` | FIX_V7，strip | ✅ **崩过（EXIT=139）** | 旧基线 |
+| `bdf39e55` | FIX_V7+WCDIAG，NO_STRIP | ✅ 取证过（136组合） | 诊断产物 |
+| **`f9bf1d51`** | **FIX_V7+OCFIX，strip** | ❌ **未上过机** | **交付候选，未验证** |
+
+### 6️⃣ `BUILD-INFO.txt` 里我写死的两条声明（防止下一个人拿错）
+
+```
+########## FIX_V7 + OCFIX BUILD - delivery candidate, NOT yet validated ##########
+warning=NOT validated: must pass acceptance level 4 (byte-identical vs x86 baseline)
+warning2=only write_core_interleaved patched; 3 more sites of the same formula
+         (write_core_6 x2, write_core_sequential) remain UNPATCHED by design
+mesa_tag_binary=26.2.5mesa-ddaf85e353-git     ← 与前两轮同一份源码
+```
+
+### 7️⃣顺带确认的两件事
+
+**a) 上一轮报的边界风险没触发** —— `\nstatic` 函数体边界在真实 26.2.5 上成立，计数门 4 个特征串全部正确匹配，补丁代码编译通过。那个脆弱点仍在（换 Mesa 版本可能触发），但方向安全（大声拒绝，不会误放行）。我加的「失败时打印源码邻域」这轮没用上，保留着。
+
+**b) 产物体积没变**（11,975,792，与上一轮 stripped 基线**完全相同**）—— 这**不能**证明补丁生效（改的是 `.text`，strip 不影响段大小口径）。真正的证据是编译成功 + 日志门 + 上面那三条反向门。**我不拿「体积一样」当证据。**
+
+### 8️⃣ 未落盘（按你说的不传）
+
+下载只到我的临时目录 `D:\clawtemp\oc-verify-tmp\` 做校验，**没放进 `o2tf-src\`，你那边看不到**。要传的话说一声（12 MB，和上轮同等量级）。
+
+### 9️⃣ 两个待你裁决（我都没擅自做）
+
+1. **给 OCFIX 加编译期标记**（`__attribute__((used)) static const char …`），之后 `strings` 就能判它 —— 需要改你的补丁文件。
+2. **`TEFLON_OCFIX=2` = 只钳位 + 保留旧公式**的二分开关 —— 第 ④ 级不过时一轮就能定位是「钳位就够」还是「必须重映射」。
+
+**这一版我不写「已修复」。** 它是交付候选，能不能用由你的第 ①–④ 级说话。
+
+[2026-10-18 01:27] IDLE msg_14c9f47b7001q2iFuR3SDSmVWe succeeded
+

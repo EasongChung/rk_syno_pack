@@ -1,0 +1,107 @@
+【och→oca】**(a) 和 (b) 都不用 —— 你拦下的是对的，但我查出来的根因比你列的两种世界都更靠上**
+
+一、先把话说全：**你对补丁的三条判定全部正确，这次构建会白跑。**
+
+`orig_input_channels * stride * stride ≡ input_channels * stride * stride`，
+`NEW` 里没有任何 `wdims_in` 赋值 —— 恒等变换，一个字节的行为都没改。
+`wdims_in` 在乘法**之前**初始化，本来就拿到原值。所以「缺第 2 步」不是问题，
+**是第 2 步根本不该存在**。你给的 A/B 两种世界里，**A 是真的**（那个初始化器就是 `wdims_in`），
+而 A 的推论是「`wdims_in[3]` = 原值 → **那里根本不越界**」。
+
+**你的三条判断让这次构建、一次真机验证、一次 12 MB 产物落地全部省下来了。**
+
+二、你那处「门内自相矛盾」也成立，我已修
+
+结构门要求 `operation->input_channels = operation->input_channels * …` 存在于 `fn_body`，
+这确实是**打补丁前**的形态。我在新补丁里的做法：门只校验**锚点 + 真实源码统计**，
+反向自检改成「锚点必须消失 + 新代码恰好出现 1 次」，不再依赖「原式仍在」这种只对替换型补丁成立的假设。
+
+三、真正的根因（本地离线审计查出来的，不需要 CI）
+
+`addr2line` 那条链是对的：`subsample etnaviv_ml_nn.c:424`，
+调用链 `etna_ml_lower_convolution → strided_to_normal → reshape → subsample`。
+但**越界不在 `in_z`，在 `map_in` 的步长**。
+
+我把真机模型（`pertensor.tflite`，6 MB，从设备拉下来）逐算子解析，崩溃分区里有：
+
+```
+op#58   CONV_2D  input=[1,52,52,244]  filter=[244,3,3,1]  stride=2x2
+op#153  CONV_2D  input=[1,25,25,488]  filter=[488,3,3,1]  stride=2x2
+                  ↑ 输入 244/488 通道      ↑ filter 的 in_c（最后一维）= 1
+```
+
+算术严丝合缝：
+
+| 步骤 | 值 | 出处 |
+|---|---|---|
+| `operation->input_channels` | **244**（取自**输入张量**） | `etnaviv_ml_nn.c:571` |
+| `wdims_in[3]` | 244 | `strided_to_normal` |
+| `map_in` 步长 | `3*3*244 = 2196` | `reshape` |
+| 权重张量实际大小 | `244*3*3*1 = ` **2196** | filter 真实形状 |
+
+⇒ **`out_channel ≥ 1` 时 `map_in` 就已越过张量末尾**，`subsample` 读越界 → SIGSEGV。
+注意 `map_in` 的步长用了 `input_channels`，而张量只有 `in_c=1` 深 —— **两者不是同一个量**。
+
+这也解释了为什么离线审计「7 个 stride=2 卷积 filter 字节数全部自洽」却仍崩：
+自洽性检查是拿 `oc*ic*w*h` 跟 `num_elements` 比，**没检查 `input_channels` 与 `filter.in_c` 是否相等**。
+
+四、所以修法是「**不接管**」，不是改系数排布
+
+从 coeff 构造（`weights_map[input_channels][w][h]`）到 `strided_to_normal` 的整条路径，
+都建立在「filter 深度 == 输入通道」这个**不成立**的前提上。
+改单点只会把**越界**换成**静默错误数值** —— 那比崩更糟。
+
+正确做法：让驱动识别这种算子并**拒绝接管**，回退 CPU。
+这正是 `etna_ml_operation_supported` 的职责（它本来就拒绝 dilation 与 per-axis 量化）。
+
+**新补丁：`patch-etnaviv-filter-shape-guard.py`**，注入点：
+
+```c
+if (!operation->conv.depthwise &&
+    operation->conv.weight_tensor->dims[3] != input_tensor->dims[3]) {
+   ML_DBG("filter in_c (%u) != input channels (%u)，回退 CPU\n", …);
+   break;   /* supported 保持 false */
+}
+```
+
+- 目标文件 **`etnaviv_ml.c`**（不是 `ml_nn*.c`）；
+- **depthwise 豁免**：它的 filter 布局是 `[1,h,w,out_c]`，`dims[3]` 是输出通道，本就该不同；
+- 锚点由 `tools/gen-fsguard-patch.py` 逐字生成，门 = 锚点唯一 + 4 个特征精确计数；
+- 自测：1 正例通过 + **6 反例全拦**（注释行被删 / 缩进坏一格 / conv case 消失 /
+  dilation 检查被删 / quant 检查被删 / 函数整体消失）+ 幂等拦住。
+
+五、请你做的四件事
+
+1. **作废并删除** `patch-etnaviv-strided-normal-fix.py` —— 它是恒等变换，
+   留着就有人会打开它，而它**看起来**是个正经修复。这是本轮第二个「文档描述 ≠ 代码行为」。
+2. 落盘新文件：
+   - `patch-etnaviv-filter-shape-guard.py`（**新增**）
+   - `build-teflon.sh`（3h 步已从 `TEFLON_SNFIX` 换成 `TEFLON_FSGUARD`，目标文件改为 `etnaviv_ml.c`，头部注释已同步；**全文已无 SNFIX 残留**，我本地 `grep` 验过）
+3. **仅开** `TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1` 触发 fix workflow。
+   不加 `DEBUG_INFO` / `NO_STRIP` / `WCDIAG` / `DIAG`。
+4. 回传仍是那四样（提交 sha / 三行补丁日志原文 / `.so` sha256+字节数 / `strings` 三条：
+   `och-patch-v7-outchannel-clamp` **存在**、`och patch: filter 深度` 相关串 **存在**、`[och-wc]` **不存在**）。
+
+**关于第三条 strings 门的一个事先说明**：FSGUARD 用的是 `ML_DBG` 格式串
+（`"filter in_c (%u) != input channels"`），那是**真字面量**、编译后一定在 `.rodata`，
+可以直接用 `strings | grep -q 'filter in_c'` 判定。**注释里的 marker 依旧不可判定**
+（就是我第一轮那道被你抓出来的假门），这条请不要写进断言。
+
+六、本地已验的组合
+
+四个补丁按构建脚本真实顺序、在真实源码上串联：`3f → 3g → 3e → fsguard` **全部通过**，
+标记齐全、花括号/圆括号配平。我把生成器也一并给你（`tools/gen-fsguard-patch.py`），
+**直接用文件，不要誊写**。
+
+七、这一轮的判据预期（先说清，免得又出现「不崩就算好」）
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | ✅ 应达成（那两个算子回退 CPU，不再进 `strided_to_normal`） |
+| ② 接管数 | **会下降 2 个**（这是**预期行为**，不是回归 —— 那两个算子本就不该被接管） |
+| ③④ | 由我上机验 |
+
+`ML_DBG` 的输出需要 `ETNA_ML_DEBUG` 才会打印；**诊断轮**如果你想看那两行回退日志，
+告诉我，我另要一份带 debug 的构建。**交付轮不要开。**
+
+四级判据仍然只有第 ④ 级（逐字节一致）算「能用」，我不提前写结论。

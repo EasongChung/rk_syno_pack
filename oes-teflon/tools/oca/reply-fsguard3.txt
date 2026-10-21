@@ -1,0 +1,119 @@
+[2026-10-18 07:33] ASSISTANT msg_14dedacfe0011RF4Pbufbqeo03 (deepseek-v4.1-flash-free)
+核对提交信息里写的行号是否真实；不核实就不能上报：
+  [tool:write] {"content": "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\"\"\"核实注入位置的真实行号（提交信息里写了 etnaviv_ml.c:657-689，必须对得上）。\"\"\"\nimport os\nimport shutil\nimport subprocess\nimport sys\nimport tempfile\n\nSRC = r'D:\\clawtemp...
+
+[2026-10-18 07:33] ASSISTANT msg_14dedfa20001ZqVyhCY6Hrl7Cv (deepseek-v4.1-flash-free)
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; $env:PYTHONIOENCODING='utf-8'; python3 verify_inject_lineno.py 2>&1 | Out-String", "timeout": 600000}
+
+[2026-10-18 07:33] ASSISTANT msg_14dee14b4001LoU6rS7Y20981F (deepseek-v4.1-flash-free)
+构建成功、产物已保存到磁盘，并已独立复算。以下是回信。
+
+---
+
+## 一、交付四样
+
+**① 提交**：`1fa37748`（`1fa377482acf489fadf8a2b5a54a2bea1c460da6`），已 push 到 `main`
+**② CI run**：`39107477126`（build-teflon-fix）**success**；push 顺带触发的生产 run `39107460623` 已 cancel
+
+**③ `.so`**：`sha256 = 675a10913846258114e43ce01340f40e36bf0b6574fa5d49ba15243a812970df`，**11,975,792 bytes**
+
+**④ 四行日志原文**（从 run log 直取，未誊写）：
+
+```
+==> [3g/6] 打【修复】write_core_interleaved out_channel 尾部越界钳位
+[och-ocfix] 已加 out_channel 尾部越界钳位: mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+==> [3h/6] 打【修复】filter 深度一致性守卫（不自洽卷积回退 CPU）
+[och-fsguard] 已加 filter 深度一致性守卫：不自洽卷积回退 CPU
+```
+
+**strings 三条**（我另写了纯 Python ELF 节头解析 + 自实现 strings，不依赖 workflow 断言）：
+
+| 探针 | 结果 |
+|---|---|
+| `och-patch-v7-outchannel-clamp` | **FOUND** |
+| `filter in_c (%u) != input channels (%u)` | **FOUND** |
+| `[och-wc]` | **absent** |
+| `.debug_*` 节 | **NONE**（27 节，无调试段） |
+| glibc 上限 | libteflon **2.34** / libdrm 2.33（设备 2.36） |
+
+---
+
+## 二、两个拦截点：**撤回**
+
+`ML_DBG` 我先用你给的四个真产物独立复算，再加真源码确认，不是采信：
+
+| 产物 | `dumping intermediate graph` | `coefficients_size 0x` |
+|---|---|---|
+| `b9936131`（clamp, **stripped** 11.98 MB） | FOUND | FOUND |
+| `ffce949e` / `f9bf1d51`（stripped） | FOUND | FOUND |
+
+`etnaviv_ml.h:143` 逐字确认是 `if (DBG_ENABLED(...)) _debug_printf(...)`，`etna_mesa_debug` 是 `extern int` ⇒ 运行期分支、格式串进 `.rodata`。**strings 门成立。**
+
+尾部结构也确认：`bool supported = false;` → `default: return false;` → 尾部 `return supported;`。
+
+---
+
+## 三、真源码验证（本轮翻转：GitLab raw 通道恢复，**已拉下 Mesa 26.2.5 源码**）
+
+之前我说「本机取不到源码」，本轮 raw 返回 200。拉了 `etnaviv_ml.c/.h`、`ml_nn.c`、`ml_nn_v7.c`、`ml_nn_v8.c`、`p_state.h`，**在真源码副本上把 3e/3g/3h 全跑了一遍**：
+
+| 检查项 | 真源码结果 |
+|---|---|
+| `3h FSGUARD` 打在 `etnaviv_ml.c` | **rc=0**，注入块 **662–685**（MARKER 662，`return false;` **684**，`}` 685；函数起始 650） |
+| fail-closed 偏移 | `return false @28637` < `supported = true @29034` —— **与你本地数字逐位一致** |
+| `input_tensor` 作用域 | 在 `case ...: {` 块内 **657 行**声明，**早于**注入点 ⇒ 不会编译失败（你列的第二个未知，已闭） |
+| STRUCT 四项 | 真源码函数体内各 **恰好 1 次** |
+| 字段存在性 | `p_state.h:1145 bool depthwise`、`:1110 weight_tensor`、`pipe_tensor.dims[4]` 全在 |
+| `3e FIX_V7` / `3g OCFIX` | 真源码副本上 **rc=0**（第一次实跑，不再靠推断） |
+| `ml_nn.c:424` | 逐字就是 `out[x][y] = in[in_x][in_y][in_z];` |
+
+**顺带确定 SNFIX 的判断**（此前只是推理）：真源码 `strided_to_normal` 里 `orig_input_channels` 出现 **0 次**，`wdims_in` 在乘法**之前**初始化 ⇒ 恒等变换，无任何字节变化。
+
+---
+
+## 四、门 + 抓到的两处漂移
+
+1. **GEN 一致性门**（我加的）：用 `OLD` 构造同形 mock 跑生成器，与仓库补丁做 **Python token 流**比对。抓到 **1 个空格**：生成器 TEMPLATE 写 `src[g_at: g_end]`，补丁文件写 `src[g_at:g_end]`。语义等价，我按 token 流判等价 → **WARN 不阻塞**。请你统一（重新生成，或改 TEMPLATE）。
+2. **workflow 头部第 7 行仍指向已作废的 `patch-etnaviv-outchannel-fix.py`** → 已改为 `-clamp.py`（这是真漂移，会误导下一个人）。
+3. **文档一致性门**按你的基准实现：头部 `TEFLON_FSGUARD` 段 **与** 3h 段都必须含 `op#58` 与 `filter.in_c`。为此把两处「filter 的 in_c」改成字面 `filter.in_c` —— 否则这门必然直接判失败。
+4. **反向**：`SNFIX` / `strided-normal` 扫 `oes-teflon/**`（**不扫 workflow 自己**，避免自指），并断言 `[och-snfix]` 日志缺席、作废补丁文件不回库。
+5. **n8（我加的）**：把守卫出口换成 `break;` → 门必须判失败。理由：样本 `default:` 分支本身就有 `return false;`，若门只做全文件 grep，break 版会被误判为通过 —— 那正是 fail-open。
+
+本地：**1 正例 + n1–n7 + n8 + 幂等 + GEN 全过**（1 条空格 WARN）。
+
+---
+
+## 五、必须说清的缺口
+
+1. **附件 3/3 没收到**。而且上一轮 `build-teflon.sh` 的附件**只到了描述、没到内容** ⇒ **3h 步与头部段是我写的**，不是你的文件。功能已在真源码验证（3h 打到 `etnaviv_ml.c`、rc=0、日志行在），但要**逐字**对齐请把文件贴来。
+2. `BUILD-INFO` 里 `mesa_tag_binary=26.2.5mesa-ddaf85e353-git`，我取的是 `mesa-26.2.5` tag 源码；若那次构建的 commit 与该 tag 不同，锚点仍以 CI 那次为准（补丁器自带「必须恰好 1 处」门，不等就中断）。
+3. **①②③④ 全部未验**。本文只证明「构建成功 + 二进制里有该做的事」。
+4. 模型全量不匹配算子总数我仍**无法独立计数**（没有 `.tflite`）。你说的 2 我按 2 上报，不背书。
+
+---
+
+## 六、判据预期与地址不可比
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | 应达成（那 2 个算子不再进 `strided_to_normal`） |
+| ② 接管数 | **恰好 −2**。若 ≠2，请按**「守卫未生效」**排查，不要读成回归 |
+| ③④ | 你上机验 |
+
+**三元组**：`675a1091` / `FIX_V7+OCFIX+FSGUARD, stripped, DISABLE_DIAG` / **未上机**
+
+⚠️ `+0x22fda0` 属于 `b9936131`(clamp) 与 `f9bf1d51`(remap)，**与 `675a1091` 不可比** —— 加补丁改了代码布局。
+
+---
+
+**已保存到 `D:\clawtemp\o2tf-src\`**（既有目录，只新建文件）：
+
+- `libteflon-fix-v7-ocfix-fsguard-675a1091.so`（11,975,792）
+- `libdrm-675a1091.so.2`（133,896）
+- `libteflon-fix-v7-ocfix-fsguard-675a1091.so.sha256`（头部写明：未上机 / 四级全未验 / 地址不可比）
+- `BUILD-INFO-675a1091.txt`
+
+一个可选清理（**没动**，留给下一轮）：真源码 658 行已有局部变量 `weight_tensor`，守卫里用的是 `operation->conv.weight_tensor->dims[3]`；两者等价，但用局部变量更贴合该函数风格。改它要同时改生成器 + 重新生成，不值得为格式再烧一次构建。
+
+[2026-10-18 07:34] IDLE msg_14deed61b001WxNtgtEwDrT6DG succeeded
+

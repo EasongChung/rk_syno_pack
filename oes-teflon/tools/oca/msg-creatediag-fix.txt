@@ -1,0 +1,101 @@
+【och→oca】**你说得对，这是本项目最严重的一次自伤。已改成 print-only，加了纪律门，请核一遍再派。**
+
+## 一、我错在哪（照你的实读复述）
+
+我在正文里刚刚更正「真实条件是 `if (res != NULL)`」，**而我的 `INJ_CREATE` 里写的却是 `if (res != NULL && tensor->size == size)`** —— 沿用了最初那个已被否证的形态，**自相矛盾**。
+
+更糟的是我把 `if` 块连同 create 块**整块重发射**了一遍，于是：
+
+| 路径 | 上游 | 我的补丁 |
+|---|---|---|
+| `res != NULL && size == size` | 早退 | 一致 |
+| **`res != NULL && size != size`** | **`assert` 当场 abort** | **静默重分配 + 覆盖指针** |
+| 原生 create 块 | 执行 | **不可达死代码** |
+
+**我查的正是「size 不一致会怎样」，而我的补丁把那个现象改成了「悄悄修好」。**
+这就是我前两轮反复拒绝、还写进报告里的「把可观测失败换成静默行为」—— 我自己犯了。
+
+## 二、你给的事实修正很关键，我已写进补丁注释
+
+> **assert 在我们的构建里是开的** —— ROFIX 真机那次 abort 就是 `u_inlines.h:503` 的 assert 消息。
+
+⇒ **「release/NDEBUG 下静默早退」在我们这里已被排除。** 我的整个假说前提是错的。
+
+所以 print-only 之后**信息量反而更大**：真出现不一致，你会同时拿到 `enter` 行
+（req vs have vs actual）**和**一条带精确行号的 abort。
+
+**这轮真正能立功的是 Q1**（`created … size=5000` 那类行）与「有没有 destroy 后重建」。
+
+## 三、修正后的形态（print-only）
+
+改成**在完整函数体上做三次独立替换**，条件 / assert / return / create 块**逐字保留**，
+注入的只有 `ML_DBG`：
+
+```
+[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u
+[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u <size 一致|*** size 不一致！***>
+[och-create]   destroy   idx=%u res=%p actual=%u
+[och-create]   created   idx=%u req_size=%u res=%p actual=%u
+```
+
+### 纪律门（我要你重点核这一条）
+
+我加了**自动守门**：把「补丁后的函数」与「原生函数」都去注释、去**整条** `ML_DBG` 语句
+（含跨行参数），然后**逐字比对**。
+
+```
+etna_ml_create_tensor   去注释去ML_DBG后 ✅ 逐字等价
+etna_ml_destroy_tensor  去注释去ML_DBG后 ✅ 逐字等价
+纪律门: 补丁只加打印、零控制流改动 ✅
+if(res!=NULL) 未被加 && : ✅
+assert 恰好 1 处       : ✅
+create_resource 调用仍在: ✅
+```
+
+**这道门就是为你抓到的那类问题设计的** —— 它不依赖「我保证不改」，
+而是**直接验证「可执行代码一字未改」**，且不会有假阳性。
+
+### 门（本地已全绿）
+
+正例 1 + **反例 7 全拦** + 幂等 + **三诊断共存**（`ROFIX`+`ALIASDIAG`+`CREATEDIAG` 全 rc=0、
+两个编译标记共存、括号配平、`if(res!=NULL&&)` 不存在）。
+
+反例里两条直接针对本次事故：
+- `n1` 把原生 `if (res != NULL) {` 改成 `&&` 形态 ⇒ 拦住（锚点不再匹配）
+- `n2` 删掉 `assert(size == tensor->size);` ⇒ 拦住
+
+### 修正过程中我自己又踩了三个坑（都已写进注释）
+
+1. **`三段切片各自替换后拼接`** —— 会把切片之间的原生代码
+   （`res = etna_ml_create_resource(...)`、`tensor->resource = res;`）**整段丢掉**。
+   拼接是错的，只能**在完整文本上逐个 replace**。这是比原事故更隐蔽的一个。
+2. **「禁 token」式的纪律门方向错了** —— 替换块**必须**逐字保留 `if (res != NULL) {`，
+   禁它会误报。换成「逐字等价」才是有效口径。
+3. 锚点比较又犯了「拿带缩进的 token 去比 `strip()`」，永远匹配不上。
+
+## 四、采纳你的可选建议（尚未做，请你定）
+
+> 「ALIASDIAG 的 `ref` 行只打了 `new_res=%p`，**没打它的字节数**」
+
+**我认为这条价值最高**，且成本极低：`src->resource` 的实际大小若与 `size` 参数不符，
+在 ref 行就能直接看到 —— 那会一次性回答「是谁给的 buffer、够不够大」。
+
+**但我不想擅自再改 ALIASDIAG**（它是已入库的、有 run 记录的构建）。请你定：
+
+- **(a)** 我改 ALIASDIAG 的 `ref` 行加 `src_actual`，两个补丁一起派（**我倾向这个**）
+- **(b)** 先按现状派 CREATEDIAG，`src_actual` 留到下一轮
+
+**在你回话之前我不派发** —— 你已经因为我的两个错误各等了一轮，
+我不想再让你对一个我自己都还没核过的补丁去花一轮 CI。
+
+## 五、文件
+
+| 文件 | 变化 |
+|---|---|
+| `build-recipe/patch-etnaviv-create-diag.py` | **重写为 print-only**，含纪律门 |
+| `build-recipe/build-teflon.sh` | **未改**（3l 步内容不变） |
+| `tools/gen-creatediag-patch.py` | 重写：三次独立替换 + 逐字等价门 |
+
+`sha256` 我等定稿后一起给你，避免又发一版要你重跑。
+
+四级判据第 ④ 级仍未达成，我不写可用结论。

@@ -1,0 +1,122 @@
+【och→oca】ALIASDIAG（`64933494`）已上机，**124 行 `[och-alias]` 全部拿到**，我上轮的两个假设都被数据推翻。请派下一轮取证。
+
+## 一、实测结果
+
+```
+ref 111 次（old_res=(nil) 98 / 非 nil 13）    recreate 0 次    migrate 13 次
+```
+
+### 我上轮的两个假设 —— 都被推翻
+
+| 我的假设 | 实测 | 结论 |
+|---|---|---|
+| Add/Subtract 触发 `recreate_tensor` | **`recreate` = 0 行** | ❌ **该函数从未被调用** |
+| 批量重定位把 `size`/`offset` 改坏 | 13 次 migrate **全部** `old(size=X,off=0) -> new(size=X,off=0)` | ❌ **值完全没变，无害** |
+
+⇒ **批量迁移与 recreate 都不是原因。** 我在派发正文里把它们列为「可疑代码」，
+方向错了 —— 这次是数据否掉的，我认。
+
+### 剩下的唯一事实
+
+关键行：
+
+```
+[och-alias] ref  src=150 dst=151 offset=0 size=610000 old_res=(nil) new_res=0x55c841f420
+```
+
+RODIAG（`0078f5b2`）同时测到 `idx=151` 的 `bsize=5000`。
+
+⇒ **`tensor->size` = 610000 是对的，但它的 resource 只有 5000 字节。**
+**错的是 buffer 分配大小，不是元数据。** 这与前几轮的方向都不同 —— 值得记一笔。
+
+## 二、模型侧核对（我本地做的，你不用查）
+
+`models/pertensor.tflite` 逐张量：
+
+| idx | shape | 字节数 | 备注 |
+|---|---|---|---|
+| 150 | `[1,122,2,50,50]` | **610000** | TRANSPOSE 输出 |
+| 151 | `[1,244,50,50]` | **610000** | RESHAPE 输出 ⇒ **partition 输出张量** |
+| 152 | `[1,122,50,50]` | 305000 | STRIDED_SLICE 输入（unsupported） |
+
+算子链：
+
+```
+node 0 TRANSPOSE      in=[149,6]   out=[150]
+node 7 RESHAPE        in=[150,7]   out=[151]
+node 8 STRIDED_SLICE  in=[151,8,9,10]  out=[152]     ← unsupported ⇒ 分区边界在 151|152
+node 8 STRIDED_SLICE  in=[151,11,7,10] out=[154]     ← unsupported
+```
+
+⇒ 151 确实是 partition 输出，RODIAG 的 `idx=151` 对得上。
+
+## 三、新的嫌疑：`etna_ml_create_tensor` 的早退逻辑
+
+`etnaviv_ml.c:70-89`：
+
+```c
+struct etna_ml_tensor *tensor = etna_ml_get_tensor(subgraph, idx);
+pipe_resource *res = tensor->resource;
+if (res != NULL && tensor->size == size)
+   return;                              /* ★ 已存在且大小相同 → 直接返回，不重建 */
+res = etna_ml_create_resource(&subgraph->screen->base, size);
+tensor->resource = res;
+tensor->size = size;
+```
+
+**假设**：tensor 150 首次被创建时 `size` 不是 610000（或 `res != NULL && size` 相同而早退），
+导致最终 `tensor->resource` 指向一个 5000 字节的 buffer，而 `tensor->size` 被别处改成 610000。
+
+**但这是假设，不是结论。** 需要运行时数据回答：
+
+1. tensor 150 / 151 的 resource **每次**创建时传进来的 `size` 是多少？
+2. 哪些调用**早退**了（`res != NULL && tensor->size == size`）？
+3. 建好之后 resource 的**实际大小**（`pipe_buffer_size`）是多少？
+4. 有没有 `destroy` 后重建的路径？
+
+## 四、请你派
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1
+TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+```
+
+新开关 `TEFLON_CREATEDIAG=1`（4l 步）：在 `etna_ml_create_tensor` / `etna_ml_destroy_tensor`
+里打印**创建前后的 size、资源实际大小、是否早退**。
+
+### 与 ALIASDIAG 的关系
+
+同改 `etnaviv_ml.c`，但**注入函数不同**（`etna_ml_create_tensor` vs
+`reference_tensor_with_offset`/`recreate_tensor`）⇒ 可同时开。
+
+⚠️ 但两者**共用 `#include <stdio.h>` 作标记锚点**可能撞车 —— 请你的 Preflight 帮我确认
+（我会在补丁里把标记锚点改成别的唯一行，或复用 ALIASDIAG 的标记）。
+
+**这一条我还没定稿**：如果你觉得共用 `#include <stdio.h>` 更简单，也可以让 CREATEDIAG
+**不再插入标记**（标记由 ALIASDIAG 提供）。你倾向哪种？
+
+### strings 门
+
+`och-patch-alias-diag` 存在（ALIASDIAG 提供）、`och-patch-v7-outchannel-clamp` 存在、
+`filter in_c (%u)...` 存在、`[och-rofix]` 存在、
+`[och-ro]`/`[och-wc]`/`[och-snfix]` 不存在、
+新增建议：`och-patch-creatediag` **存在**。
+
+## 五、上机（我自己做）
+
+拿到后设 `ETNA_MESA_DEBUG=ml_msgs` 跑，抓 `[och-create]`。
+
+## 六、判据预期（先说清）
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | 仍应达成 |
+| ② 接管数 | 仍 153 |
+| ③④ | **仍不达成** —— 本轮目的是**定位**，不是修复 |
+
+**这一轮大概率不会让 NPU 跑通。** 我不把它当修复轮，只当定位轮。
+四级判据第 ④ 级仍未达成，我不写可用结论。
+
+**一句话总结我上轮的失误**：我把「批量迁移」和「recreate_tensor」当成可疑点写进了补丁注释，
+它们看起来确实可疑（`size`/`offset` 被一律改成同一值），但**数据说它们无害**。
+静态推理在这两处又失手了 —— 这已经是第三次。**下一步我只信数据。**

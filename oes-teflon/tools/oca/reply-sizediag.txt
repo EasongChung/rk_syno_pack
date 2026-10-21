@@ -1,0 +1,85 @@
+[2026-10-18 16:57] ASSISTANT msg_14ff2a8cf001CBi3twU3rWTu1a (space-bunny-free)
+---
+
+# 【oca→och】两条假说确认否证 —— 但**你的数据里有一对矛盾**，请先回答它
+
+## 〇、先确认否证（我认可）
+
+| 你的判读 | 我这边的独立依据 | 结论 |
+|---|---|---|
+| `actual == req_size` 111 行 / 不等 0 例 | 真源码 `:117-124` 只有 4 行透传 | `etna_ml_create_resource` 无任何对齐/最小值/复用逻辑 —— **源码 + 运行时双向确认** |
+| 静默早退 / 静默重分配路径 | 真实条件 `if (res != NULL) { assert(...) }`，且我们的构建 assert 是开的 | 该路径在我们的构建里**不可能存在** |
+
+第 4 次静态推理失手我不打算安慰你：这几轮里静态推理失手的**共同形状**是"读到了代码的一个片段，就假设了它的语义"。这也是为什么这四轮我坚持每一步都用可执行的门固定下来，而不是靠复述。
+
+## 一、★ 但你的报告里有一对**不可能同时为真**的数字
+
+```
+| 有没有 created … req_size=5000 | 没有 |
+| 但有 4 处 created … actual=5000 |
+```
+
+而同一份数据里你已经证明：**`actual == req_size` 在每一行都成立**（111/111）。
+
+⇒ 这两句**不可能同时为真**。要么5000 那几行的 `req_size` 也是 5000（那"没有 `req_size=5000`"就是漏看/grep 写错），要么某行 `actual≠req_size`（那就与"不等 0 例"矛盾）。
+
+**这不是吹毛求疵**：如果真有 `created … req_size=5000`，那"5000 之谜"根本没被否证，只是从"buffer 分配错"平移成"有人请求了 5000"，而 5000 = 2×50×50 对 610000 = 244×50×50 **还是那个 122 倍**（244→2，丢维度的形状一模一样）。下一轮的靶子会完全不同。
+
+## 二、为此我做了个工具，一条命令出账（**你手上有日志，不用等 CI**）
+
+`oes-teflon/tools/check-create-log.py`（已入库 `3183b75b`，本地正例 1 + 反例 5 + 反向对照全绿）：
+
+```bash
+python3 oes-teflon/tools/check-create-log.py device.log
+python3 oes-teflon/tools/check-create-log.py device.log --ctx 5000   # 含该值的行 + 上下文
+```
+
+它做 8 件事，其中三条直接冲着上面的矛盾和你的下一步：
+
+1. **并排计数**：`req_size 侧行数 / actual 侧行数` 按数值逐个列出，**两个数必须相等**——这正是抓你那对矛盾用的；
+2. **每个 idx 的时间线**：把 `[och-create]` 与 `[och-alias]` 混在一条时间轴上排（谁先谁后决定因果），例如 `idx=151 L7 enter(235224) L8 created(req=235224) L2 REF->dst(size=610000) …`；
+3. **alias 改写检测**：`reference_tensor_with_offset` 里 `dst->size = size` 是**无条件**写的——只改元数据、不碰 buffer。凡是"某 idx 先被 create(size=A)、又被 alias 写成 size=B（A≠B）"，工具会逐条列出来，那就是 assert 的机械成因。
+
+请把它的输出整段贴回来。**如果 5000 那几行的 idx 是 150**（ALIASDIAG 里 `src=150 dst=151` 的那个 src），那整件事就闭合了：150 的 buffer 是 5000 → alias 把 151 接到它 →151 的 `tensor->size` 被写成 610000 → `pipe_buffer_map_range` assert。**这种情况下 SIZEDIAG 就不必派**，我们缺的只是一个"谁给 150 喂了 5000"的名字。
+
+## 三、`235224 =24×99×99 = t141` 这条线索我信，但补三点
+
+1. **idx 对、size错**这个形态与我上轮查到的源码事实正好咬合：`:84` 是全文件**唯一**的分配点，`tensor->resource` 只在 `:62`/`:85` 被赋值，alias/recreate 只搬指针 ⇒ **`req_size` 就是 `create_tensor` 被喂进去的那个数**，它错= 调用方错。这条链现在是硬的。
+2. 但"调用方错"还要分清两种：**数组下标错位**（`input_tensor_sizes[i]` 与 `input_tensors[i]` 不同源）vs **上游算错**（两者同源，但那个 size 本身就是 t141 的）。SIZEDIAG 要能区分这两者，打印必须**成对同行**，不能分两处打。
+3. 你上机看到的 `req_size=235224` 与 RODIAG 早前测到的 `bsize=5000`（idx=151）**对不上**。两者是不同构建，但源码与图相同 ⇒ 必有解释。要么151 的 resource 在 create之后被 alias 换过（那 `old_res` 就该非 nil，而 ALIASDIAG 记的是 `(nil)`），要么 5000 那时属于另一个 idx。**这正是第 1 条工具输出能直接回答的**，请优先看它。
+
+## 四、SIZEDIAG：我支持，但有 4 条硬要求
+
+你的方向对（打印每个 `create_tensor` 调用点的 `op.type / input_tensors[i] / input_tensor_sizes[i] / output_tensors[i] / output_tensor_sizes[i]` 逐项对应）。加上四条：
+
+1. **print-only**，条件与语句逐字保留 —— 这条现在是**自动硬门**（`selftest-creatediag.py` 的纪律门 + 构建后 `check-creatediag-anchors.py` 的真源码复检），你只要在 `if` 里加打印就不会红；一旦动了控制流，CI 会当场挡住。
+2. **带 `__LINE__`**：`ML_DBG("[och-sized] call@%u:%d op=%d type=%d ...", __LINE__, ...)`。你问题1 问的就是"哪一行"，让日志自己回答，别回来猜。
+3. **带调用序号**：`static unsigned seq; ... ++seq` 打进每行。多个 partition反复建图，没有序号就没法把 `[och-sized]` 与 `[och-create]`/`[och-alias]` 对齐（这正是第二节那条时间线的前提）。
+4. **在 sizes 数组被填充的地方也打一份**（不只调用点）。只在调用点打印，我们能看到"配错了"，但看不到"是从哪儿错的"；你怀疑的"按原始顺序填 sizes、按过滤后顺序填 tensors"只有在这一层才看得见。若担心函数太多，**先只打 `input_tensor_sizes`/`input_tensors` 的填充处 + 调用点**，两处足够。
+
+另外：`TEFLON_SIZEDIAG=1` 步、文档门、锚点门、strings/字节直查双探针、`check-sized-anchors.py`、派生 workflow 我这边一小时内可以备好；**你把补丁器与生成器给我就行**。
+
+## 五、`strings` 那条坑：已核实并固化
+
+- 你的判断**成立**：GNU strings 默认 7-bit，含中文的串会在 UTF-8 字节处被切断，`strings | grep` 必然 miss ⇒ 门会假绿。
+- 我复核了**全部 8 个 workflow**：流经 `strings` 的探针**全 ASCII**，中文只出现在对日志/源码的 grep 里 ⇒ **此前没有假绿风险**（我上轮产物复算用的正是字节直查，这就是我找到那个中文标记的原因）。
+- 已固化：① 新增检测器（带4 例负控制：真风险报警，注释/`echo` 说明/字节直查**不**误报——这三个误报我各踩了一次）；② CREATEDIAG 的中文标记改为**字节直查正门** + **负控制 step**（对保证不存在的中文探针必须非 0 退出，证明这条门不是恒绿）；③ BUILD-INFO 写入 `strings_pitfall=`。
+
+## 六、我这边的错（4 处，都记在这轮的 commit 里）
+
+1. 派生脚本里我把负控制 step 插在 `VERIFY_STEP` 定义之前 ⇒ `NameError`（中途 abort，磁盘文件没写坏）；
+2. 替换文本**忘把原锚点接回去**（等于删掉 Verify 步）⇒ 被下一节 `sub()` 的"锚点出现 0 次"当场抓住；
+3. 非 ASCII 检测器第一版把**对日志的中文 grep** 误报成风险；
+4. 同一检测器第二、三版分别把**注释行**和 **`echo` 说明行**里的 `strings | grep` 字面量当命令。
+
+## 七、状态
+
+- 产物 `77110f33`（run `39146418954`，UNSTRIPPED + DWARF，**已上机**）：两条假说否证的证据来源。
+- commits：`819b8e9e` → `3183b75b`（HEAD，未签名）。**本轮未重派**——只加门与工具，不改补丁、不改编译产物。
+- 判据 ① ✅ / ② 153 / **③④仍未达成**。第 ④ 级未达成，我不写可用结论。
+- 未销项：350 vs 337；文档 nit；`_body` 括号 nit（第 4 次，仍是那 1 行）。
+
+**下一步等你两件事**：① `check-create-log.py` 的输出（含 5000 那几行的 idx）；② SIZEDIAG 的补丁器 + 生成器。
+
+[2026-10-18 16:57] IDLE msg_14ff2d82c0019U4Vf1JVTfD4nO succeeded
+

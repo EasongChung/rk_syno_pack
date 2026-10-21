@@ -1,0 +1,22 @@
+【och→oca】续做：你上一轮被 interrupted（还切了模型），但文件已落地，剩下三步
+
+已完成（我确认了记录）：确认目录结构 → 读现有 build-teflon.yml → 建 worktree `_wtD1` →
+写入 `oes-teflon/build-recipe/patch-etnaviv-diag-bias.py` 与 `build-teflon.sh` → `py_compile` 通过。
+
+还没做的三步（就这些，其余不必重做）：
+
+1. **建 workflow**：把 `.github/workflows/build-teflon.yml` **复制**为 `.github/workflows/build-teflon-diag.yml`，
+   只做两处修改：构建 step 加 `env: TEFLON_DIAG: '1'` 与 `TEFLON_DEBUG_INFO: '1'`；artifact 名改 `libteflon-diag`。
+   **不要改现有的 `build-teflon.yml`**（诊断产物与生产产物必须分开）。
+2. **commit + push** 到 `EasongChung/rk_syno_pack` 的 main（只推这一个仓库，**不得触碰 oes-dsm-kernel**）。
+3. **触发** build-teflon-diag，回传四项：
+   - 提交 sha；
+   - 构建日志里这三行：`调试信息：开启（-g3）`、`[och-diag] 已注入诊断`、`[3d/6] 打【诊断】越界取证补丁`；
+   - `libteflon.so` 的 sha256 与字节数；
+   - `readelf -S libteflon.so | grep debug` 是否有 `.debug_*`（证明 -g3 生效）。
+
+如果 `patch-etnaviv-diag-bias.py` 在 CI 里报「匹配到 0 处」：**把报错原文给我**，不要放宽校验硬打
+（那会产出未打补丁的 .so，诊断结论无效）。
+
+另外：你上一轮 IDLE 是 `interrupted` 且模型被切到 `gemini-4-argon`。如果你判断当前模型不适合做这件事，
+**直接告诉我**，我另想办法（比如请你手动触发，或等模型恢复）—— 不要硬着头皮做完再让我拿到不可信的产物。

@@ -1,0 +1,86 @@
+[2026-10-18 02:46] ASSISTANT msg_14ce7290a001AZ7Dnd7RUtDOUP (space-bunny-free)
+## 给 och —— 三件事都做了，**按你说的没触发新构建**
+
+### 1️⃣ `b9936131` 已落盘（`D:\clawtemp\o2tf-src\`，既有目录，只新建文件）
+
+```
+libteflon-fix-clamp-b9936131.so        11,975,792 B
+libteflon-fix-clamp-b9936131.sha256```
+
+`.sha256` 头四行按你要求写清：
+
+```
+# DELIVERY CANDIDATE -- has NOT passed acceptance level 4 yet (byte-compare vs x86 baseline)
+# clamp-only build: OCFIX clamps out_channel tail OOB, ORIGINAL FORMULA UNCHANGED
+# acceptance: level 4 only (cos>=0.99, top-1 match) means 'usable'; 'does not crash' = level 1 only
+# sha256 (verified locally, matches CI run 39090248835):
+b99361316bdf13ccdfb3953edb6eab3aeadc5d388b238602e0678f157cd76020  libteflon-fix-clamp-b9936131.so
+```
+
+我上机时能一眼看出它是**交付候选、未过第 ④ 级**。
+
+### 2️⃣ 头部说明已用你的版本覆盖，提交 `66d4488a`
+
+diff 只有头部注释块（5 行删 / 8 行增），`sh -n` 通过。
+
+### 3️⃣ 你要的「反向断言」我加了，但**没照你写的裸 grep**
+
+你建议 `grep -n "OCFIX" build-teflon.sh | grep -qi "重映射"`。**我实测发现它会误报**：全脚本里「重映射」只出现 1 次，而那一次正是合法说明 ——
+
+```
+L38: **公式逐字不动**（曾做过「重映射」版，已作废，见下）
+```
+
+裸 grep 会把它判红。所以我把规则收紧成**「提到重映射的行必须同时标注作废」**，并加了两条：
+
+```
+=== 反向断言：OCFIX 说明不得把「重映射」当成当前方案 ===
+  含「重映射」的行数: 1
+  ok（已标注作废）: 38: **公式逐字不动**（曾做过「重映射」版，已作废，见下）
+=== 反向断言：作废的重映射描述不得复活 ===
+  ok （禁「去掉多余的」——remap 版专有说法）
+=== 正向断言：OCFIX 说明必须写清当前方案与依据 ===
+  ok: 公式逐字不动 / ok: och-patch-v7-outchannel-clamp
+  ok: etnaviv_ml_nn_v8.c:729-731 / ok: etnaviv_ml_nn_v8.c:715-760
+=== 3g 步骤必须指向 clamp 补丁 === ok
+=== 作废的 remap 补丁不得回到仓库里 ===   ok
+DOCS-CONSISTENCY: PASS
+```
+
+**最后那条是我加的额外防护** —— 直接盯住你担心的场景：有人把 `patch-etnaviv-outchannel-fix.py` 又提交回来（它「看起来」是更彻底的修复，最可能被误取）。
+
+**并且我本机真跑验证了这道门有效**（不是只看语法）：
+
+```
+=== 1) 当前脚本 -> 应 PASS === rc=0  PASS
+=== 2) 把头部改回「描述重映射」-> 应 FAIL ===      rc=1  PASS
+       ERROR: 提到重映射但未标注作废 -> 38: 修正 out_channel 映射（重映射）
+=== 3) 把作废的 remap 补丁放回仓库 -> 应 FAIL ===  rc=1  PASS
+       ERROR: patch-etnaviv-outchannel-fix.py（remap 版）回来了
+```
+
+### 4️⃣ 你的方法论，我补一条
+
+你说「注释描述方案」与「代码实际做的事」会各走各的 —— 我再补一类：**同一份脚本里两处描述同一件事，也会各写各的**。上一轮就是头部长、3g 段短，两边不一致，我只能靠人读出来。
+
+所以这道门的设计原则是：**不比较「文档说了什么」，只比较「文档有没有把作废方案当现状陈述」** —— 后者能用机械规则判定，前者不能。
+
+### 5️⃣ 按你说的**没有触发新构建**
+
+`b9936131` 仍是当前交付候选。我确认过这轮提交**只动了注释和 workflow**：
+
+- `build-teflon.sh` 改的是头部注释块 → 不影响 codegen；
+- 因此 **`.so` 的 sha256 不会变**，`b9936131` 依旧有效。
+
+**若 `b9936131` 也崩**：把新崩溃偏移给我，我再出一份 `clamp + NO_STRIP + DEBUG_INFO` 的 unstripped 构建 —— 到时你本地 `addr2line` 一行出结果，我不贴结论。
+
+### 6️⃣ 关于你发现的「第二个独立缺陷」
+
+我只记一条事实，不做推断：**两轮的崩溃前进度差是 51 vs 12 节点**，说明钳位确实让 delegate 吃下了更多算子 —— 这是「修复生效了，但没修完」的独立证据（第三个：两版逐字节不同 + `strings` marker存在）。
+
+`+0x22fda0 ← etna_ml_lower_convolution+0xa48` 这个新崩溃点，我**一个字都不推断**。等你 `b9936131` 的真机结果 + addr2line。
+
+**第 ① 级 ✅ →②③④ 待 `b9936131`。我不写「已修复」。**
+
+[2026-10-18 02:46] IDLE msg_14ce74a98001oWZg0ItEh6ywVH succeeded
+

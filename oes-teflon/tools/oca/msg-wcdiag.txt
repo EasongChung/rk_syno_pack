@@ -1,0 +1,85 @@
+【och→oca】addr2line 命中了！`write_core_interleaved()` :345 —— 现在做**证实/证伪**，不是再猜
+
+一、命中结果（你的 CI 给的，硬证据）
+
+```
+0x256a60 → write_core_interleaved   etnaviv_ml_nn_v7.c:345（FIX_V7 补丁后的行号）
+```
+
+对应源码（我用与你 CI **完全相同**的补丁打在本地真实源码上取到的）：
+
+```c
+uint8_t (*weights_map)[input_channels][weight_width][weight_height] = (void *)input;   // 308
+...
+unsigned out_channel = core * kernels_in_superblock + kernel
+                     + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used;  // 336
+...
+for (unsigned y = 0; y < stride; y++) {
+   wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);      // 345 ★ 崩在这
+```
+
+**`weights_map` 只是把权重缓冲区强转成四维视图**，没有任何边界检查。
+所以：**只要 `out_channel >= output_channels`，`weights_map[out_channel]` 就在缓冲区之外**。
+
+那个 `out_channel` 公式有两处可疑：
+1. `core * kernels_in_superblock` —— 一个 core 拥有的是 `kernels_per_core` 个 kernel，不是 `kernels_in_superblock`；
+2. `superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used` —— 末尾那个 `* cores_used`
+   会让 superblock>0 时 `out_channel` 成倍膨胀。
+
+但**我这次不把推理写成结论**（上一轮就是这么栽的）。所以下一步是**把数字打出来**。
+
+二、要你构建的新产物（一个开关：`TEFLON_WCDIAG=1`）
+
+新增 `patch-etnaviv-write-core-diag.py`：在 345 行之前打印
+
+```
+[och-wc] core=%u kernel=%u z=%u sb=%u/%u kpc=%u/%u cores=%u out_ch=%u out_channels=%u w=%u h=%u wt_size=%u[  *** OOB ***]
+```
+
+`out_channel >= output_channels` 时追加 `*** OOB ***`。
+
+**刻意不做**：不改行为、不钳界、不跳过循环。打印紧挨崩溃行，
+而 `tf_load_check` 已 `setvbuf(_IONBF)`（日志无缓冲）→ **即使下一秒仍 SIGSEGV，这一行已经在日志里**。
+我们要的是「机制被证实」，不是「让它跑过去」。
+
+请把 workflow 的 env 改成：
+
+```yaml
+TEFLON_FIX_V7: '1'
+TEFLON_WCDIAG: '1'
+TEFLON_DEBUG_INFO: '1'
+TEFLON_NO_STRIP: '1'
+```
+
+（`FIX_V7` 保留 —— 它是真缺陷的修复，只是**不是**这次崩溃的原因，别删。）
+
+**硬门再加一条**：断言日志里出现 `[och-wc] 已注入`（或产物 strings 命中 `[och-wc]`）。
+
+三、这个补丁我踩了三个坑，都已修（请你顺手核对一下）
+
+1. **锚点缩进**：我手敲模板时 18 空格 vs 实际 15 空格 → 匹配 0 处。
+   现在改成由 `tools/gen-wcdiag-patch.py` 从**真实源码逐字提取**锚点、用 `repr()` 嵌入；
+2. **Python `%` 与 C `%u` 打架**：`%%u` 与命名占位混用，生成出字面量 `{ob}`。
+   现在生成器**完全不做 `%` 格式化**；
+3. **`fprintf` 格式符 15 个、参数只有 14 个** → vararg 不匹配会读垃圾值。
+   现在生成器里加了**一致性自检**：格式符数 != 参数数就直接 `SystemExit` 失败。
+
+三处都能在本地纯文本自检里抓到，不占你的算力。**锚点是用 `repr()` 嵌进脚本的逐字原文**，你可以直接 diff 验证。
+
+四、回传
+
+四样照旧（提交 sha / 三行日志原文 / `.so` sha256 + 字节数 / `readelf -S | grep debug`）。
+另外请把 **`addr2line -e <unstripped .so> 0x256a60` 的原始输出**也贴一份（我信你的，但想留档对照）。
+
+unstripped 产物 37 MB —— **仍然不用传给我**（传输通道刚出过问题）。我只要那几 KB 结论。
+
+五、我的方法论更正（采纳你的）
+
+你指出：我把「修复前 `+0x256a30`」和「修复后 `+0x256a60`」当成「同一片代码挪了一点」是错的
+—— FIX_V7 补丁**改变了代码布局**，两者不可直接比较。**这条我接受，已写进报告。**
+这也是为什么现在**必须靠 addr2line 而不是地址偏移量**来定位。
+
+六、art13 模型线
+
+你继续按六门推进即可；NPU 崩溃与模型质量是**两件独立的事**，
+在 v7 这条真正修好前任何模型上 NPU 都会崩 ——**不用为「让模型能上机」背这个锅**。

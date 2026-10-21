@@ -1,0 +1,163 @@
+【och→oca】ROFIX 上机结果：**预测命中**，assert 把根因说清楚了。请派 `ALIASDIAG` 诊断构建。
+
+## 一、ROFIX（`6acfef1f`）上机结果
+
+| 判据 | 结果 |
+|---|---|
+| ① 编译/分区不崩 | ✅ `EXIT=0`、`partitions=82`（与 `675a1091` 一致） |
+| ② 接管数 | ✅ **153 / 153 完全持平**；守卫仍精确命中 `op#58`/`op#153` |
+| CPU 基准 | ✅ `out_hash=0x707496a009ff9690`、303.174 ms —— **与历轮逐位一致** |
+| ③ NPU | ❌ **assert 失败**（不再是野指针） |
+| ④ 逐字节 | ❌ 未达成 |
+
+### 关键输出
+
+```
+tf_load_check: ../src/gallium/auxiliary/util/u_inlines.h:503: pipe_buffer_map_range:
+Assertion `offset + length <= buffer->width0' failed.
+
+*** SIGABRT ***  (16 frames)
+  libc(abort+0xdc) / libc(__assert_fail)
+  rofix.so(etna_ml_subgraph_read_outputs+0x38c)
+  rofix.so(+0x8561c)
+```
+
+对照两版：
+
+| 版本 | map 范围 | 读取范围 | 结局 |
+|---|---|---|---|
+| `675a1091` | `0, pipe_buffer_size(res)`=5000 | `tensor->size`=610000 | 越界读 605000 B → **野指针 SIGSEGV** |
+| `6acfef1f` | `tensor->offset, tensor->size`=0,610000 | 同 | **map 层 assert 拒绝** |
+
+**两版在说同一件事：`tensor` 元数据与 resource 实际大小不一致。**
+ROFIX 不再用「不一致的两个数」，于是不一致当场暴露。
+
+`[och-rofix]` 边界检查命中 **0** 次 ⇒ 所有 idx 都在 dynarray 范围内，
+**再次印证 H1（idx 越界）已排除**。
+
+派发正文里我写过「改后可能变成 assert 而不是正确读取，**这是个诚实的结果，不是失败**」——
+命中了。**这是本项目第一次拿到「可观测的失败」**，而不是野指针或静默错误数值。
+
+### 附带一条设备侧证据（我自己取的，不用你做）
+
+```
+etnaviv etnaviv: bound ff100000.npu
+etnaviv-gpu ff100000.npu: model: GC8000, revision: 7120
+etnaviv has been instantiated on a NPU, for which the UAPI is still experimental
+```
+
+`dmesg` 里 etnaviv **零报错** ⇒ NPU job 提交成功、内核无 oops。
+崩溃纯在**用户态回读**。所以问题落在 tensor 元数据/缓冲区管理层面，
+**与 coeff 排布是否正确无关** —— 这条线可以先放下。
+
+## 二、静态定位的可疑代码（含一处我自己说错的地方）
+
+`etnaviv_ml.c` 两个函数做批量元数据迁移：
+
+```c
+/* reference_tensor_with_offset，:198-224 —— 同时改 size 与 offset */
+if (old_res) for (i...) if (etna_ml_get_resource(subgraph, i) == old_res) {
+   pipe_resource_reference(&tensors[i]->resource, src->resource);
+   tensors[i]->size = size;
+   tensors[i]->offset = offset;
+}
+
+/* recreate_tensor，:226-246 —— ★ 只改 size，没有 offset 赋值 */
+if (old_res) for (i...) if (etna_ml_get_resource(subgraph, i) == old_res) {
+   pipe_resource_reference(&tensors[i]->resource, new_res);
+   tensors[i]->size = size;
+}
+```
+
+**⚠️ 更正**：我上一轮说「`recreate_tensor` 也有同样的一段」—— **错**。
+它**只改 size 不改 offset**，这个**不对称本身就是一条线索**。
+（我把这条更正写进了补丁的 STRUCT 注释，避免下一个人按「共性」去校验。）
+
+调用点 `:540 / :552 / :562 / :569` = `CONCAT` / `SPLIT` /
+**`NN` 且 `input_count > 1`（Add/Subtract）** / `BYPASS`。
+
+**可疑点**：批量分支把「所有共享 `old_res` 的 tensor」一律改成同一组值，
+但它们本该各自占据 `old_res` 的**不同段**。
+
+**但我用静态推不出实测那组数的关系** —— 三个 `off_expected` 全是 5000 的整数倍
+（305000=61×5000、610000=122×5000）、`bsize` 恰为 5000、`toff` 全为 0。
+所以要运行时数据。
+
+## 三、请你派
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 TEFLON_ALIASDIAG=1
+TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+```
+
+**开 `DEBUG_INFO`/`NO_STRIP`**：万一崩溃点又变，unstripped 可直接 addr2line。
+本轮**不要求**地址与 `6acfef1f` 对账（取证靠 `[och-alias]` 输出，不是地址）。
+
+### ★ ALIASDIAG 与 ROFIX 可同时开
+
+它们改的是**不同函数**：
+
+| 补丁 | 改的函数 |
+|---|---|
+| ROFIX | `etna_ml_subgraph_read_outputs` |
+| ALIASDIAG | `reference_tensor_with_offset`、`recreate_tensor` |
+
+⇒ 一次构建同时拿到「read_outputs 侧的范围」+「alias 迁移过程」。
+**我本地已验证两补丁共存**：两个 marker 都在、括号配平。
+
+### 打印内容
+
+```
+[och-alias] ref  src=%u dst=%u offset=%u size=%u old_res=%p new_res=%p
+[och-alias]   migrate idx=%d res=%p old(size=%u,off=%u) -> new(size=%u,off=%u)
+[och-alias] recreate idx=%u new_size=%u old_res=%p old(size=%u,off=%u)
+```
+
+**迁移明细在改之前抓旧值** —— 否则改完就看不出原本各是多少。这是这个补丁的关键。
+
+### 文件
+
+| 文件 | 说明 |
+|---|---|
+| `build-recipe/patch-etnaviv-alias-diag.py` | 新增 |
+| `build-recipe/build-teflon.sh` | 新增 **3k 步** `TEFLON_ALIASDIAG`（默认关）+ 头部注释 |
+| `tools/gen-aliasdiag-patch.py` | 生成器，接进 Preflight，**直接用文件不要誊写** |
+
+### 门（本地已全绿）
+
+正例 1 + **反例 7 全拦** + 幂等，**外加共存验证**（ROFIX + ALIASDIAG 同时打，两个 marker 都在、括号配平）。
+含编译期标记 `och-patch-alias-diag`（`__attribute__((used))`），`strings` 可硬判。
+
+**本轮踩的三个坑，都已写进代码注释**（别让下一个人重踩）：
+
+1. **锚点撞车**：`if (old_res) {` 在两个函数里**逐字相同**（都是 3 空格缩进），
+   只取它会让文件级匹配到 2 处 ⇒ 必须带函数内唯一上下文。
+2. **反向自检口径**：三处锚点里只有 `ref` 是在段**中间**插入（旧的应消失），
+   `rec`/`mark` 是**只追加型**（旧的应恰好保留 1 处）。
+   一律查「消失」会把正例全部误拒 —— **这个坑我本轮第二次踩**（ROFIX 那次修过）。
+3. **STRUCT 不能把两函数的共性写在一起**：`recreate_tensor` 没有
+   `tensors[i]->offset = offset;`，按共性校验必然失败。
+
+### strings 门
+
+`och-patch-alias-diag` **存在**（编译期标记）、`och-patch-v7-outchannel-clamp` 存在、
+`filter in_c (%u)...` 存在、`[och-rofix]` 存在、
+`[och-ro]`/`[och-wc]`/`[och-snfix]` **不存在**。
+
+### ⚠️ 运行期开关（不用你写进构建）
+
+`ML_DBG` 是运行期判断（`extern int etna_mesa_debug`）⇒
+**上机必须设 `ETNA_MESA_DEBUG=ml_msgs`**，否则 `[och-alias]` 一行都不会打。
+
+## 四、拿到数据后我要回答的问题
+
+1. `reference_tensor_with_offset` 被谁调、`offset/size` 怎么算出来的？
+2. 每次 `old_res` 批量迁移了**几个** tensor、它们原本各是什么 size/offset？
+3. 被迁移的 tensor 里，**有没有就是输出张量**（`idx=139/149/151`）？
+4. `recreate_tensor` 改 size 不改 offset —— 是否让某些 tensor 的
+   `offset` 指向了 new_res 之外？
+
+**在这四个问题有答案之前，我不写修法。**
+前两轮已有两次「看起来对、实际错」的修法，各浪费一轮 CI + 一次真机验证。
+
+四级判据第 ④ 级仍未达成，我不写可用结论。

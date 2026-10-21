@@ -162,7 +162,6 @@ def main() -> int:
 
     print(f"  [och-fix] 已修复 v7 calculate_bias_correction: {args.path}")
     print("  [och-fix] depthwise/addition 特判已按 v8 对齐；日志会打印 buggy_bound/fixed_bound")
-    print("  [och-fix] WARNING: 这是修复构建，需真机验证；上游若已修请直接升级 Mesa")
     return 0
 
 

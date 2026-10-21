@@ -1,0 +1,80 @@
+[2026-10-17 17:10] ASSISTANT msg_14ad7cee0001GuL07DPbbE5okr (space-bunny-free)
+  [tool:shell] {"command": "gh run list --repo EasongChung/rk_syno_pack --workflow build-teflon --limit 1 --json databaseId,status 2>&1 | ConvertFrom-Json | ForEach-Object { if ($_.status -ne 'completed') { gh run cancel $_.databaseId ...
+
+[2026-10-17 17:10] ASSISTANT msg_14ad7e508001ILzx6v9LpcopvV (space-bunny-free)
+  [tool:shell] {"command": "gh run watch 39052586740 --repo EasongChung/rk_syno_pack --exit-status --interval 25 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-17 17:10] ASSISTANT msg_14ad7eb8e001MADtNj5P0KYAtV (space-bunny-free)
+## 给 och —— 先报一个**好消息**（构建本身成功了），再报我自己的问题
+
+### 1️⃣ ★ 你要的东西**编译通过了** —— WCDIAG 补丁打上了，14 个变量全在作用域
+
+CI `39052060061` 的步骤结果：
+
+| 步骤 | 结果 |
+|---|---|
+| Preflight - v7 biasfix patcher | ✅ |
+| **Preflight - write_core_interleaved** | ✅ `formats=14 args=14 OK` + `PREFLIGHT wcdiag OK` |
+| **Build libteflon.so (FIX_V7 + WCDIAG + NO_STRIP)** | ✅ **编译链接全过** |
+| **Assert switches** | ✅ 6 行断言全过（含 `[3f/6]` 与 `[och-wc] 已注入`） |
+| **Verify artifact + DWARF gate** | ✅ `.debug_info` / `.debug_line` / `[och-wc]` strings 三门全过 |
+| addr2line | ❌ **我的 bug，见下** |
+
+**这直接回答了我上一轮标为「未验证」的那一条**：那 14 个变量（`core / kernel / z / superblock / superblocks / kernels_in_superblock / kernels_per_core / cores_used / out_channel / output_channels` + 3 个 `operation->`）**全部真实存在于 345 行作用域内**。若任何一个名字不对，`error: 'xxx' undeclared` 会让构建失败 —— 没有静默产出坏 `.so`。
+
+**你的补丁在 CI 里是真打过、真编进去的**，不是「日志说说」。
+
+### 2️⃣ 我连续三轮栽在同一个地方，必须说清楚
+
+| 轮次 | 我写的判定 | 为什么错 |
+|---|---|---|
+| 第1轮 | 内联 Python 解析 ELF 头 | format 串 `'<IIQQII'` 少一个 `Q`，读出 `sh_size=0` |
+| 第2轮 | `awk '$2==".text"{print $4,$6}'` | **列号是我按记忆写的**，本地测试用的是我自己伪造的样本 |
+| 第3轮 | 同上 | CI 上 `cut` 取到空串 → `$((16#))` 报 `invalid integer constant` |
+
+**第2、3 轮是同一个错误的两次重复**：我验的是「我以为的 readelf 输出」，不是真 readelf。**手写的、需要猜外部工具输出格式的判定，一律不可靠。**
+
+已改成：
+- `.text` 范围 → **按名字找字段**（与列号无关），且**解析不到就跳过**，只作参考；
+- 真正的门 → **「addr2line 自己解析不出这个地址就失败」**。它返回 `??` 就是无效地址，这是**直接答案**，不像段表那样是间接推断。
+
+顺带修掉一个更隐蔽的问题：`{ ... } | tee "$MAP"` 里 `exit 1` **只退出子 shell**，管道状态取 `tee` 的 0 ⇒ **那道门形同虚设**。已改成 `> "$MAP"` + `cat`。
+
+### 3️⃣ 这次我换了验证方法：**造假工具真跑**，不再只跑语法
+
+```
+BASH = C:\Program Files\Git\bin\bash.exe
+--- 正常：12 个带 0x 的有效地址 ---   rc=0 (期望 0)  含「ADDRES GATE PASSED」= True   PASS
+--- 反例1：PowerShell 变形后的十进制串 --- rc=1 (期望 1)  含「lacks 0x prefix」= True   PASS
+--- 反例2：合法十六进制但不在 .text 内 ---  rc=1 (期望 1)  含「could not resolve」= True   PASS
+--- 反例3：非十六进制字符 ---                rc=1 (期望 1)  含「not a valid hex address」= True PASS
+RESULT: ALL PASS
+```
+
+假 `readelf` 故意输出**宽索引**（`[ 9]`）与额外空列 —— 证明「按名字找」确实与列号无关。
+
+**这套 harness 还抓出一个真实脆弱点**：`nearest symbol` 那段嵌套 python 崩了 → `set -e` 把**整个步骤连同真正的门一起杀掉**。而它只是装饰性信息（函数名 DWARF 已经给了）。已改成非致命。
+
+### 4️⃣ 提交
+
+```
+7cb46caa  (main)  只改 build-teflon-diag.yml
+43d0e108          rev5 脚本 + wcdiag 补丁 + gen-wcdiag-patch.py + env/硬门
+```
+
+CI `39052586740` 已触发（生产已 cancel）。
+
+### 5️⃣ 一个我预判到、但仍要如实说明的风险
+
+**WCDIAG 补丁往 `write_core_interleaved` 里插了约 15 条指令，代码布局必然改变** ⇒ 上一轮那批地址（`0x256a60` 等）**可能已经失效**。
+
+这正是新门要抓的：若地址落在新 `.text` 之外，`addr2line` 返回 `??` ⇒ 步骤 **fail**，我会把报错原文给你，**不会自行猜新地址**。
+
+**若本轮报 `could not resolve`**，说明布局变了 —— 那时正确做法是：先把 WCDIAG 关掉出一份「基线地址」，或者你直接用 `.symtab` 里 `write_core_interleaved` 的新起始地址重新算。**我不会替你推断新偏移。**
+
+出结果我立刻贴：12 个地址的完整归属 + `.so` sha256/字节数 + `.debug_*` + `strings [och-wc]`。
+
+**关于 345 行那行代码、以及 `out_channel` 公式那两处可疑点 —— 我一个字都不推断，等你的 `[och-wc]` 数字。**
+
+[2026-10-17 17:10] IDLE msg_14ad806e1001eFiI7jM5r6kyUW succeeded
+

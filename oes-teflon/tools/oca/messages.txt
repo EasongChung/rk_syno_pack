@@ -1,0 +1,580 @@
+[2026-10-17 05:04] ASSISTANT msg_1483f9198001lLSBd7bqSMsGae (deepseek-v4.1-flash-free)
+  [tool:shell] {"command": "python3 -m py_compile D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py 2>&1; echo \"compile=$LASTEXITCODE\"; python3 -c \"import yaml; d=yaml.safe_load(open(r'D:\\clawtemp\\rk_syno_pack\\.github\...
+
+[2026-10-17 05:04] ASSISTANT msg_1483fa65c001dtPqEZQB6ja3xO (deepseek-v4.1-flash-free)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree add --detach D:\\clawtemp\\_wtVV origin/main 2>&1 | Select-Object -Last 1; Copy-Item D:...
+
+[2026-10-17 05:05] ASSISTANT msg_148409a57001utt6GNI5igEb3O (deepseek-v4.1-flash-free)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtVV --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree pru...
+
+[2026-10-17 05:06] ASSISTANT msg_14840da82001fyyuKveembwbds (deepseek-v4.1-flash-free)
+**给 och 的回复 —— 你的门已实测，判定是决定性的，而且它在 CI 上独立复现了你真机的结果。**
+
+## 一、输入敏感性门实测（CI `39004180722`）
+
+| 产物 | distinct hashes | 判定 |
+|---|---|---|
+| **`concept_int8_fixed`** | **4 / 4** | ✅ **PASS** |
+| `concept_int8_pertensor` | 1 / 4 | ❌ CONSTANT OUTPUT |
+| `concept_int8_tf`（MLIR） | 1 / 4 | ❌ CONSTANT OUTPUT |
+| `concept_int8_tf_legacy` | — | ❌ 加载失败（pad.cc:230） |
+
+**`concept_int8_tf` 的 1/4 与你真机的「4 输入 1 哈希」逐字吻合** —— 我的门在 CI(x86) 上**独立复现了你的设备侧发现**，两条独立证据互证根因判断。
+
+`concept_int8_fixed` 的四个哈希全不同：
+```
+all_0    0x25a86b638b038b33   min=-128 max=-43
+all_-128 0x2a433bf45e70af27   min=-128 max=55
+all_+127 0xd813dccef6a9736d   min=-128 max=-125
+ramp     0xb148bbc32062211f   min=-128 max=-29
+```
+
+## 二、⚠️ 我自己的门里有个标签错误，已修（`d8fa9b01`）
+
+上一版对**任何**非零退出都打 `FAIL (constant output / input-insensitive)`。但 `concept_int8_tf_legacy` 是**加载失败**（`pad.cc:230 PADV2 prepare 拒绝`），不是常量输出。
+
+**两者都不可用，但原因不同——混为一谈会误导归因。** 这正是我们反复栽的那类错（把"特定原因的失败"当成"通用标签"）。已改为不预设原因，判定以脚本自己的 verdict 为准。
+
+## 三、结论：**已有一个可用的 int8 模型，不需要"从零修 int8"**
+
+`concept_int8_fixed.tflite` = **legacy 量化器 + PADV2→PAD 修复**：
+- 退化 scale **0 个**（MLIR 是 6 个）
+- 同集 200 张 `cos=0.8879 / top1=0.73`
+- **输入敏感性 4/4 PASS**
+- 导出实测：`output_0000_i8.bin` mean=-126.99（反量化≈0.004）vs 原模型 mean=0.0017，同量级，非饱和
+
+## 四、这改变了你的优先级表
+
+| 你的表 | 实际 |
+|---|---|
+| 「修 FLT_MAX/255 **同时卡住** CPU 版和 NPU 版」 | **只卡 NPU**。按用户更正，CPU 版 = 原模型 `model_float16.tflite`，不涉及量化 |
+| 「int8 完全不工作」 | **只有 MLIR 产物不工作**；legacy 产物工作正常 |
+
+所以你**不需要**等我的 int8 修复版来做 CPU 版——原模型现在就能交付（你已实测它输入敏感 ✓）。而 NPU 线的基线可以从 `concept_int8_fixed.tflite` 起步（per-channel，卷积上不去，但**模型是活的**）。
+
+## 五、根因修正（重申，因为它决定了怎么修）
+
+不是 float16 溢出、也不是预处理不匹配，而是**张量在校准中从未被观测**：
+
+```
+TF MinMax 哨兵初值 {min=0, max=FLT_MAX}
+未观测 → min 钳到 ≤0 仍为 0，max 仍为 FLT_MAX
+scale = (FLT_MAX - 0)/255 = 1.3344405750530544e+36   ← 与你实测逐位吻合
+```
+
+如果是 inf 溢出，float32 会保留 `inf`，`inf/255 = inf`，**不会得到 FLT_MAX**。
+
+那 4 个是 `tfl.pseudo_qconst106/110/112`（伪量化**常量**）+ 沿 PadV2 被统一 scale 的 139/140/141。
+
+## 六、per-tensor 现状（第 2 优先级）
+
+| 组合 | 结果 |
+|---|---|
+| MLIR + per-tensor | 结构 ✅ 57/57，但 6 退化 ⇒ **常量输出** |
+| legacy + per-tensor | ❌ 转换器报错 `Quantized dimension ... Got 3 and 0` |
+
+`_experimental_disable_per_channel` **只有 MLIR 支持**。所以「可用基线 + per-tensor」目前做不到。**不要在坏模型上做 per-tensor**（你的提醒是对的，我已确认：per-tensor 变体也是 1/4 常量输出）。
+
+**建议下一步**：查**为什么 MLIR 校准器漏掉这 4 个张量**（对比 legacy 为何观测到），而不是事后 binary-search 补 scale。前者治本可复现，后者要对 4 个张量各搜一遍且未必唯一解。
+
+**仍未验证**：修好 MLIR 退化 scale 后 per-tensor 能否既结构达标又数值可用；以及卷积上 NPU 的实际收益。
+
+[2026-10-17 05:06] IDLE msg_14840fdff001yt1AKg7W9fYcx6 succeeded
+
+[2026-10-17 05:14] USER msg_14848838e0016Kb1hj27Ji2PXH
+
+
+[2026-10-17 05:14] ASSISTANT msg_148488493001S8vr6gJbEsIEdY (deepseek-v4.1-flash-free)
+
+
+[2026-10-17 05:14] IDLE msg_148489432001SEpiOkM0A142HK failed
+
+[2026-10-17 05:15] MODEL-SWITCHED msg_148497d50001tjVNkFsDRjhTya
+
+[2026-10-17 05:15] USER msg_1484986840011Bi37vKsB0UTet
+
+
+[2026-10-17 05:15] ASSISTANT msg_148497fbf001DyEUeSk6E8hpXj (space-bunny-free)
+och 的第 1 条指控我必须**先用数据核实再回应**——他的数字和我的 200 张数据直接冲突，而这种冲突最怕的就是我用"弱证据"硬顶。
+
+先查报告里的真实逐图数据：
+  [tool:shell] {"command": "$log = gh run view 39004180722 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; ($log -split \"`n\") | Where-Object { $_ -match 'REGRESS concept|agree=|0\\.0183|GATE-GENERAL|GATE-SCENE' } | ForEach-O...
+
+[2026-10-17 05:16] ASSISTANT msg_14849e412001CnT4yrWTgO6Tz7 (space-bunny-free)
+regress 这轮 `concept_int8_fixed` 报 exit=1（加载失败），但 SENS 门却成功加载了它（4/4 哈希）。**这个矛盾必须查清**：
+  [tool:shell] {"command": "$log = gh run view 39004180722 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Regression gate*' } | Where-Object { $_ -notmatch '\\[36;1m|she...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a00cb001IAU4q6mgPboPqU (space-bunny-free)
+  [tool:shell] {"command": "$log = gh run view 39004180722 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Regression gate*' } | Where-Object { $_ -notmatch '\\[36;1m|she...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a12f3001XtZUzplXj5cea1 (space-bunny-free)
+  [tool:shell] {"command": "$log = gh run view 39004180722 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Regression gate*' } | Where-Object { $_ -notmatch '\\[36;1m|she...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a23ee0010Sl1AQfpk1vb8a (space-bunny-free)
+**找到我自己造成的回归了 —— 而且它可能就是你指控的数据冲突的根源之一。**
+
+`regress.py:164 NameError: name 'shape' is not defined` —— 我提取 `preprocess_input` 时留了残缺引用，**regress 自那次提交起全部失败**。而步骤因为 `|| echo` 仍报 success，**我没发现**。先修：
+  [tool:read] {"limit": 18, "offset": 155, "path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\regress.py"}
+
+[2026-10-17 05:16] ASSISTANT msg_1484a3f12001GEXTG2kMfdvlWe (space-bunny-free)
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\regress.py", "newString": "if DEBUG['n'] < 2:\n        DEBUG['n'] += 1\n        print('DBG in: dtype=%s shape=%s quant=%s type=%s' % (\n            inp['dtype'], list(inp...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a4830001m38DerNWtmSK4U (space-bunny-free)
+修好了。现在做 och 的优先级 2（门补判据）——**并把我上一轮的错误做法一并修掉**：
+  [tool:edit] {"file_path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py", "newString": "print('  => VERDICT: PASS - output responds to input.')\n    return _ref_check(args, it, inp, out, variants)\n\n\ndef _ref_check...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a6998001Y1Hm3qPM80viaW (space-bunny-free)
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py", "newString": "print('  => VERDICT: PASS - output responds to input.')\n    return _ref_check(args, it)\n\n\ndef _ref_check(args, it):\n    \"\"\"与 ...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a7910001P4XymrGFUKvZUP (space-bunny-free)
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py", "newString": "ap.add_argument('--model', required=True)\n    ap.add_argument('--ref', default='tools/oes/models/model_float16.tflite',\n           ...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a83ef001giRN9SPjwF350k (space-bunny-free)
+现在修 workflow：regress 的 **error(exit≠3) 必须让步骤红**——这次假绿的直接原因就是它：
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\.github\\workflows\\qdq-clean-regress.yml", "newString": "echo \"=== REGRESS $b ===\"\n            case \"$b\" in\n              baseline_float_*)\n                # float 基线：不加 --re...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a924d001V4WDIg6aZbtMgI (space-bunny-free)
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\.github\\workflows\\qdq-clean-regress.yml", "newString": "set -euo pipefail\n          n=0\n          err=0\n          for f in out/*.tflite; do", "oldString": "set -euo pipefail\n  ...
+
+[2026-10-17 05:16] ASSISTANT msg_1484a9c0f001CEjXVWtk8BazZF (space-bunny-free)
+  [tool:edit] {"path": "D:\\clawtemp\\rk_syno_pack\\.github\\workflows\\qdq-clean-regress.yml", "newString": "if [ \"$n\" -eq 0 ]; then\n            echo \"GATE ABORT: no tflite candidate produced\"; exit 9\n          fi\n          if...
+
+[2026-10-17 05:16] ASSISTANT msg_1484aa595001qGpKCCyyp3pJOC (space-bunny-free)
+  [tool:bash] {"command": "cd /d/clawtemp/rk_syno_pack && python3 -m py_compile tools/oes/regress.py tools/oes/input_sensitivity.py && echo \"compile OK\" && python3 -c \"import yaml; d=yaml.safe_load(open('.github/workflows/qdq-clean...
+
+[2026-10-17 05:16] ASSISTANT msg_1484aaeee001ni8zW4Jswl5Lol (space-bunny-free)
+  [tool:shell] {"command": "python3 -m py_compile D:\\clawtemp\\rk_syno_pack\\tools\\oes\\regress.py D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py 2>&1; echo \"compile=$LASTEXITCODE\"; python3 -c \"import yaml; d=yaml.sa...
+
+[2026-10-17 05:17] ASSISTANT msg_1484abe82001PWtOSFFOpQ72Df (space-bunny-free)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree add --detach D:\\clawtemp\\_wtXX origin/main 2>&1 | Select-Object -Last 1; Copy-Item D:...
+
+[2026-10-17 05:18] ASSISTANT msg_1484ba8a70018KPgS0MzlwjG7D (space-bunny-free)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtXX --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree pru...
+
+[2026-10-17 05:18] ASSISTANT msg_1484c66f5001ee0vdp3uEtm2vs (space-bunny-free)
+  [tool:shell] {"command": "gh run watch 39005770479 --repo EasongChung/rk_syno_pack --exit-status --interval 20 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-17 05:18] ASSISTANT msg_1484c70af001b0qAnUYmVcBua5 (space-bunny-free)
+**给 och 第20轮的回复 —— 你第1 条指控我先接受一半，另一半我用数据反驳；并报一个我自己造成的、可能污染了两轮数据的回归。**
+
+## 一、我上一轮犯的两个错，先认
+
+**1. 用弱证据下结论（你指出的，正是要害）**
+
+我说"mean 同量级所以不是常量"——这是**无效推断**，你说得对。96% 饱和的输出完全可以让 mean 落在同一量级。**结论该由充分判据下，不由弱证据下。**
+
+**2. ⚠️ 我把 regress 打挂了，而且掩盖了两轮**
+
+查你这轮数据时发现：`regress.py:164 NameError: name 'shape' is not defined`
+
+那是我提取 `preprocess_input` 时留下的残缺引用，**regress 自那次提交起全部失败**，而 `|| echo` 让步骤报 success，**我连续两轮只看了别的地方，没发现**。
+
+**所以 `concept_int8_fixed` 的 cos=0.8879 是更早一轮（39001267570）的数据，不是当前状态的数据。** 我上一轮把它当现状引用，这是我的错。
+
+已修，并把 workflow 改成**regress 的 error(exit≠3) 直接让步骤红**，只有门限 MISS(exit=3) 才容忍——假绿的根源就在这里。
+
+## 二、但你的 0.512 与我的 0.8879 不矛盾：**单图 vs 200 图**
+
+| | 范围 |
+|---|---|
+| 你的 `cos=0.512083` | **单张** `oes-eval-0000.jpg` |
+| 我的 `cos=0.8879` | **200 张**均值 |
+
+单图 cos 方差极大。**0.512 在单图上完全可能与 0.8879 的均值并存。** 而322/335 饱和（96%）确实是坏信号。
+
+**"96% 饱和"这条我同意它构成疑点，但不同意直接判死**，理由是硬数据：
+
+```
+float 输出: min=5.26e-14  max=0.3157  mean=0.0017
+int8 输出层 scale=0.00390625, zp=-128
+```
+
+`mean=0.0017` < 半个 scale `0.00195` ⇒ **float 参照本身就有过半的真值落在零点附近**，量化成 int8 必然舍入到 −128。**高饱和率是这个输出层 scale 太粗的必然结果，不是模型独有的失败信号。**
+
+真正的失败信号是 **top1 不一致（165 vs 190）**——这条我认，是实打实的精度损失。
+
+## 三、我按你的判据补了门（不是照抄饱和率）
+
+`input_sensitivity.py` 新增 **float 参照逐图比对**（50 张，cos≥0.95 / top1≥0.90），这才是你说的**充分判据**。
+
+**饱和率只作诊断打印，不作硬阈值** —— 理由如上，直接卡 50% 会把这个模型误杀，也会放过真正的问题。如果你要硬阈值，我建议卡在**中间层张量**而不是输出层（输出层天然高饱和），请裁决。
+
+## 四、优先级 1️⃣（无退化 per-tensor）我需要先定位机制，不能盲改
+
+6 个退化张量里，**127/131/133 是 `pseudo_qconst106/110/112`（Int32 bias + 无形状常量）**，139/140/141 是沿 PadV2 路径的激活。
+
+关键线索：**它们是"校准从未观测到"**。我的假设是：**该分支的常量在图里被常量折叠**，校准器不观测常量，故给出哨兵 `{0, FLT_MAX}`。
+
+**验证这个假设、而不是直接填 scale**，办法是：让 MLIR 导出**保留所有张量**（`experimental_preserve_all_tensors`）再查那 4 个张量的**真实激活范围**——有了真值就能算出正确 scale，而不是猜（你测 1.0/0.404/0.1 都能过，说明"能过"不等于"对"）。
+
+这需要先确认 `tfl.pseudo_qconst` 是否真的不在 `tensors_to_quantize` 里。
+
+## 五、第 3 条 🎉 我确认收到，但补一个数据
+
+56 CONV + 17 DWCONV 被接受 —— 这是**第一次有卷积进 lowering**。而 SIGSEGV 在 `etna_ml_lower_convolution+0xa48`，你判断与畸形张量（尤其 TENSOR 133 无形状）相关。
+
+**我同意这个方向**，因为 lowering 里要 `weight_tensor->dims[]` 算 `weight_size`，形状为空会越界。**但注意 133 是 constant_values，不是 conv weight**——它更可能被当作 activation buffer 传下去。**修掉 133（PADV2→PAD 改写已经删掉它）恰好能一并验证你的假设。**
+
+**下一步我打算做**：把 PADV2→PAD 改写应用到你手上那份 per-tensor 模型上（它已经有 PADV2），**先验证 SIGSEGV 是否消失**——这一步成本极低，且能直接验证你的假设，不必等我做完整的无退化模型。
+
+**如果你要的是这个，请把那份 per-tensor 模型给我一份**（或告诉我它的产出命令），我改写后回传。
+
+[2026-10-17 05:19] IDLE msg_1484c9248001M1m3affVvHcJw2 succeeded
+
+[2026-10-17 05:32] MODEL-SWITCHED msg_14858afb4001EtXLNUY7gdnFRF
+
+[2026-10-17 05:33] MODEL-SWITCHED msg_148596eb2001TUyqiwM0xy7gD6
+
+[2026-10-17 05:33] USER msg_14859778d001nw1l6TJQf1bH27
+
+
+[2026-10-17 05:33] ASSISTANT msg_14859708f00104imgJyf6j2dP3 (DeepSeek-V4.1-Flash)
+我
+
+[2026-10-17 05:36] SYNTHETIC msg_1485cc370001g9fegUsI3z6q2Y
+
+[2026-10-17 05:42] ASSISTANT msg_1485cc3760016U5kfJXl1N2OYe (DeepSeek-V4.1-Flash)
+理解，我来处理。先纠正一个**角色混淆**：我不是 och，我是 oca（OC-EA）。och 是 NPU 交付链负责人，你们是两个人。你让我"把质问发给 oca 回答"——**收到质问的就是我**，所以我直接回答，不再转手。
+
+先查你说的"之前成功测试过"这个关键点：
+
+
+
+  [tool:shell] {"command": "gh run view 39005770479 --repo EasongChung/rk_syno_pack --json conclusion,status 2>&1; $log = gh run view 39005770479 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; ($log -split \"`n\") | Where-Obj...
+
+[2026-10-17 05:46] ASSISTANT msg_148649a74001HUgXimG7U0Cl5H (DeepSeek-V4.1-Flash)
+
+
+
+
+[2026-10-17 05:49] SYNTHETIC msg_14868b3c6001FKNB2OkmOZsw26
+
+[2026-10-17 05:50] ASSISTANT msg_14868b3cc001i91NosP9MqgpeU (DeepSeek-V4.1-Flash)
+
+
+
+
+  [tool:shell] {"command": "$log = gh run view 39005770479 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -notmatch '\\[36;1m|shell:|env:|endgroup|oneDNN|DBG |cuda|absl|AVX|comp...
+
+[2026-10-17 05:51] MODEL-SWITCHED msg_14869e66e001INfHfnPaJAnQdr
+
+[2026-10-17 05:52] USER msg_14869ef13001T0GeMoFF33rDDw
+
+
+[2026-10-17 05:52] ASSISTANT msg_1486b6ac70018I0u3KrJTvk9Pa (step-5-preview)
+  [tool:shell] {"command": "$log = gh run view 39005770479 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -match 'regress.py\", line|Error|SENS concept|VERDICT|distinct hashes|c...
+
+[2026-10-17 05:53] ASSISTANT msg_1486bd97f001CDYpM4wH0fDZb7 (step-5-preview)
+  [tool:shell] {"command": "$log = gh run view 39005770479 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\"; $i = ($lines | Select-String -Pattern 'regress.py\", line' | Select-Object -First 1).LineN...
+
+[2026-10-17 05:53] ASSISTANT msg_1486c1b09001sG1QlqVuGZQtj6 (step-5-preview)
+**又一个同类回归：`NameError: name 'np' is not defined`（regress.py:167）** —— 我提取 `preprocess_input` 时把 `import numpy as np` 也一起搬走了，但 `run_once` 的 DBG 块还在用。好在我上轮加的"regress 出错就红"抓住了它。
+
+修：
+  [tool:edit] {"newString": "def run_once(interp, image_bytes):\n    import numpy as np\n    inp = interp.get_input_details()[0]\n    out = interp.get_output_details()[0]\n    t = preprocess_input(inp, image_bytes)", "oldString": "def...
+
+[2026-10-17 05:53] ASSISTANT msg_1486c81af001tA4gHw2mYxvvq0 (step-5-preview)
+  [tool:shell] {"command": "python3 -c \"\nimport ast,sys\np=r'D:\\clawtemp\\rk_syno_pack\\tools\\oes\\regress.py'\nt=open(p,'rb').read().decode('utf-8')\ntree=ast.parse(t)\n# 静态检查：run_once 与 preprocess_input 里用到的所有自由名是否已定义\nimport bui...
+
+[2026-10-17 05:54] ASSISTANT msg_1486d4162001q256sDOgP63dIF (step-5-preview)
+本机内联 python 又被吞输出。写成一个**静态检查工具**——它能一次性抓住我这两轮犯的同一类错（提取函数时漏带 import）：
+  [tool:write] {"content": "#!/usr/bin/env python3\n\"\"\"静态检查：函数内引用了未定义的自由名（漏 import / 提取函数时漏搬）。\n\n## 为什么需要\n连续两轮犯同一类错：\n  1. regress.py 提取 preprocess_input 后，run_once 里遗留 `shape`\n     -> NameError（CI run 39004180722，掩盖了一整轮 regress）...
+
+[2026-10-17 05:55] ASSISTANT msg_1486d8cee001Lr1VKaA3LDHkn0 (step-5-preview)
+  [tool:shell] {"command": "cd D:\\clawtemp\\rk_syno_pack; python3 tools\\oes\\check_undefined_names.py tools\\oes\\regress.py tools\\oes\\input_sensitivity.py tools\\oes\\export_tensor_bytes.py tools\\oes\\qdq_to_tflite_tf.py tools\\o...
+
+[2026-10-17 05:55] ASSISTANT msg_1486dc678001yBYzOJCjpfPzW8 (step-5-preview)
+检查器抓到了**一个真 bug**（其余是闭包/dunder 误报）：
+
+**`input_sensitivity.py:128 _ref_check -> os` 未定义** —— 我新写的 `_ref_check` 用了 `os.path.join` 但该文件没 import os。**会在 CI 上直接崩**。
+
+修 bug + 消除闭包误报：
+  [tool:edit] {"newString": "import argparse\nimport hashlib\nimport os\nimport sys", "oldString": "import argparse\nimport hashlib\nimport sys", "path": "D:\\clawtemp\\rk_syno_pack\\tools\\oes\\input_sensitivity.py"}
+
+[2026-10-17 05:55] ASSISTANT msg_1486dfd6a0012GVArTU0sf6iEr (step-5-preview)
+  [tool:edit] {"newString": "def collect_bound(node):\n    \"\"\"收集某作用域内所有被绑定的名字（含嵌套函数的形参/局部）。\"\"\"\n    bound = set()\n    for n in ast.walk(node):\n        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):\n            b...
+
+[2026-10-17 05:55] ASSISTANT msg_1486e4e4a0019pMiz4Lngk0FfQ (step-5-preview)
+  [tool:shell] {"command": "cd D:\\clawtemp\\rk_syno_pack; python3 tools\\oes\\check_undefined_names.py tools\\oes\\regress.py tools\\oes\\input_sensitivity.py tools\\oes\\export_tensor_bytes.py tools\\oes\\qdq_to_tflite_tf.py tools\\o...
+
+[2026-10-17 05:56] ASSISTANT msg_1486eb7b90013Ral0syq6WWkY1 (step-5-preview)
+这 5 条是**我检查器自身的缺陷**（嵌套函数被顶层循环重复检查一遍，丢了闭包作用域）。修：
+  [tool:edit] {"newString": "mn = module_level_names(tree)\n        # 只从**顶层**函数进入，嵌套函数由 check_func 递归处理\n        # （否则嵌套函数会被顶层循环按其自身检查一遍，丢掉闭包可见名，\n        #  产生大量误报）。\n        for n in tree.body:\n            if isinstance(n, (ast.Fu...
+
+[2026-10-17 05:56] ASSISTANT msg_1486f1e91001k25WvWK7e5olKC (step-5-preview)
+  [tool:shell] {"command": "cd D:\\clawtemp\\rk_syno_pack; python3 tools\\oes\\check_undefined_names.py tools\\oes\\regress.py tools\\oes\\input_sensitivity.py tools\\oes\\export_tensor_bytes.py tools\\oes\\qdq_to_tflite_tf.py tools\\o...
+
+[2026-10-17 05:57] ASSISTANT msg_1486f604f001nNbzwLRMUwZM3b (step-5-preview)
+检查器现在 **0 误报**，且真 bug 已修。加进 push 前的自检流程：
+  [tool:read] {"path": "D:\\clawtemp\\o2tf-src\\verify_all.py"}
+
+[2026-10-17 05:57] ASSISTANT msg_1486fc1c8001ozqNYjN74Df2Ga (step-5-preview)
+  [tool:write] {"content": "\"\"\"提交前静态校验：编译、NUL 字节、AST 解析、YAML、未定义名、CLI 可解析性。\n\n## 为什么加\"未定义名\"这一项\n连续两轮栽在同一类错：提取函数时漏搬 import/局部变量，\n本地无 TF 跑不到，只能靠 CI 发现，而且被 `|| echo` 掩盖过一整轮。\n`check_undefined_names.py` 是纯 AST 检查，不依赖 TF，能在 push 前拦住。...
+
+[2026-10-17 05:57] ASSISTANT msg_148700e63001TiJJmsCTFM804U (step-5-preview)
+  [tool:shell] {"command": "python3 D:\\clawtemp\\o2tf-src\\verify_all.py 2>&1 | Out-String", "timeout": 600000}
+
+[2026-10-17 05:58] ASSISTANT msg_14870b89600185QjpHaEqbMuFj (step-5-preview)
+全部 24 个工具静态检查通过、0 未定义名。推送：
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree add --detach D:\\clawtemp\\_wtYY origin/main 2>&1 | Select-Object -Last 1; Copy-Item D:...
+
+[2026-10-17 06:00] ASSISTANT msg_148722ad9001URNsmHzGaquEKG (step-5-preview)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtYY --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree pru...
+
+[2026-10-17 06:01] ASSISTANT msg_148734ec0001hOUU69TbJFORCY (step-5-preview)
+  [tool:shell] {"command": "gh run watch 39008327776 --repo EasongChung/rk_syno_pack --exit-status --interval 20 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-17 06:01] ASSISTANT msg_14873723100129F5DOTWIAPVLP (step-5-preview)
+CI 在跑。现在核实你说的「**之前成功测试过 NPU**」——这条我必须用记录说话：
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack log --oneline -30 origin/main --grep=\"真机\\|NPU\\|npu\\|delegate\\|teflon\" 2>&1 | Select-Object -First 25", "timeout": 600000}
+
+[2026-10-17 06:02] ASSISTANT msg_148742362001FklSEZ1NEm73Cd (step-5-preview)
+  [tool:shell] {"command": "Get-ChildItem D:\\clawtemp\\rk_syno_pack\\.github\\workflows -Filter *.yml | Select-Object Name | Format-Table -AutoSize | Out-String; git -C D:\\clawtemp\\rk_syno_pack log -1 --format=\"%s%n%n%b\" 9f5494df ...
+
+[2026-10-17 06:02] ASSISTANT msg_148747bfb001ATYqESkdTRdndo (step-5-preview)
+## 一、先纠正角色：我是 **oca（OC-EA）**，不是 och
+
+你说"你就是 och，请把你的质问发送 oca 回答"——**这里有个身份混淆**：
+
+- **我 = oca（OC-EA）**，你指定的私人 Agent 助理，负责转换/量化/评测这条线
+- **och = 另一位**，NPU 交付链负责人（Mesa/delegate/真机），那些"质问"是他发给我的
+
+所以"把质问发给 oca 回答"= 我直接回答。我前几轮一直在做的就是这件事，**没有中间人可转**。
+
+## 二、⚠️「之前成功测试过 NPU」——记录不支持这个记忆
+
+我查了 och 的全部相关提交与真机报告，**没有任何一次成功的 NPU 推理**。看起来像成功的有两处，但都不是：
+
+| 时间点 | 看起来的成功 | 实际结果 |
+|---|---|---|
+| mesa-25.0.7 + 补丁 | `EXIT=0` + `DELEGATE_ACTIVE` + **18 个 NPU 子图建立** | 输出**全饱和 −128**（与 CPU 不一致）；耗时 **1128 ms = CPU 302 ms 的 3.7×**（更慢） |
+| per-tensor 模型 | **56 CONV + 17 DWCONV 被接受进 lowering** | NPU 侧 **SIGSEGV**（`etna_ml_lower_convolution+0xa48`）；CPU 侧输出几乎全零（6 个退化张量） |
+
+och 自己在第20轮的原话：
+
+> **「还没有任何一次成功的 NPU 推理。唯一有严格证据支撑的交付物是 float16 CPU 版（521 ms，数值正确）。」**
+
+你记住的"成功"，最可能是下面两个**里程碑**之一——它们是真的，但都只是**过程节点**，不是可用结果：
+1. 「18 个 NPU 子图建立 / DELEGATE_ACTIVE」← 只证明 delegate 装上了
+2. 「56 CONV + 17 DWCONV 被 NPU 接受」← 只证明进入 lowering，**随即 SIGSEGV**
+
+**这正好是我们这几轮反复栽的同一类坑**：`能加载 ≠ 能接管 ≠ 能跑通 ≠ 结果正确`。四层，每一层都有过"看起来成功"。
+
+## 三、我没法自己跑真机测试
+
+我的工作边界里明确写着**不连设备**（DS423 在 och 那边）。真机测试由 och 执行、由他回报。
+
+**我能做的是把"值得上机测的模型"造出来** —— 而这正是当前卡点：现有的 int8 模型没有一个同时满足「无退化张量 + 输入敏感 + per-tensor」。拿现在的东西上机，测出来的仍然是崩溃或常量，**不构成对 NPU 的检验**。
+
+## 四、我这轮修掉的两个自己的回归（都在 regress 里）
+
+| 回归 | 后果 |
+|---|---|
+| `regress.py:167 NameError: np` | 提取 `preprocess_input` 时把 `import numpy` 搬走，`run_once` 的 DBG 块仍引用 → **regress 全崩** |
+| `input_sensitivity.py _ref_check: os` | 新写的函数用了 `os.path.join` 但没 import → **会在 CI 崩** |
+
+**根因是同一类**：本地无 TF，只能靠 CI 发现；而我上轮加的"regress 出错即红"门恰好抓住了第二个（否则又会假绿一轮）。
+
+**已加静态防线** `tools/oes/check_undefined_names.py`（纯 AST，不依赖 TF），并接进 push 前的 `verify_all.py`——24 个工具现在 **0 未定义名**。它抓到的那一个真 bug（`os`）就是证明。
+
+## 五、CI `39008327776` 正在跑
+
+跑完我就能给出 **`concept_int8_fixed` 的真实 200 张 cos/top1**（而不是被我回归污染的旧数据），从而裁决你第20轮那条指控里"0.8879 vs 0.512"的冲突。
+
+**下一步（och 优先级 1）**：造「无退化张量 + 输入敏感 + per-tensor」的模型——这是让 NPU 测试**有意义**的前提。现在的 per-tensor 模型是坏的（6 退化 ⇒ 常量输出），拿它上机只会再得到一次 SIGSEGV，证明不了 NPU 能做什么。
+
+[2026-10-17 06:03] IDLE msg_1487548d1001ULM1KHTwVZdDzM succeeded
+
+[2026-10-17 06:14] SYNTHETIC msg_148737166001GEoFHsZSL7Duaj
+
+[2026-10-17 06:14] ASSISTANT msg_1487f8795001KU3Y0IMDcA6cPO (step-5-preview)
+  [tool:shell] {"command": "gh run view 39008327776 --repo EasongChung/rk_syno_pack --json conclusion 2>&1; $log = gh run view 39008327776 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Obj...
+
+[2026-10-17 06:15] ASSISTANT msg_1488089ce001G1kGRMdT9rohAh (step-5-preview)
+干净的数据到手了，**冲突可以裁决了**。先看结果：
+
+| 产物 | regress (200张) | SENS 4 输入 | vs float 参照 (50张) |
+|---|---|---|---|
+| float 基线 ×2 | cos=1.0000 top1=1.0 | — | — |
+| **`concept_int8_fixed`** | **cos=0.8879 top1=0.73** | **4/4 不同 → PASS** | cos=0.8718 top1=0.72 → **FAIL** |
+| `concept_int8_pertensor` | — | 1/4 → **常量输出** | — |
+| `concept_int8_tf`（MLIR） | — | 1/4 → **常量输出** | — |
+
+**冲突裁决（两面都要说）：**
+
+- **och 对的部分**：`concept_int8_fixed` **确实不可交付**。我新加的 float 参照门把它拒了（0.8718 < 0.95）。**top1=0.73 这个数字我不解释掉。**
+- **och 过头的部分**：它不是"常量输出"。4/4 哈希全不同、200 张 cos=0.8879 —— 它**对输入有响应**，是"精度不够"，不是"完全不工作"。**这两种失败的机理与修法完全不同**，混为一谈会把排查引向错方向。
+
+现在做 och 的优先级 1：**验证「删掉退化的 constant_values(133) 能否修好整条退化链」**——这同时验证他对 SIGSEGV 的假设：
+  [tool:edit] {"newString": "echo \"=== baseline for comparison (per-channel) ===\"\n          [ -s out/concept_int8_tf.tflite ] && \\\n            python tools/oes/check_pc.py --model out/concept_int8_tf.tflite \\\n              || t...
+
+[2026-10-17 06:16] ASSISTANT msg_148816a7f0010xb1gLxcP3OSLF (step-5-preview)
+需要退化张量计数——`check_pc.py` 不报这个。给 `tflite_fix_padv2.py` 加 `--audit-only`：
+  [tool:edit] {"newString": "ap.add_argument('--dry-run', action='store_true')\n    ap.add_argument('--survey-only', action='store_true')\n    ap.add_argument('--audit-only', action='store_true',\n                    help='只做完整性审计（量化数...
+
+[2026-10-17 06:17] ASSISTANT msg_14881d6b9001fSHFAS6rs2ohPB (step-5-preview)
+  [tool:edit] {"newString": "echo \"########## BEFORE (degenerate count) ##########\"\n          python tools/oes/tflite_fix_padv2.py --in \"$SRC\" \\\n            --out /tmp/x.tflite --audit-only --survey-only || true\n          pyth...
+
+[2026-10-17 06:17] ASSISTANT msg_14882294d001UbWf8yUaLiunsb (step-5-preview)
+  [tool:shell] {"command": "python3 D:\\clawtemp\\o2tf-src\\verify_all.py 2>&1 | Select-Object -Last 4", "timeout": 600000}
+
+[2026-10-17 06:18] ASSISTANT msg_14882ab92001s2WkVkZ6JAVD4b (step-5-preview)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree add --detach D:\\clawtemp\\_wtZZ origin/main 2>&1 | Select-Object -Last 1; Copy-Item D:...
+
+[2026-10-17 06:19] ASSISTANT msg_14883be7b001Z5kkXB5VvS4nAY (step-5-preview)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtZZ --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree pru...
+
+[2026-10-17 06:20] ASSISTANT msg_14884cacb001jVYqqg6kmF2faq (step-5-preview)
+  [tool:shell] {"command": "gh run watch 39009507872 --repo EasongChung/rk_syno_pack --exit-status --interval 20 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-17 06:20] ASSISTANT msg_1488527260018ca8R6B709K8Wy (step-5-preview)
+## 给你与 och 的完整交代
+
+### 一、角色澄清（重要）
+
+**我是 oca（OC-EA），不是 och。** 你让我"把质问发给 oca 回答"——**接质问的就是我**，所以我已经在逐条回答，没有中间人。och 是 NPU 交付链负责人，那些质问是他发我的。
+
+### 二、「之前成功测试过 NPU」——记录不支持
+
+我查了 och 的全部提交和真机报告，**没有一次成功的 NPU 推理**：
+
+| 看起来像成功的 | 真实结果 |
+|---|---|
+| mesa-25.0.7：`EXIT=0` + `DELEGATE_ACTIVE` + 18 子图 | 输出全饱和 −128；**1128 ms（比 CPU 302 ms 慢 3.7×）** |
+| per-tensor：**56 CONV + 17 DWCONV 被接受** | 随即 **SIGSEGV**；CPU 侧输出几乎全零 |
+
+och 自己第20轮原话：**「还没有任何一次成功的 NPU 推理。」**
+
+你记住的是**过程里程碑**（delegate 装上 / 算子被接受），不是可用结果。这正是我们反复栽的坑：**能加载 ≠ 能接管 ≠ 能跑通 ≠ 结果正确**。
+
+### 三、我不能自己跑真机测试
+
+我的工作边界写明**不连设备**。真机在 och 那边（DS423）。**我能做的是造出"值得上机测"的模型**——而这正是当前卡点。
+
+### 四、我刚拿到的干净数据（裁决了上一轮争议）
+
+| 产物 | 200 张 cos/top1 | 4 输入敏感性 | vs float 参照 |
+|---|---|---|---|
+| **`concept_int8_fixed`** | **0.8879 / 0.73** | **4/4 PASS** | 0.8718 / 0.72 → **FAIL** |
+| `concept_int8_pertensor` | — | 1/4 | **常量输出** |
+| `concept_int8_tf`（MLIR） | — | 1/4 | **常量输出** |
+
+**两面都认**：
+- och 对 —— `concept_int8_fixed` **不可交付**（我的 float 参照门已拒它）。**top1=0.73 我不解释掉。**
+- och 过头 —— 它**不是**常量输出（4/4 哈希不同）。是「精度不够」，不是「完全不工作」。**这两种失败机理和修法完全不同。**
+
+### 五、我这轮修的自己的 bug（连续第三次同类）
+
+`regress.py` 里 `np` 未定义、`input_sensitivity.py` 里 `os` 未定义 —— **都是我提取函数时漏搬 import**。已加静态检查器 `check_undefined_names.py`（纯 AST，不依赖 TF），接进 push 前自检，24 个工具现在 **0 未定义名**。
+
+### 六、CI `39009507872` 正在跑一个决定性实验
+
+**验证「删掉退化的 `constant_values`(133) 能否修好整条退化链」**，同时检验 och 对 SIGSEGV 的假设（他判断 SIGSEGV 与畸形张量相关）。
+
+给 per-tensor 模型做 PADV2→PAD 改写，对比改写前后的**退化张量数**。两种结果都是明确结论：
+- 退化数大降 → 133 是源头，整条链是"连坐"
+- 退化数不变 → 已烘焙进各张量自身参数，需逐张量修
+
+**结论出来我立刻报。在拿到「无退化 + 输入敏感 + per-tensor」的模型之前，我不会声称 NPU 能做什么。**
+
+[2026-10-17 06:21] IDLE msg_14885961b001sh89z9U4gYh3em succeeded
+
+[2026-10-17 06:33] SYNTHETIC msg_14885260d001009FBVdwKm0TcH
+
+[2026-10-17 06:33] ASSISTANT msg_14890fd58001GHkAQqLE8Cov68 (step-5-preview)
+  [tool:shell] {"command": "gh run view 39009507872 --repo EasongChung/rk_syno_pack --json conclusion,status 2>&1; gh run list --repo EasongChung/rk_syno_pack --workflow qdq-clean-regress.yml --limit 2 2>&1", "timeout": 300000}
+
+[2026-10-17 06:34] ASSISTANT msg_14891829c001go11ZVP0jPGpP4 (step-5-preview)
+  [tool:shell] {"command": "$log = gh run view 39009507872 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -notmatch '\\[36;1m|shell:|env:|endgroup|oneDNN|DBG |cuda|absl|AVX|comp...
+
+[2026-10-17 06:35] ASSISTANT msg_1489229b6001tHW4zhgau3CTWB (step-5-preview)
+关键对比已经出现：legacy 模型的 PADV2 输入是 `t139(i8, s=0.473)` —— **正常量级**，不是退化值。取假设验证步骤的 BEFORE/AFTER：
+  [tool:shell] {"command": "$log = gh run view 39009507872 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Test hypothesis*' } | Where-Object { $_ -notmatch '\\[36;1m|she...
+
+[2026-10-17 06:36] ASSISTANT msg_148932534001X8PI69rfvwS222 (step-5-preview)
+  [tool:shell] {"command": "$log = gh run view 39009507872 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -like '*Test hypothesis*' }; $i = ($lines | Select-String -Pattern 'PAC...
+
+[2026-10-17 06:36] ASSISTANT msg_1489392a0001As7gCOCdloJPif (step-5-preview)
+**假设被证伪了 —— 这是决定性的否定结果。**
+
+| | 退化张量数 |
+|---|---|
+| BEFORE（per-tensor 原样） | **6**（t127/131/133/139/140/141） |
+| AFTER（PADV2→PAD 删掉 133） | **6**（不变） |
+
+t133 已从算子输入移除（`op#4 n_in=3→2`），但**它仍留在张量表里且 scale 仍退化**，其余 5 个也**一个没修好**。
+
+**所以：退化已烘焙进各张量自身的量化参数，不是"被 133 连坐"。删掉 133 不能治愈整条链。**
+
+取该产物在门下的判定：
+  [tool:shell] {"command": "$log = gh run view 39009507872 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -notmatch '\\[36;1m|shell:|env:|endgroup|oneDNN|DBG |cuda|absl|AVX|comp...
+
+[2026-10-17 06:37] ASSISTANT msg_1489440ef001IDOYPoexyt7Jno (step-5-preview)
+## 实验结果（CI `39009507872`）—— 假设被证伪，且找到一个具体修法线索
+
+### 一、och 的假设（133 是退化源头）**不成立**
+
+| | 退化张量数 |
+|---|---|
+| BEFORE | **6**：`t127, t131, t133, t139, t140, t141` |
+| AFTER（PADV2→PAD 删掉 133） | **6**：**一个一个都没少** |
+
+算子层面确实改了（`op#4 n_in=3→2`），但 t133 仍留在张量表、scale 仍退化，其余 5 个**完全没变**。
+
+**结论：退化已烘焙进每个张量自身的量化参数，不是"被 133 连坐"。** 门也确认了：
+
+```
+SENS concept_int8_pertensor_padfix: distinct hashes 1/4 -> CONSTANT OUTPUT
+```
+
+**所以：修 PadV2 不能治愈退化链。** 这条路堵死了，我不再往这上面花时间。
+
+### 二、但我找到了**具体可执行的修法线索**
+
+对比同一位置（op#4，即 PadV2）在两个模型里的尺度：
+
+| 模型 | op#4 的输入张量 | scale |
+|---|---|---|
+| **legacy**（可用，0 退化） | `t139(i8)` | **s=0.473** ← 正常 |
+| **MLIR per-tensor**（常量输出） | `t139(i8)` | **s=1.334e+36** ← 退化 |
+
+**同一个张量，同一个位置，legacy 量化器算出 0.473，MLIR 算出 FLT_MAX/255。**
+
+这证明：**退化是 MLIR 量化器的产出缺陷，而正确的值客观存在（在 legacy 产物里）。**
+
+**修法**：按**张量名**把 legacy 模型里的正确 scale 移植到 MLIR per-tensor 模型的对应张量上（用名字匹配，不靠索引猜——两个模型张量数不同：354 vs 337）。
+
+这比 och 的二分搜索更可靠：**不需要猜，有真值来源**。
+
+### 三、`concept_int8_fixed` 的最终判定（两面都摆出来）
+
+```
+regress 200 张:  cos=0.8879  top1=0.73   -> 双门 MISS
+SENS 4 输入:     4/4 哈希不同            -> PASS（对输入有响应）
+vs float 参照:   cos=0.8718 top1=0.72    -> FAIL
+```
+
+- **对 och**：你是对的，**它不可交付**，我新加的 float 参照门已经拒了它。**top1=0.73 我不解释掉。**
+- **但**：它不是常量输出（4/4）。是「精度不足」，不是「完全不工作」——**这两种失败机理不同**，混为一谈会把排查引偏。
+
+### 四、当前状态汇总
+
+| 产物 | 退化 | 输入敏感 | 可用性 |
+|---|---|---|---|
+| `concept_int8_fixed`（legacy） | **0** | 4/4 ✅ | cos 0.8879/top1 0.73 → 精度不够 |
+| `concept_int8_pertensor`（MLIR） | 6 | 1/4 ❌ | 常量输出 |
+| `concept_int8_pertensor_padfix` | 6 | 1/4 ❌ | 同上（本实验） |
+| `concept_int8_tf`（MLIR） | 6 | 1/4 ❌ | 常量输出 |
+
+**没有任何一个同时满足「零退化 + 输入敏感 + per-tensor」。** 所以现在拿任何东西上机测 NPU，测到的都是崩溃或常量，**不构成对 NPU 的检验**。
+
+### 五、下一步（我要做的）
+
+**按张量名移植 scale**：legacy 的正确 scale → MLIR per-tensor 的退化张量。产出后立刻过四道门（零退化 / 无空形状 / 4 输入敏感 / vs float 参照 cos≥0.98 top1≥0.95）。
+
+**这才是 och 优先级 1 的正解**——不是二分搜索，是从一个已知正确的模型里取真值。
+
+**同时我不会声称**：移植后 per-tensor 就能用（SIGSEGV 是 och 侧的、我无法验证），以及任何 NPU 加速结论。
+
+[2026-10-17 06:37] IDLE msg_14894ce92001DoQlJhutl7V5zD succeeded
+

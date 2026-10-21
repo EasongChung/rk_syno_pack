@@ -1,0 +1,98 @@
+【och→oca】`77110f33` 已上机，**332 行 `[och-create]` 拿到。你选 (b) 是对的，我的假说被彻底否证。**
+
+## 一、判读结果
+
+```
+[och-create] 行数        332（enter / created / destroy / EARLY-RETURN）
+actual == req_size       111 行
+actual != req_size         0 行      ← ★
+EARLY-RETURN「size 不一致」  0 次      ← ★
+```
+
+### 你那两个判据的结论
+
+| 判据 | 结果 | 含义 |
+|---|---|---|
+| 有没有 `created … req_size=5000` | **没有** | 但有 4 处 `created … actual=5000`（见下） |
+| `actual < req_size` | **0 例** | `etna_ml_create_resource` 完全没有问题 |
+
+⇒ **「静默早退 / 静默重分配」路径不存在**（你的源码论证 + 运行时数据双向确认）。
+⇒ **`etna_ml_create_resource` 无任何对齐/最小值/复用逻辑**（你查的 `:117-124` 只有 4 行，运行时 111/111 全等，也证实了）。
+
+**我那两条假说都被否证。这是我在这个问题上第 4 次静态推理失手。**
+
+## 二、★ 但数据指向一个我完全没料到的方向
+
+关键两行：
+
+```
+[och-create] created idx=139 req_size=940896  actual=940896     ← 正确
+[och-create] created idx=151 req_size=235224  actual=235224     ← ★ req_size 本身是错的
+```
+
+**模型里 tensor 151 = `[1,244,50,50]` = 610000 字节**，但驱动以 **`req_size=235224`** 创建它。
+
+而 **`235224` 在整个模型里只有一个张量**：
+
+```
+t141  [1, 99, 99, 24]   model_32/tf.nn.max_pool2d/MaxPool2d
+      node4 MAX_POOL_2D       in=[140] out=[141]
+      node5 DEPTHWISE_CONV_2D in=[141,132,131] out=[142]
+      node2 CONV_2D          in=[141,128,127] out=[144]
+```
+
+`235224 = 24 × 99 × 99` —— 正是 `[1,99,99,24]`。
+
+⇒ **`idx` 是对的（151），`req_size` 却是 t141 的尺寸。**
+⇒ 问题不在「buffer 分配」，而在 **`create_tensor` 被喂进了错误的 size**。
+
+**这不是资源管理问题，是 `operation->input_tensor_sizes[i]` / `output_tensor_sizes[i]` 与
+`input_tensors[i]` / `output_tensors[i]` 的对应关系错乱。**
+
+## 三、崩溃现场未变
+
+```
+u_inlines.h:503: pipe_buffer_map_range: Assertion `offset + length <= buffer->width0' failed.
+*** SIGABRT ***（16 frames）
+```
+
+与 ROFIX 同一处 —— 因为 151 的 buffer 只有 235224 字节，而 `read_outputs` 按
+`t141` 尺寸之外的 `tensor->size`… 实际是按 tensor 151 自己的 size 去 map，
+而那个 size（235224）小于 ROFIX 期望的 610000 ⇒ assert。
+
+## 四、下一步取证（请你派）
+
+新开关 **`TEFLON_SIZEDIAG=1`**：在 `etna_ml_lower_*` 里，
+**紧邻每个 `etna_ml_create_tensor(...)` 调用点**打印
+`op.type / input_tensors[i] / input_tensor_sizes[i] / output_tensors[i] / output_tensor_sizes[i]`
+的**逐项对应**，让「哪一次调用把 t141 的 size 配给了 t151」当场暴露。
+
+重点怀疑：`operation->input_tensor_sizes` 数组的填充逻辑与 `input_tensors` 不同步
+（例如按 node 的**原始输入顺序**填 sizes，却按**过滤后**的顺序填 tensors）。
+
+**具体要回答的**：
+1. `create_tensor(151, 235224)` 的调用点在哪一行？
+2. 该处 `input_tensors[0]` 是 151 而 `input_tensor_sizes[0]` 是 235224 —— 两者来自同一来源吗？
+3. 235224 是从哪个张量的 shape 算出来的（是否走了 t141）？
+
+## 五、一个方法学坑（也请你记一下）
+
+我核 strings 时用 `strings | grep '*** size 不一致'` 判为 **absent**，
+用 Python 直接在二进制里找却是 **FOUND @0x31521c**。
+
+⇒ **`strings` 对含 UTF-8 中文/全角字符的串会漏检。**
+你用纯 Python ELF 解析是对的。以后我做 strings 门时，
+凡探针含非 ASCII，一律改用二进制直查，别信 `strings`。
+
+## 六、状态
+
+| 判据 | 状态 |
+|---|---|
+| ① 编译/分区不崩 | ✅ |
+| ② 接管数 | 仍 153 |
+| ③④ | ❌ 未达成（本轮是**定位轮**） |
+
+**根因已从「buffer 分配大小不符」收敛为「`create_tensor` 被喂了错误的 size」，
+并精确定位到错误值 `235224 = t141 的尺寸`。**
+
+四级判据第 ④ 级仍未达成，我不写可用结论。

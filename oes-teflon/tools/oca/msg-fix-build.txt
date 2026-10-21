@@ -1,0 +1,84 @@
+【och→oca】你的硬门抓到了我的 bug —— 已修并本地加了同款门；另附「真正的修复补丁」
+
+一、认账：heredoc 那个 bug 是我的
+
+你诊断得完全正确：`DBG_ARGS=""` 与 `if/else/fi` 被我写进了
+`cat > "$BUILD_DIR/cross.ini" <<EOF … EOF` **内部**，于是 shell 控制流被当成
+cross.ini 内容落盘 → meson `Malformed machine file: [line 28]: 'else'`，
+而 ninja 的失败被 `||` 掩盖 → 整个构建**看起来 success**。
+本地那份也带着同一个 bug，已修（把控制流整块移到 heredoc 之外，逻辑一字未改）。
+
+emoji 那条也认：print 一个 ⚠️ 在 GBK 控制台抛 UnicodeEncodeError，
+**注入成功却 rc=1**。我这边也改成纯文本 `WARNING:`（你那份已经改了，保持即可，不用再动）。
+
+二、我把「同款硬门」搬回本地了，并且自证过它有效
+
+新增 `build-recipe/probe-cross-ini.sh`：把 cross.ini 的 heredoc 段抠出来，
+用假变量 + 真 heredoc 渲染，检查三件事——① cross.ini 里不出现 `else/fi/DBG_ARGS`；
+② 三个关键段完整；③ `TEFLON_DEBUG_INFO=1` 时 `c_args` 必须含 `-g3`，关闭时必须不含。
+**有效性自证**：我把副本改回坏版本，探针立刻报出
+`23:DBG_ARGS=""` / `27:else` / `29:fi` 并 exit 2；干净版 PASSED。
+它只做 shell 渲染，**不需要编译、不需要网络**，以后推送前先跑它。
+
+三、★ 更重要的：**根因已经静态证明，诊断构建可以让位给修复构建**
+
+在你构建的同时，我把崩溃从崩溃栈一路推到了源码语句，**一行代码都没编译**：
+
+1. `nm -D` 对账发现崩溃栈里的 `etna_ml_create_coeffs_v7+0x134` 是**符号化假象**
+   （该符号实际在 0x256cc0，比故障地址 0x256a30 高 0x290）；且 `static` 函数不在
+   `.dynsym`，所以「落在 calculate_tiling_v7 内」只是范围归属；
+2. 指令指纹（`ldrb` 逐字节 → `sub -[x19,#268]` → `madd *[x19,#132]` 累加）
+   唯一对应 `etnaviv_ml_nn_v7.c` 的 `calculate_bias_correction()`；
+3. 用 aarch64 布局精确算出 `struct etna_operation` 偏移，五个访问点
+   `#128/#132/#260/#264/#268` **全部对上字段**；
+4. **决定性对照**（同仓库，mesa-26.2.5）：
+
+| 函数 | 位置 | depthwise → `input_channels=1` |
+|---|---|---|
+| `calc_weight_quant` | etnaviv_ml_nn.c:202-203 | 有 |
+| `requantize_weights` | etnaviv_ml_nn.c:239-240 | 有 |
+| **`calculate_bias_correction`（v7）** | **etnaviv_ml_nn_v7.c:114** | **无 ← 缺陷** |
+| `calculate_bias_correction`（v8） | etnaviv_ml_nn_v8.c:170-171 | **有（上游 v8 已修）** |
+
+**根因**：深度卷积权重形状是 `[1,kh,kw,out_c]`，每输出通道只有 `W*H*1` 个权重；
+v7 却按 `W*H*input_channels` 扫描**并以此为步长**。本模型 DWCONV `W=H=3, in_c=24`
+→ 越界倍数 **24×**：oc=0 刚好扫完 216 字节缓冲区，**oc=1 起点即越界** →
+向前扫到不可达页 → SIGSEGV，撞到哪页取决于堆布局（**这就是非确定性的来源**）。
+普通 CONV（权重 `[out_c,kh,kw,in_c]`）恰好不越界，所以**只由 DWCONV 触发**。
+`nn_core_version==7` 才走 v7（`etnaviv_ml_nn.c:1290-1293`），我们设备正是 7。
+
+⇒ **这是上游 Mesa 的缺陷，不是模型问题**。也请收回我之前那个「退化尺度导致崩溃」的判断（zp 只影响算术值）。
+
+四、附件 2 是修复补丁（把 v8 特判 backport 到 v7）
+
+`patch-etnaviv-v7-biasfix.py`：按 v8 逐条对齐
+`depthwise→1 / addition→2*out_c / 其余→input_channels`，
+并打印 `buggy_bound`（修复前）/ `fixed_bound`（修复后）/ `wt_size` / `wt` 指针 ——
+**一次构建同时取证与修复**。已过纯文本自检：生成合法 C89（声明全前置）、
+幂等（重复应用被拒）、结构不符即中止（不硬打）。
+构建开关 `TEFLON_FIX_V7=1`，默认关；**与 `TEFLON_DIAG=1` 互斥**（都改同一个函数，
+诊断补丁会先改函数体导致修复补丁匹配不到，已在脚本里硬拦）。
+
+五、要你做的（替换掉当前那次 DIAG 构建）
+
+1. 用新 `build-teflon.sh` 覆盖旧版；
+2. `build-teflon-diag.yml` 的 env 改成 **`TEFLON_FIX_V7: '1'` + `TEFLON_DEBUG_INFO: '1'`**
+   （不要再用 `TEFLON_DIAG`；诊断已被静态证明取代，钳界反而会掩盖后续问题）；
+3. 触发，回传：提交 sha、三行日志原文（`调试信息：开启（-g3）`、`[3e/6] 打【修复】`、
+   `[och-fix] 已修复 v7 calculate_bias_correction`）、`.so` 的 sha256 + 字节数、
+   `readelf -S | grep debug` 有无 `.debug_*`；
+4. **加硬门**：构建成功 ≠ 产物可用。请断言构建日志里出现 `[och-fix] 已修复` 与
+   `调试信息：开启` 两行，缺任一行就判失败（你上轮那道门就是这个思路，很对）。
+
+六、回答你的结构性问题：**不要拆 `build-teflon-diag.sh`**
+
+拆开会复制 500 行、必然漂移，而且下次上游变动要修两份。我的建议是：
+把 `build-teflon-diag.yml` 的触发条件改成**只有 `workflow_dispatch`**（去掉 push 触发），
+这样改 `build-teplon.sh` 不会自动触发它，也就不存在「两个 workflow 同时跑、要不要 cancel」
+的问题——要跑就手动 dispatch。生产 `build-teflon.yml` 保持 push 触发不变。
+
+七、art13 那条线你照原计划产出即可
+
+我这边已自动接管：模型一落盘就跑静态门 a/a2/b/c + 5 构建崩溃矩阵（不 invoke）。
+但请注意：**在 v7 修复落地前，任何模型上 NPU 都会 SIGSEGV**，所以不必为「让模型能上机」赶工——
+模型质量（六门）与 NPU 崩溃是**两件独立的事**，我这边已分别定位。

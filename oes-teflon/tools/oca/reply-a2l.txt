@@ -1,0 +1,72 @@
+[2026-10-17 16:55] ASSISTANT msg_14ac9e169001csKzTSlzxCE03c (space-bunny-free)
+  [tool:shell] {"command": "gh run watch 39051487131 --repo EasongChung/rk_syno_pack --exit-status --interval 25 2>&1 | Select-Object -Last 2; echo \"WATCH_DONE\"", "timeout": 3000000, "background": true}
+
+[2026-10-17 16:55] ASSISTANT msg_14ac9e840001cwQJPGPAhD7vdR (space-bunny-free)
+## 给 och —— 关键结论已拿到（第一个地址就中了）
+
+### 1️⃣ `0x256a60` 的 addr2line 结果（**这是本轮最重要的信息**）
+
+```
+=== 0x256a60 (decimal 2452064) ===
+-- addr2line -f -i -C:
+write_core_interleaved
+/home/runner/work/_temp/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c:345
+-- nearest symbol (.symtab):
+   write_core_interleaved.isra.0 +0x256790  (delta=720 bytes)
+```
+
+**崩溃在 `write_core_interleaved()`，`etnaviv_ml_nn_v7.c:345`。**
+
+⇒ 你上一条的推断（"这几乎肯定是另一个 static 函数，权重排布循环"）**方向对了**，函数名就是这个。注意它带 `.isra.0` 后缀 —— GCC 的 Interprocedural Scalar Replacement of Aggregates，把 `write_core_interleaved` 的一个 wrapper 内联/特化进了 `etna_ml_subgraph_create`，所以 `.symtab` 里的静态符号名带后缀。
+
+**行号 345 是打补丁后的文件行号**（补丁在109–119 行插入了约 15 行，未打补丁时约在 330 附近）。你对着 `third_party/mesa-src-26.2.5` 读时请注意这个偏移。
+
+### 2️⃣ 我自己踩的坑：12 个地址里只有 1 个是对的（已修）
+
+```
+ADDRS: 0x256a60,2452044,2452052,2452056,2452060,2452044,...
+                 ^^^^^^^^^^^ 全是十进制！
+```
+
+**PowerShell 把我命令行里的 `0x256a4c` 当成十六进制数字字面量，转成十进制再传给 `gh`。** 于是 11 个地址查的是完全不同的位置，addr2line 老老实实返回 `??:0`，**而步骤照样 `success`** —— 教科书级假绿。
+
+**已加两层修复**（`71a5ffba`）：
+- 调用侧：`fault_addrs` **整体加引号**；
+- 步骤侧（**真正防复发的那层**）：每个地址必须落在 `.text` 段区间内，越界即 `exit 1` 并打印收到的原始输入。不再依赖调用方传对。
+
+顺带修了两处我自己写的东西：`strtonum` 是 gawk 专有（Ubuntu 默认 mawk 没有，改用 python3 解析）；disasm 步改成 `continue-on-error` ——上一轮它崩了，**连带把 artifact 收集带没了**，关键证据到手却传不下去。
+
+### 3️⃣ 你要的四样（第 1 轮 CI `39051215623`）
+
+| 项 | 值 |
+|---|---|
+| 提交 sha | `cef9a747`（脚本 rev3）/ `f69ff414`（rev4 头部）/ `71a5ffba`（地址硬门） |
+| `.debug_info` / `.debug_line` | ✅ **两条硬门都 PASSED** —— 你的验收项达成 |
+| `.so` 大小 | **37,413,456 B**（stripped 版 11,975,792 B，约 3.1×） |
+| `.so` sha256 | `69aeeb347a8d2558bec98fe9a8bdd19d81936105142ff9821d772abd6621a6a0` |
+
+第 1 轮 CI整体 `failure`，原因就是第 2 点那个 disasm 步；**addr2line 步与 DWARF 硬门都是 success**。
+
+### 4️⃣ 我顺手做了一个本地粗归属（不等 CI）
+
+`-g3` 与 strip 都不改代码布局，所以我用手上那个 patched `.so`（`ffce949e`）直接解析了 `.dynsym`：
+
+```
+0x256a60  ← etna_ml_calculate_tiling_v7 +0x1150（已越过其 size=0x244）
+0x255710  ← etna_etc2_patch +0x320（已越过 size=0x9c）
+0x256cc0  ← etna_ml_calculate_tiling_v7 +0x13b0
+附近唯一导出符号：etna_ml_create_coeffs_v7 @ 0x256e90（size=0x3a8）
+```
+
+即这批地址全部落在 `etna_ml_calculate_tiling_v7`（+0x244 结束）与 `etna_ml_create_coeffs_v7`（0x256e90 开始）**之间的 static 函数区**，`write_core_interleaved` 正在其中。这条独立印证了 `.isra.0` 的归属方向。
+
+**⚠️ 一条方法论更正，请你记下**：你上一条把「修复前 `+0x256a30`」和「修复后 `+0x256a60`」当作同一片代码比较「往后挪了一点」—— 但 **FIX_V7 补丁往 `calculate_bias_correction` 里插了约 15 条指令**，后面的代码整体后移。**两个构建的地址不可直接比**。这次 DWARF 一出手就分家了（`+0x256a30` 那个旧点其实也在 `write_core_interleaved` 区域附近），说明「位置微移」这条线索本身不成立。
+
+### 5️⃣ CI `39051487131` 正在跑
+
+拿到全部 12 个地址的 `函数 + 文件:行` 后立刻贴给你。**artifact 这次也会正常上传**（unstripped `.so` 37 MB + `addr2line-map.txt` + disasm 窗口），但按你说的**产物不必传** —— 结论我贴对话里就够。
+
+我不再对 `write_core_interleaved` 做什么推断。**行号 345 的代码是什么、越不越界，等你判。**
+
+[2026-10-17 16:55] IDLE msg_14aca0740001z1YoRO1dYzrIoJ succeeded
+

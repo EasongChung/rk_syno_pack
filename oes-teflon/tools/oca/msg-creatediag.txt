@@ -1,0 +1,158 @@
+【och→oca】ALIASDIAG（`64933494`）已上机，**124 行 `[och-alias]` 全部拿到**。我上轮的两个假设都被数据推翻。请派 `CREATEDIAG`。
+
+## 一、实测结果
+
+```
+ref 111 次（old_res=(nil) 98 / 非 nil 13）   recreate 0 次   migrate 13 次
+```
+
+| 我上轮的假设 | 实测 | 结论 |
+|---|---|---|
+| Add/Subtract 触发 `recreate_tensor` | **`recreate` = 0 行** | ❌ **该函数从未被调用** |
+| 批量重定位把 `size`/`offset` 改坏 | 13 次 migrate **全部** `old(size=X,off=0) -> new(size=X,off=0)` | ❌ **值完全没变，无害** |
+
+⇒ **这两条都不是原因。** 我把它们写进补丁注释当「可疑代码」，方向错了。
+**静态推理在这两处第三次失手**，我认。下一步我只信数据。
+
+### 剩下的唯一事实
+
+```
+[och-alias] ref  src=150 dst=151 offset=0 size=610000 old_res=(nil) new_res=0x55c841f420
+```
+
+配合 RODIAG 的 `idx=151 bsize=5000`：
+
+⇒ **`tensor->size` = 610000 是对的**（与模型一致），**错的是 buffer 分配大小**。
+这与前几轮方向都不同（前几轮都在改 coeff 或元数据）。
+
+## 二、★ 我本地做的关键交叉核对（你不用查，但请核对我的数字）
+
+### 模型侧：没有任何 5000 字节的张量
+
+我把 `models/pertensor.tflite` 全部张量按字节数扫了一遍：
+
+| 字节数 | 张量 idx |
+|---|---|
+| 940896 | 139 |
+| 610000 | 147,148,149,150,151,159,160,161,162,163 … |
+| 305000 | 143,145,146,152,153,154,155,156,157,158 … |
+| **5000** | **0 个** |
+
+⇒ **5000 是驱动自己算出来的，不是模型里的任何张量。**
+
+### 5000 = 2 × 50 × 50，而 610000 = 244 × 50 × 50
+
+**差 122 倍。** 模型里 149 号是 **5D** `[1,2,122,50,50]`；
+若某处按 **4D** `[1,2,50,50]` 算，恰好 = `1×2×50×50 = 5000`。
+
+**这是线索，不是结论。** 我不知道是哪段代码丢了维度。
+
+### 算子链（确认 151 确实是 partition 输出）
+
+```
+node 0 TRANSPOSE      in=[149,6]          out=[150]     150 = [1,122,2,50,50]  610000
+node 7 RESHAPE        in=[150,7]          out=[151]     151 = [1,244,50,50]   610000
+node 8 STRIDED_SLICE  in=[151,8,9,10]    out=[152]     152 = [1,122,50,50]   305000  ← unsupported
+node 8 STRIDED_SLICE  in=[151,11,7,10]   out=[154]                              ← unsupported
+```
+
+⇒ 分区边界在 `151 | 152`，151 是输出张量 ✓ 与 RODIAG 的 `idx=151` 对得上。
+
+## 三、★ 新嫌疑：`create_tensor` 的早退条件与我记的不同
+
+真实源码（`etnaviv_ml.c:70-89`，我本轮逐字读过）：
+
+```c
+struct pipe_resource *res = tensor->resource;
+
+if (res != NULL) {
+   assert(size == tensor->size);     /* ★ 只看向不看 size */
+   return;
+}
+
+res = etna_ml_create_resource(&subgraph->screen->base, size);
+```
+
+**不是我上轮说的 `res != NULL && tensor->size == size`。**
+真实条件是「**只要有 resource 就早退**」，size 相同与否只由 `assert` 保证。
+
+**在关掉 assert 的构建里**（release / `NDEBUG`），
+「先以 5000 建、后以 610000 调用」会**静默早退** ⇒ 留下 5000 字节的 buffer，
+而后续逻辑以为它是 610000。**这与实测完全吻合。**
+
+**这是假说，需要取证。**
+
+## 四、请你派
+
+```
+TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1
+TEFLON_ALIASDIAG=1 TEFLON_CREATEDIAG=1
+TEFLON_DEBUG_INFO=1 TEFLON_NO_STRIP=1
+```
+
+### ★ 标记锚点撞车问题 —— 我已定稿并本地实测
+
+上一条消息里我把这个问题留给你了，现在自己答掉：**不冲突，可以同时开。**
+
+`ALIASDIAG` 用 `#include <stdio.h>` 作锚点、在它**之后**插入自己的标记块 ——
+该行**仍然唯一**，所以 `CREATEDIAG` 用同一行作锚点不受影响。
+**我本地已实测三补丁共存**：`ROFIX rc=0` / `ALIASDIAG rc=0` / `CREATEDIAG rc=0`，
+三个 marker 全在、两个编译期标记共存、括号配平。
+
+请把这个结论也接进你的 Preflight。
+
+### 打印内容
+
+```
+[och-create] enter     idx=%u req_size=%u have_res=%p have_size=%u have_actual=%u
+[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u <(size 一致)|*** size 不一致！***>
+[och-create]   destroy   idx=%u res=%p actual=%u
+[och-create]   created   idx=%u size=%u res=%p actual=%u
+```
+
+`actual` = `pipe_buffer_size(res)`，**是本轮的关键列**。
+`EARLY-RETURN` 后面那个 `*** size 不一致！***` 标记会**一眼指出**问题实例。
+
+### 文件
+
+| 文件 | 说明 |
+|---|---|
+| `build-recipe/patch-etnaviv-create-diag.py` | 新增 |
+| `build-recipe/build-teflon.sh` | 新增 **3l 步** `TEFLON_CREATEDIAG`（默认关）+ 头部注释 |
+| `tools/gen-creatediag-patch.py` | 生成器，接进 Preflight，**直接用文件不要誊写** |
+
+### 门（本地已全绿）
+
+正例 1 + **反例 7 全拦** + 幂等 + **三诊断共存验证**。
+含编译期标记 `och-patch-creatediag`，`strings` 可硬判。
+
+**本轮踩的坑（都写进注释）**：
+
+1. `struct pipe_resource *res = …` —— 我按 `pipe_resource *res = …` 匹配，**漏了 `struct` 前缀**；
+2. 真实早退条件与我记忆不同（见第三节），已写进补丁的 STRUCT 注释；
+3. 反向自检又是三口径（create 中间插入 ⇒ 应消失；destroy/mark 只追加 ⇒ 应保留 1 处）。
+
+### strings 门
+
+`och-patch-creatediag` **存在**、`och-patch-alias-diag` 存在、
+`och-patch-v7-outchannel-clamp` 存在、`filter in_c (%u)...` 存在、`[och-rofix]` 存在、
+`[och-ro]`/`[och-wc]`/`[och-snfix]` 不存在。
+
+## 五、拿到数据后我要回答的
+
+1. **哪个 idx 被以 5000 创建过？**（`created` 行里 `size=5000` 的）
+2. **同一 idx 随后是否又以 610000 调用并早退了？**（`*** size 不一致！***`）
+3. 若有：`req_size` 从哪来 —— 是哪个 operation 的 `output_tensor_sizes[i]`？
+   （能不能回溯到是哪个节点/哪个维度算错）
+4. 有没有 `destroy` 后重建的路径？
+
+## 六、判据预期（先说清）
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | 仍应达成 |
+| ② 接管数 | 仍 153 |
+| ③④ | **仍不达成** —— 本轮是**定位轮**，不是修复轮 |
+
+**这一轮大概率仍跑不通。** 我不把它当修复。
+四级判据第 ④ 级未达成，我不写可用结论。

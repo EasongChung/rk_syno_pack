@@ -1,0 +1,76 @@
+[2026-10-17 17:15] ASSISTANT msg_14adcfec0001iyuuRIKrr4YB6Q (space-bunny-free)
+  [tool:shell] {"command": "$lines = @(\"bdf39e55b56e5c2d9348de82a2e142ea9dacf29a3605d6a840db4bb0f8346cf9  libteflon-wcdiag-unstripped.so\"); Set-Content -Path D:\\clawtemp\\o2tf-src\\libteflon-wcdiag-unstripped.sha256 -Value $lines -E...
+
+[2026-10-17 17:16] ASSISTANT msg_14add9341001EfyG9JmY61HvL2 (space-bunny-free)
+##交付 —— 按新三元组标注
+
+### 1️⃣ 落盘位置（**只新建文件**，`o2tf-src\` 是既有目录）
+
+```
+D:\clawtemp\o2tf-src\libteflon-wcdiag-unstripped.so       37,415,744 B
+D:\clawtemp\o2tf-src\libteflon-wcdiag-unstripped.sha256  101 B
+```
+
+已按你要求**等 35 秒后**才回复，等待后复算 sha256 未变。
+
+### 2️⃣ sha256 —— **本地实算，三方一致**
+
+```
+本地实算    : bdf39e55b56e5c2d9348de82a2e142ea9dacf29a3605d6a840db4bb0f8346cf9
+CI 声明     : bdf39e55b56e5c2d9348de82a2e142ea9dacf29a3605d6a840db4bb0f8346cf9
+artifact 内 : bdf39e55b56e5c2d9348de82a2e142ea9dacf29a3605d6a840db4bb0f8346cf9
+```
+
+`MATCH` ✅字节数 `37,415,744` ✅
+
+### 3️⃣ 三元组标注（采纳你的新约定，也请你用同一格式引用我给的地址）
+
+| sha256(前8) | 构建配置 | 是否上过机 | 真机崩溃点 |
+|---|---|---|---|
+| `69aeeb34` / `ffce949e` | FIX_V7 + DEBUG_INFO + **strip** | ✅ **崩过（EXIT=139）** | `write_core_interleaved` **:345** |
+| **`bdf39e55`（本次交付）** | FIX_V7 + **WCDIAG** + DEBUG_INFO + **NO_STRIP** | ❌ **未上过机** | **未知**（等 `[och-wc]` + 新地址） |
+
+**请注意**：`bdf39e55` 里那些地址（`0x256a60` 等）是**这个**二进制的，**不是** `ffce949e` 崩溃点的地址。`ffce949e` 的崩溃点归属仍然是 `:345`。
+
+### 4️⃣ 你本地 addr2line 时会需要的两个锚点（**属于 `bdf39e55`，别混用**）
+
+```
+.text范围            : 0x84ab0 .. 0x2e108c
+write_core_interleaved.isra.0 起始 : 0x256790
+wb_stream_write 起始             : 0x255710
+```
+
+你拿到新崩溃地址后：
+
+```bash
+addr2line -f -i -C -e libteflon-wcdiag-unstripped.so <新地址>
+```
+
+`-i` 一定要带 —— 本轮数据证明**存在内联帧**（`append_bits` 被内联进 `write_core_interleaved`），不带 `-i` 你只会看到最外层，可能再次错判。
+
+想快速定位的话：`新地址 - 0x256790` 就是**距 `write_core_interleaved` 起始的字节偏移**。目前已知的函数内位置参考（同一二进制）：
+
+```
++672 .. +724   → append_bits :155/:160/:161/:162（内联自 :325）
++712 → write_core_interleaved :327
++740, +744     → write_core_interleaved :385
++752           → write_core_interleaved :387
++1328          → write_core_interleaved :356
+```
+
+### 5️⃣ 两点补充
+
+**a) artifact 里还有两个小文件，我也一并留着**（`D:\clawtemp\oes-teflon-wcdiag\`，同目录，非新建顶层目录）：
+`addr2line-map.txt`（4,327 B，12 个地址的完整归属）、`disasm-window.txt`（7,367 B，`objdump -dlS` 带源码文本窗口）、`build-diag.log`（156 KB，含完整构建日志）。你本地 addr2line 若与我的结果不一致，`disasm-window.txt` 那段源码可以直接对照。**要不要也放进 `o2tf-src\`？** 说一声我就拷（只新建文件）。
+
+**b) `libteflon-nodebug.so` 那条我撤回** —— 你要的是 unstripped（为了本地 addr2line），不是给设备瘦身。**设备上部署也请用这份37 MB 的**（DWARF 在设备上只是占空间，不影响加载与性能；`RUNPATH=$ORIGIN` 仍要求 `libdrm.so.2` 同目录）。我不再提这个变体。
+
+### 6️⃣ 采纳你的两条约定
+
+- **交付格式**：凡涉及「地址 ↔ 二进制」，一律带 `sha256(前8) / 构建配置 / 是否上过机` 三元组 —— 我后续所有汇报都这么写。
+- **FIX_V7 保留**：已在 workflow 里，未动。
+
+你上机后把 `[och-wc]` 全部行 + 新崩溃地址贴给我。**在你给出那两样之前，我对 `out_channel` 公式不做任何判断。**
+
+[2026-10-17 17:16] IDLE msg_14addade3001A0ERAy1z96E3R1 succeeded
+

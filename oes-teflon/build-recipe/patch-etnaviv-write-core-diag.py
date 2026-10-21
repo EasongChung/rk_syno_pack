@@ -44,7 +44,7 @@ MARKER = "och patch: write_core_interleaved out_channel diagnostics"
 # ↓↓↓ 逐字锚点（由 tools/gen-wcdiag-patch.py 从真实源码提取，勿手改）↓↓↓
 OLD = '                  for (unsigned y = 0; y < stride; y++) {\n                     wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);\n'
 NEW = '                  for (unsigned y = 0; y < stride; y++) {\n/* och patch: write_core_interleaved out_channel diagnostics */\n                        fprintf(stderr,\n                                "[och-wc] core=%u kernel=%u z=%u sb=%u/%u "\n                                "kpc=%u/%u cores=%u out_ch=%u out_channels=%u "\n                                "w=%u h=%u wt_size=%u%s\\n",\n                                core, kernel, z, superblock, superblocks,\n                                kernels_in_superblock, kernels_per_core, cores_used,\n                                out_channel, output_channels,\n                                operation->weight_width, operation->weight_height,\n                                operation->weight_tensor_size,\n                                (out_channel >= output_channels) ? "  *** OOB ***" : "");\n                     wb_stream_write(&wb_stream, weights_map[out_channel][z][x][y]);\n'
-# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+# ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
 
 def main() -> int:

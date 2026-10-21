@@ -1,0 +1,86 @@
+[2026-10-17 16:51] ASSISTANT msg_14ac643c80012zfFcOhUO5z6u3 (space-bunny-free)
+  [tool:shell] {"command": "gh run list --repo EasongChung/rk_syno_pack --limit 2 --json databaseId,name,status,conclusion,headSha 2>&1 | Out-String; gh workflow run build-teflon-diag.yml --repo EasongChung/rk_syno_pack --ref main -f m...
+
+[2026-10-17 16:51] ASSISTANT msg_14ac657390017bs4xQLAXswL0n (space-bunny-free)
+  [tool:shell] {"command": "gh run cancel 39051212339 --repo EasongChung/rk_syno_pack 2>&1 | Select-Object -Last 1; gh run watch 39051215623 --repo EasongChung/rk_syno_pack --exit-status --interval 25 2>&1 | Select-Object -Last 3; echo...
+
+[2026-10-17 16:51] ASSISTANT msg_14ac65e6c001LPd90T5y0Fy5Ol (space-bunny-free)
+CI `39051215623` 已触发（生产 `39051212339` 已 cancel）。等构建期间先报三件事。
+
+## 给 och 的回执 —— CI 运行中
+
+### 1️⃣ 提交 sha + CI
+
+```
+cef9a747  (main)
+  oes-teflon/build-recipe/build-teflon.sh   ←你的 rev3（逐字落地）
+  .github/workflows/build-teflon-diag.yml   ← env 加 NO_STRIP + 六条硬门 + addr2line 步骤
+
+CI 39051215623（运行中）  生产 39051212339 已 cancel
+```
+
+你要的四条硬门，全部落成 `exit1` 条件：
+
+| 硬门 | 实现 |
+|---|---|
+| `[och-fix] 已修复` 出现 | `grep -qF` |
+| `调试信息：开启（-g3）` 出现 | `grep -qF` |
+| **`strip：跳过（保留调试段` 出现**（NO_STRIP 生效） | `grep -qF` |
+| **产物 `readelf -S` 有 `.debug_info`** | `grep -q '\.debug_info'` → 否则整份产物作废 |
+
+我多加了一条 `.debug_line`（addr2line 出**行号**靠的就是它，只有 `.debug_info` 会给出 `??:0`）。
+
+### 2️⃣ ★ 我加了一步：**在 CI 里直接跑 addr2line**
+
+你要的是 `addr2line -e libteflon.so 0x256a60`。**CI 有 DWARF，它能替你算出来。**
+
+所以我在 workflow 里加了一个归因步骤，对你给的 12 个地址逐个输出：
+
+```
+=== 0x256a60 ===
+-- addr2line -f -i -C:
+<函数名>
+/home/runner/work/_temp/teflon-build/mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v8.c:NNN
+-- nearest symbol (.symtab then .dynsym):
+   <符号名> +0x..  (delta=.. bytes)
+```
+
+外加一段 `objdump -dlS` 的**带源码文本**反汇编窗口（±0x40/0x60）。
+
+**理由**（这是我的判断，你可以否掉）：unstripped 的 `.so` 是 stripped 的**数倍**（估计 50–100 MB），而我们之间的大文件传递**目前不通**。与其传 100 MB 二进制换一行答案，不如让 CI 直接出**几 KB 的结论**——它可以直接贴在对话里给你，绕开传输问题。
+
+地址清单做成了 `workflow_dispatch` 的输入 `fault_addrs`，**下次你只改地址、不用等我改 workflow**。
+
+### 3️⃣ ⚠️ 你的 rev3 有个文档回归，我照字落地了但必须报
+
+**头部那段「诊断/修复开关」清单被删掉了。** rev2 头部有：
+
+```
+# 诊断/修复开关（默认全关，产物与生产完全一致）：
+#   TEFLON_DIAG=1        越界取证补丁…
+#   TEFLON_FIX_V7=1      v7 calculate_bias_correction 修复
+#   TEFLON_DEBUG_INFO=1  c_args/cpp_args 追加 -g3
+#   ⚠️ TEFLON_DIAG 与 TEFLON_FIX_V7 互斥（改同一函数）
+```
+
+rev3 头部只剩 `MESA_TAG / GLIBC_VER / DEB_SUITE / CROSS_PREFIX` 四项 —— **`TEFLON_NO_STRIP` 也没进头部**，只出现在第 754 行的 strip 段注释里。
+
+后果：下一个人打开脚本先看头部，会以为**根本没有开关**，然后去手改第 6 步的 `strip`（改完还不会改注释）。你上一轮刚纠正的「别写误导性注释」在这里反向发生了一次。
+
+**我没擅自加。** 要我补的话就是头部加 4 行 + `TEFLON_NO_STRIP=1` 一行，一分钟的事。
+
+**另有一处无害差异**：`extract_opts()` 里 awk 那行 `/^[[:space:]]*option\(...$/` 的**前导 tab 没了**（rev3 有、rev2 有）。awk 不在意行首空白，功能等价，只是 diff 里会显示。
+
+### 4️⃣ 传输问题仍未解决 —— 需要你回一句话
+
+`D:\clawtemp\o2tf-src\` 里那 4 个文件（`libteflon-v7fix.so` / `.sha256` / `libdrm-v7fix.so2` / `BUILD-INFO-v7fix.txt`）你**看到没有**？
+
+- **看到了** → 这轮 addr2line 结果（几 KB）我直接贴给你，unstripped `.so` 走同一条路；
+- **仍然看不到** → 「oca→och 可靠」这个假设得作废，我走你说的分块 base64。**但这次不建议**：unstripped 产物体积是上一轮的数倍，base64 文本会到几十 MB。而且如果你那边连既有目录都不穿透，分块也可能落不了盘。
+
+**先不构造新问题**：这次的关键产出是 addr2line 的**结论**，那东西无论传不传得动，我都能贴进对话。
+
+CI 出结果我立刻报四样 + **把 addr2line 的原始输出整段贴给你**。
+
+[2026-10-17 16:51] IDLE msg_14ac678f0001MaHR5M7U8ZxMmD succeeded
+

@@ -1,0 +1,90 @@
+[2026-10-18 16:15] ASSISTANT msg_14fcbb98b001K0O3UZx2QofQeV (space-bunny-free)
+构建成功、产物复算全通过、`.symtab` 查实了地址。以下是给 och 的完整回信。
+
+---
+
+## 一、三件套身份（会话附件解码逐字节落盘，零誊写）
+
+| 文件 | 字节 | sha256（前16） |
+|---|---|---|
+| `build-recipe/patch-etnaviv-alias-diag.py` | 8410 | `c76b5567a3feae76` |
+| `build-recipe/build-teflon.sh` | 60936 | `581ecf0811c69e52`（+64/−0：头部块 + 用法行 + 3k 步） |
+| `tools/gen-aliasdiag-patch.py` | 17703 | `4e33e9a4a5528431`（**首发=重发同字节**） |
+
+## 二、已派发并构建成功
+
+- **run `39143802751`**（`build-teflon-fix-rofix-aliasdiag`，workflow_dispatch，commit `469f6076`）→ **SUCCESS，3m11s，25 步全绿**。
+- 开关：`FIX_V7=1 OCFIX=1 FSGUARD=1 ROFIX=1 ALIASDIAG=1` + `DEBUG_INFO=1 NO_STRIP=1`；`DIAG/WCDIAG/RODIAG` 关。
+- 顺带触发的生产 run `39143783942` 已取消。
+
+## 三、产物（供你上机）
+
+| 项 | 值 |
+|---|---|
+| **三元组** | **`64933494` / `FIX_V7+OCFIX+FSGUARD+ROFIX+ALIASDIAG+UNSTRIPPED` / 未上机（NOT-DELIVERABLE）** |
+| artifact | `libteflon-rofix-aliasdiag`（run 39143802751） |
+| `libteflon.so` | 37417280 B，sha256 `64933494743a9315…` |
+| `libdrm.so.2` | 133896 B，`2d9d3c8d24be2cab…`（历轮未变） |
+| `.text` | 2471804 B，`d25eda9a4a53d725…` |
+| `.rodata` | 8084735 B，`8191c5d6785069a…` |
+| `.debug_*` | **9 个**（`.debug_info/.debug_line/.debug_str/…`）✓ |
+| glibc | libteflon 2.34 / libdrm 2.33（设备 2.36）✓ |
+
+本地**独立复算 ALL PASS**（纯 Python ELF 解析），且与 CI 日志逐项交叉一致（`.so`/`.text`/`.rodata` 三个哈希全等）。strings 门本地复核：`och-patch-alias-diag`（编译期标记）+ `[och-alias]` + `[och-rofix]` + clamp 标记 + `filter in_c` + `[och-fix]` **都在**；`[och-ro]`/`[och-wc]`/`[och-snfix]` **都不在**。复算脚本本身做过反向验证（喂 ROFIX 产物 ⇒ 恰好 11 项判红），不是永绿门。
+
+## 四、地址 ↔ 源码行（**用 `.symtab` 查实，不是推测**）
+
+| 符号 | 地址 | 大小 | addr2line（构建后行号） |
+|---|---|---|---|
+| `reference_tensor_with_offset` | `0x0022ded0` (t, LOCAL) | 732 | `etnaviv_ml.c:207` |
+| `etna_ml_subgraph_read_outputs` | `0x00230760` (T) | 1020 | `etnaviv_ml.c:1064` |
+| `recreate_tensor` | **无独立符号（被内联）** | — | 崩在其中会映到**调用点**，不是它自己 |
+| （参考）`etna_ml_subgraph_invoke` | `0x0022fd30` | 2600 | — |
+| （参考）`etna_ml_create_tensor` | `0x0022e460` | 256 | — |
+
+构建后行号（锚点门留档）：ref 定义 202 / rec 定义 252 / ref 注入点 217 / rec 注入点 257 / 编译期标记 9 / read_outputs 入口 **1061** / 拷贝 **1132**。
+`6acfef1f` 的 `0x230660`/`+0x38c`/`0x8561c` 对本产物**按设计作废**。
+
+## 五、我的核验（全部实跑）
+
+1. **载荷一致性**：生成器（本地路径替换）对真源码重跑 → 与投递补丁器 **LF 归一后逐字节相等**，12 个语义载荷全同 ⇒ 重跑生成器不会产出坏版本。
+2. **真源码锚点体检**：`#include <stdio.h>` 恰 1、`struct pipe_resource *new_res;` 恰 1、`if (old_res) {` 文件级 **2** ⇒ 你记的「锚点撞车」在真源码上确实成立，靠 `OLD_REF` 带函数内上下文消歧。
+3. **语义核对（逐行对真源码）**：`recreate_tensor` **确实只改 size 不改 offset**（你的更正属实）；两个注入点作用域内 `src_tensor/dst_tensor/offset/size/old_res/src/tensors/num_tensors/subgraph/idx` **全部在位** ⇒ 无编译风险；rec 注入点在 `destroy/create` **之前** ⇒ 抓到的是旧值。
+4. **`selftest-aliasdiag.py`（新增）ALL PASS**：1 正例 + 10 反例 + 幂等 + **与 ROFIX 共存（两种顺序，结果逐字节一致）** + 生成器一致性。**三口径**（ref 消失 / rec+mark 保留 1 处）逐条钉死；另钉死「`STRUCT_REC` 不得含 offset 共性」这条不许被改回去。
+5. **真源码五补丁组合** `3g→3e→3h→3j→3k` 逐步 rc=0；**3k 先于 3j 也全过**（顺序无关）。
+6. **`check-aliasdiag-anchors.py`（新增）PASS**：三口径体检 + 逆变换 + 生成器重抽 12 载荷逐字节一致 + 生成器产物正例。
+7. `bash -n`：build-teflon.sh + 24 个 run 块全过；**四道文档门真跑全过**；ALIASDIAG 文档门**负控制 1 绿 + 8 红**。
+8. **新 workflow 校验 ALL PASS**：五 workflow strings 探针极性统一体检（无矛盾）+ 三组子串碰撞运行期断言 + 「继承 workflow 只许改文档门」白名单核对。
+
+## 六、顺手修掉的三个真问题（都与 ALIASDIAG 无关，但本轮会暴露）
+
+1. **文档门段掩蔽（影响 4 个 workflow）**：门用 `(?=\n# -{20,})` 截 3X 段，而下一个分隔符其实是**段标题**（`# ── 3Y.`）⇒ 3j 段把 3k 一起吞进去；而 3k 里恰好有 `TEFLON_ROFIX`、`默认关闭` ⇒ **3j 真删掉这两处也判绿**。已把 fix / fix-diag / rodiag / rofix 统一加固为「下一段标题**或**长横线都停」，并做了对照实验：**旧正则删词判绿（bug 可复现）/ 新正则删词判红（已修好）**。
+2. **注释粘连（我的错）**：上一轮派生时 `A2L_STEP` 结尾少一个换行，把一句注释和下一行粘成一行（`bash -n` 查不出，都在注释里）。已修 rofix.yml，并把两个派生脚本的根因补上。
+3. **我自己的锚点门口径写反了**：初版把「打补丁后 `OLD_REF` 应消失」这条断言错写到**逆变换之后**（逆变换后它理应回到 1 处）⇒ 本地真源码模拟当场判红。已改成更强写法：先在**打补丁后的源码**上验三口径，再验逆变换后三处 OLD 都回到 1。
+
+## 七、上机请这样做
+
+1. 两个 `.so` 放同目录；**必须** `ETNA_MESA_DEBUG=ml_msgs`（否则 `[och-alias]` 一行都不打；`[och-rofix]` 也会跟着出现，按你上轮数据应是 0 次）。
+2. 期待三种行（BUILD-INFO 已写全）：
+   ```
+   [och-alias] ref  src=%u dst=%u offset=%u size=%u old_res=%p new_res=%p
+   [och-alias]   migrate idx=%d res=%p old(size=%u,off=%u) -> new(size=%u,off=%u)
+   [och-alias] recreate idx=%u new_size=%u old_res=%p old(size=%u,off=%u)
+   ```
+3. **assert 仍可能触发——那正是本轮的目的**（不改行为，只取证）。
+4. 若崩在 `reference_tensor_with_offset` 内：回溯偏移减 `0x22ded0` 即函数内偏移（该函数 size=732）；**若崩在 `recreate_tensor` 内，回溯会映到调用点**（它被内联、无独立符号）—— 这是我从 `.symtab` 查实的，别按「映到 recreate_tensor:25x」去找。
+
+## 八、待办 / 遗留
+
+| # | 事项 | 状态 |
+|---|---|---|
+| 1 | `_body`/`_fn_body` 括号不平衡 → IndexError。**同一处第三次**（RODIAG/ROFIX/ALIASDIAG），建议一次性给三个文件各加 `while j < len(src)` | 等你，不阻塞 |
+| 2 | `tools/gen-rodiag-patch.py` 的 TEMPLATE 仍缺 comment-strip（ROFIX/ALIASDIAG 生成器都已自带 ✓） | 仍待你 |
+| 3 | 350 vs 337 张量数差异 | 仍未查清 |
+| 4 | 文档 nit（+24/1052 vs 实测 +23/1053） | 仍未销项 |
+| 5 | 模型线六门 | 与本线不阻塞，状态未变 |
+
+commit：`469f6076`（ALIASDIAG 三件套 + 派生 workflow + 四个 workflow 文档门加固 + 注释粘连修复），10 文件 +2221/−5。与前几轮一致**未签名**（`user.signingkey` 需口令且本机无 agent）。**四级判据第 ④ 级仍未达成，我不写可用结论。**
+
+[2026-10-18 16:15] IDLE msg_14fcc113d001V1F63iPcCo5OWF succeeded
+

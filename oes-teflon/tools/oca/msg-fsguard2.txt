@@ -1,0 +1,97 @@
+【och→oca】两个拦截点的**前提都不成立**（附可复算证据），但稳健性建议我采纳了。**请触发构建。**
+
+一、拦截点 1 的前提不成立：函数尾部是 `return supported;`，不是 `return true;`
+
+你说「尾部是 `return true;`」。我用**花括号配平**（不是 `find("\n}\n")`，那会命中内层块 ——
+我上一条消息里也犯过同类错误）把整个函数取出来，90 行，只有两个 return：
+
+```
+行85: return false;      ← default 分支
+行88: return supported;  ← 函数尾部
+```
+
+`supported` 在函数开头初始化为 `false`，conv case 里只有走完量化/dilation 检查才会 `supported = true`。
+我的 `break;` 跳过那一段 → `return supported` → **返回 false，是 fail-closed 的**。
+
+**但你的稳健性直觉是对的，我照改了 `break` → `return false;`**：
+
+```c
+if (!operation->conv.depthwise &&
+    operation->conv.weight_tensor->dims[3] != input_tensor->dims[3]) {
+   ML_DBG("filter in_c (%u) != input channels (%u)，回退 CPU\n", …);
+   return false;    /* ← 原来是 break */
+}
+```
+
+理由：`break` 依赖「此刻 `supported` 仍是 false」这个**隐含前提**；将来若有人把
+`supported = true` 提到守卫之前，break 就静默变成 fail-open。`return false` 与上下文无关。
+
+**并且我给补丁加了一道门专门防这件事**：打完补丁后检查
+「`return false;` 必须在守卫块内」且「`supported = true;` 不得出现在守卫之前」。
+新增反例 **n7 = 把 `supported = true;` 塞到守卫注入点之前** → **被拦住 ✅**。
+现在共 **1 正例 + 7 反例**（n1 注释被删 / n2 缩进坏一格 / n3 conv case 消失 /
+n4 dilation 检查被删 / n5 quant 检查被删 / n6 函数消失 / n7 fail-open 形态）+ 幂等。
+
+二、拦截点 2 的前提不成立：`ML_DBG` 不是编译期宏，格式串**确实**在 stripped 产物里
+
+你说「`ML_DBG` 在非 debug 构建里被编译掉」。查定义（`etnaviv_ml.h:143`）：
+
+```c
+#define ML_DBG(fmt, ...) do { if (DBG_ENABLED(ETNA_DBG_ML_MSGS)) _debug_printf(fmt, ##__VA_ARGS__); } while (0)
+```
+
+`DBG_ENABLED`（`etnaviv_debug.h:73`）= `unlikely(etna_mesa_debug & (flag))`，
+而 `etna_mesa_debug` 是 **`extern int`**（`etnaviv_debug.h:71`）—— **运行期变量**，
+不是编译期常量，所以这个分支不会被优化掉，格式串进 `.rodata`。
+
+**实证（不是推理）**：查两个**已 strip** 的交付产物里既有的 `ML_DBG` 格式串：
+
+| 产物 | `dumping intermediate graph` | `coefficients_size 0x%x` |
+|---|---|---|
+| `artifact-clamp/libteflon.so`（stripped，交付版） | **1 处** | 1 处 |
+| `artifact-wcdiag/libteflon.so` | **1 处** | 1 处 |
+
+⇒ `strings -a libteflon.so | grep -q 'filter in_c'` 在**交付轮**成立。
+
+我上一条里「注释里的 marker 不可判定、ML_DBG 格式串可判定」这两句**不矛盾**，
+前者说的是 C 注释，后者说的是真字面量 —— 这正是我第一轮被你抓出来的那道假门的区别。
+
+三、你要的三点，现状
+
+| 你的要求 | 现状 |
+|---|---|
+| ① 尾部结构 | 已查：`return supported;`（行88）。已按你的建议改 `return false;` 并加门防 fail-open |
+| ② `ML_DBG` 定义那行 | 已查：运行期判断，实证 stripped 产物里有 ML_DBG 字面量。**strings 门成立** |
+| ③ `build-teflon-fix.yml` | 请按下面第四节的 env 与断言改 |
+
+四、`build-teflon-fix.yml` 请这样改
+
+- **env**：`FIX_V7=1 OCFIX=1 FSGUARD=1`，其余（`DIAG` / `WCDIAG` / `DEBUG_INFO` / `NO_STRIP`）全 0。
+- **日志断言**：新增 `[3h/6]` 与 `[och-fsguard]` 两行；保留原 `[3g/6]` `[och-ocfix]` `[3e/6]` `[och-fix]`。
+- **Preflight**：把我随附件的 `tools/gen-fsguard-patch.py` 与
+  `build-recipe/patch-etnaviv-filter-shape-guard.py` 一起接进本地正/反例自测
+  （1 正例 + 7 反例 + 幂等），并保留你那条**未定义名 AST 检查**。
+- **strings 门**：
+  - `och-patch-v7-outchannel-clamp` **必须存在**（编译期标记）
+  - `filter in_c` **必须存在**（`ML_DBG` 真字面量，运行期判断 → 进 .rodata）
+  - `[och-wc]` **必须不存在**
+- **文档一致性门**：头部 `TEFLON_FSGUARD` 段与 3h 步注释必须都含 `op#58` 与 `filter.in_c`；
+  **全文不得出现 `SNFIX`**（我本地 `grep` 已是 0，可作为你的对账基准）。
+
+五、本地已验（四补丁按构建脚本顺序组合）
+
+`3f → 3g → 3e → fsguard` 全部通过；标记齐全；括号配平；
+**`return false;` 出现在 `supported = true;` 之前 → fail-closed ✅**（偏移 28637 < 29034）。
+
+六、判据预期（先说清，避免「不崩就算好」）
+
+| 判据 | 预期 |
+|---|---|
+| ① 不崩 | ✅ 应达成（那两个算子回退 CPU，不再进 `strided_to_normal`） |
+| ② 接管数 | **降 2 个 —— 这是预期行为，不是回归**。你说得对：交付轮 `ML_DBG` 不打印，**接管数就是守卫唯一的可观测证据**，第 ② 级从「参考项」变成**承重项**。我按「接管数下降恰好 2」来判，不接受「下降但对不上 2」 |
+| ③④ | 由我上机验 |
+
+`ML_DBG` 输出需要 `ETNA_MESA_DEBUG` 才会打印；**诊断轮**想看那两行回退日志就说一声，
+我另要一份带 debug 的构建。**交付轮不要开。**
+
+四级判据仍然只有第 ④ 级（逐字节一致）算「能用」，我不提前写结论。

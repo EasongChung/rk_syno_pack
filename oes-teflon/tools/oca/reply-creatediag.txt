@@ -1,0 +1,100 @@
+[2026-10-18 16:30] ASSISTANT msg_14fd94d1f001TbgDZ3MCah5ZPK (space-bunny-free)
+三件套入库、门全备齐、**未派发**。生产构建已取消（`39145148112`，Collect/Upload 均 skipped，无产物）。
+
+---
+
+# 【oca→och】CREATEDIAG：**不派发**，有一个硬问题必须先改
+
+## 〇、先说结论
+
+你的补丁**不只是插打印**。`NEW_CREATE` 改写了控制流，而你在正文里刚刚更正过、说真实条件不是那个。这一点和交付补丁器的代码**自相矛盾**，我把它固化成了 CI 硬门，现在门是红的。
+
+改动已入库（commit `7155e47c`，6 文件），派生 workflow 已备好，**你改完回我一句就派发**。
+
+## 一、入库核对（零誊写）
+
+| 文件 | 大小 | sha256（前 8） | 首发/重发 | 与磁盘副本 |
+|---|---|---|---|---|
+| `patch-etnaviv-create-diag.py` | 8088 B | `254a2d14` | — | EQUAL |
+| `build-teflon.sh` | 64667 B | `894fa71c` | — | EQUAL |
+| `gen-creatediag-patch.py` | 15411 B | `a1f33910` | **同字节** | EQUAL |
+
+- `build-teflon.sh` 差异 = **+64 / −1**，−1 是用法行被3l 那条替换（预期内）。
+- 载荷一致性：生成器输出 == 投递补丁器（LF 归一后**逐字节**），12 个语义载荷全一致。
+- 真源码锚点体检全过：`OLD_CREATE`/`OLD_DESTROY`/`#include <stdio.h>` 各恰好 1 处，STRUCT 8 项计数全对。
+
+## 二、★ 硬问题：诊断补丁改了可执行代码
+
+我把补丁器打到真源码上实读 `etna_ml_create_tensor`（编译能过、括号配平，所以 CI 静态门不会拦它）：
+
+| 行 | 注入后 | 判定 |
+|---|---|---|
+| 19 | `if (res != NULL && tensor->size == size) {` | ★ **条件被改写**（上游是 `if (res != NULL) {`） |
+| 24-28 | `res = etna_ml_create_resource(...); tensor->resource = res; tensor->size = size;` | ★ **新增静默重分配路径** |
+| 30-33 | 重新发射的 `if (res != NULL) { assert(size == tensor->size); return; }` | 变成近乎死代码 |
+| 35-39 | **原来的** create 块 + 原生 `ML_DBG("created resource ...")` | 变成**不可达死代码** |
+
+三路径我逐条追过（真源码，不是猜的）：
+
+- `res == NULL`（正常路径）：行为与上游一致，只多打两行 ⇒ **无害**。
+- `res != NULL && tensor->size == size`：与上游一致 ⇒ 无害。
+- **`res != NULL && tensor->size != size`** —— **这正是你假说的核心**：上游走 `assert(size == tensor->size)` **当场 abort**；本补丁**静默重分配 + 覆盖指针（旧 resource 泄漏，无 `pipe_resource_reference(&…, NULL)`）** ⇒ 把唯一可观测的信号消掉了。
+
+另外两处是文档/实现不一致（不是硬伤，但会误导读日志的人）：
+
+1. 你的消息和 3l 注释都承诺 EARLY-RETURN 带 `req_size` / `tensor_size` / `*** size 不一致！***` 标记，**补丁器里都没有**（只有 `idx/size/res/actual`）。Q2 仍可答（`enter` 行的 `req_size` vs `have_size` 能看出来），但"一眼指出"那部分是空的。
+2. 补丁器 docstring 的「嫌疑」仍写着 `if (res != NULL && tensor->size == size) return;` —— 正是你更正掉的、真实源码里不存在的那个形态。代码实现了你更正掉的写法，文档也写着它，只有真源码不是。
+
+## 三、一个事实修正：**assert 在我们的构建里是开的**
+
+你假说的成立前提是"release / `NDEBUG` 下会静默早退"。但 ROFIX 真机 abort 就是 `u_inlines.h:503: pipe_buffer_map_range: Assertion ... failed` ⇒ **`NDEBUG` 没定义，assert生效**。
+
+所以在我们的构建里，`size` 不一致**不可能静默**——它会当场崩，而且这一轮是 `-g3` 未 strip，**崩点能 addr2line**。这意味着：
+
+- 「静默早退」那条支路在我们的构建里**已经被排除**（我们要么从没走过那个分支，要么走过去就崩了，而我们只见过 `pipe_buffer_map_range` 那一次）。
+- **改成 print-only 后信息量更大**：真出现不一致，你会同时拿到 `enter` 行（req vs have vs actual）**和**一条带精确行号的 abort。
+- 现在这个重分配版会把 abort 吃掉，换成「悄悄修好」——那正是我们前两轮反复拒绝的「把可观测失败换成静默行为」。
+
+⇒顺带：**这轮真正能新立功的是 Q1**（`created … size=5000` 那种行），以及"有没有 destroy 后重建"。Q2 在 print-only 下也会以 abort 形式回答。
+
+## 四、最小修法（我不动你的文件，文本给你）
+
+只加一行打印，**条件与 assert 原样保留** ⇒ 与上游逐字一致：
+
+```python
+NEW_CREATE = OLD_CREATE.replace(
+    '   if (res != NULL) {\n      assert(size == tensor->size);\n      return;\n',
+    '   if (res != NULL) {\n'
+    '      ML_DBG("[och-create]   EARLY-RETURN idx=%u req_size=%u tensor_size=%u res=%p actual=%u %s\\n",\n'
+    '             idx, size, tensor->size, (void *)res, pipe_buffer_size(res),\n'
+    '             (tensor->size == size) ? "<size 一致>" : "*** size 不一致！***");\n'
+    '      assert(size == tensor->size);\n'
+    '      return;\n')
+```
+
+`created` 那行建议**改锚到 `   tensor->size = size;` 之后**（第二个锚点，`OLD_CREATE` 里不含它，安全），这样连重发射都不需要，`OLD/NEW` 的可执行代码完全一致；`enter` 那行留在锚点 1 里即可。
+
+**可选加一条**（我认为性价比最高）：ALIASDIAG 的 `ref` 行只打了 `new_res=%p`，**没打它的字节数**。在 `reference_tensor_with_offset` 里 `dst->size = size;` 之后补一行 `[och-alias]   aliased dst=%u res=%p actual=%u`，就能当场回答"tensor 151 指向的 buffer 到底多大"——ALIASDIAG 数据显示 `dst=151 size=610000 old_res=(nil)`，即它的 size 是**被 alias 调用写的**，不是 create_tensor 给的，而这恰好是 5000 之谜的另一条可能路径。
+
+## 五、我这边已完成的（都可复算）
+
+- `oes-teflon/tools/selftest-creatediag.py`：1 正例 + 9 反例 + 幂等 + **三诊断共存（3 种顺序）** + 生成器一致性 + **打印纪律门** ⇒ **20 PASS / 1 FAIL（纪律门）/ 2 WARN**。
+- `oes-teflon/tools/check-creatediag-anchors.py`：构建后真源码实跑 ⇒ 正例**只有纪律门红**（并给出精确 diff），**负控制 3 个全红**（改 `&&`→`>=` / 改标记一字 / 根本没注入）。
+- `build-teflon-fix-rofix-aliasdiag-creatediag.yml`：28 个 step **全部 `bash -n` PASS**；4 个文档门**真跑** PASS；3l 文档门负控制 = 正例 1 + 反例 10 + **掩蔽对照 2** ALL PASS；`check_creatediag_wf.py` ALL PASS；**本轮对既有 5 个 workflow 零改动**（git diff 逐个核过）。
+- 新增纪律门也进了构建后门：在真源码上把"补丁后"与"逆变换后"的 `create/destroy_tensor` 去注释去 `ML_DBG` 后逐行比对。
+
+## 六、诚实交代：我自己这轮错了两次
+
+1. `n6` 反例我把 `_XX` 拼在**签名 token 末尾**，而 `_body` 是按该 token `find` 的 ⇒ token 还在，门放行是**对的**，反例是废的。不是补丁器的问题。
+2. 文档门反例我写了 `str.replace(old, new, 0)` 想表达"删净"——**`count=0` 是零次替换的静默空操作**，一个字符没删，门判绿是对的。差一步就把它误报成"门被喂饱"。现在改成 `len(seg)` 并加了"段内容必须变化"的断言。
+3. `n9` 的 `_body` 括号不平衡 IndexError 是**第四次**出现（RODIAG/ROFIX/ALIASDIAG/CREATEDIAG），根治还是那句1 行 `while j < len(src)`。
+
+## 七、请你定
+
+1. **改 print-only 后重发补丁器**（推荐）——我核一遍就派发；
+2. 或 **as-is 照派**——那我把纪律门降级为记名 WARN（**只有你明确同意才降**，默认它是硬门）。
+
+产物三元组留空：**本轮无 CI run、无产物、未上机**。commit `7155e47c`（未签名）；生产 `build-teflon` 被 push 触发，已取消（`39145148112`，未产生任何产物）。
+
+[2026-10-18 16:30] IDLE msg_14fd97cef0010sGCMNUqyD2YC5 succeeded
+

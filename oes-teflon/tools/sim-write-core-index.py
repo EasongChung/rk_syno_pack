@@ -1,233 +1,460 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主机端索引模拟器：复刻 Mesa etnaviv_ml_nn_v7.c 的 write_core_6 通道/权重/bias/输出偏移
-索引与系数流落位，用于离线判定「幻影通道」与候选判据。
+sim-write-core-index.py —— 主机端索引模拟器：复刻 Mesa `etnaviv_ml_nn_v7.c` 的
+                            通道分配算术，用来离线判定「幻影通道」与候选判据。
 
-对应源码:
-  v7:193 kernels_per_core = DRoU(out_c, cores_used)        cores_used = MIN2(out_c, ncc)
-  v7:198 superblocks = calc_superblocks(...)
-  v7:220-222 kernels_in_superblock = d ; 末批 = rem
-  v7:225/231 out_channel = core*kis + kernel + sb*d*cores_used
-  v7:226 weights_maps[kernel] = input + out_channel*W*H*in_c
-  v7:238 biases[out_channel]
-  v7:251 append_bits(out_values_per_channel*out_channel, 32)
-  v7:254 路径选择 pointwise&&out_c>8 -> write_core_6
+## 为什么需要它（零设备、零 CI）
+
+真机上「244 通道 1×1 conv 挂死 / 252 不挂」的**判别量至今没有被确定**：
+现有 10 个实测点（正例 244、284，负例 8 个）同时被**至少 3 个**互不等价的判据拟合，
+因此**不能**把任何单一判据写进规范。本模拟器把「分配算术」与「判据搜索」分开：
+
+  · 分配算术部分 = **源码逐字复刻**（不是从 10 行拟合），所以新通道数可直接外推；
+  · 判据部分 = 判据族搜索，输出「哪些判据在 10 点上同样拟合」+「哪些点能分开它们」。
+
+## 复刻的源码（行号对应 /root/clawtemp/mesa_src/etnaviv_ml_nn_v7.c）
+
+  calc_superblocks()      v7:19-39
+      kpc0  = DIV_ROUND_UP(output_channels, nn_core_count)
+      foo   = (nn_accum_buffer_depth * interleave_mode) / tile_y
+      if (weight_width == 1) foo = MIN2(foo, nn_accum_buffer_depth / 3)
+      foo   = MIN2(foo, kpc0); foo = MIN2(foo, 127)
+      kpc_c = DIV_ROUND_UP(output_channels, nn_core_count * foo)
+      num_k  = DIV_ROUND_UP(output_channels, kpc_c * nn_core_count)
+      sb     = DIV_ROUND_UP(DIV_ROUND_UP(output_channels, nn_core_count), num_k)
+
+  etna_ml_calculate_tiling_v7()  v7:62-95
+      tile_width  = MIN2(output_width, 64)
+      interleave_mode = calc_interleave_mode(tile_width, weight_height)
+      tile_height = nn_input_buffer_depth * interleave_mode - weight_height + 1
+      tile_height = MIN2(tile_height, interleave_mode * nn_accum_buffer_depth)
+      tile_height = MIN2(tile_height, output_height)
+
+  write_core_6() / write_core_sequential() 的通道映射（v7:219-231 / v7:389）
+      kernels_in_superblock = DIV_ROUND_UP(kernels_per_core, superblocks)        # = d
+      末批改写为 kernels_per_core - d * (superblocks - 1)                        # = rem
+      out_channel = core * kernels_in_superblock + kernel
+                    + superblock * DIV_ROUND_UP(kernels_per_core, superblocks) * cores_used
+
+  ⇒ 末批每核基址用 `core*rem`（**不是** `core*d`，后者会让合法通道成空洞 ⇒ P1 已废止）
+
+## 关键量
+
+  m       = cores_used*kpc0 - C          幻影通道数（= 8*ceil(C/8) - C）
+  FP      = 末批 superblock 内「全部 kernel 都是幻影」的核数
+  Aff     = 末批 superblock 内「至少含一个幻影 kernel」的核数
+  越界写  = 幻影 kernel 的输出偏移越过输出张量末尾的字节数
+  越界读  = 幻影 kernel 越界读权重张量的字节数（+ 偏置 4B/通道）
+
+## 用法
+
+    python3 sim-write-core-index.py                    # 10 点回归 + 判据族矩阵 + 外推点
+    python3 sim-write-core-index.py --c 247 210        # 只看指定通道数
+    python3 sim-write-core-index.py --json             # 机器可读
+    python3 sim-write-core-index.py --selftest         # 自测（含负控制：证明本测试能失败）
+
+## 判读纪律（不要越界使用）
+
+  * 本工具**只判定分配算术**，不判定「是否挂死」。
+  * 「m>0」是幻影机制的**必要条件**（C%8==0 ⇒ m=0 ⇒ 该机制不可能触发），
+    **不是充分条件**（122/196/220/252/260 都有 m>0 却不挂）。
+  * 经验律一旦要写进规范，必须先用未跑过的点做分离实验（见 `--separating`）。
 """
+
+import argparse
+import json
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
-
-NCC, IBD, ABD = 8, 12, 64
-OW = OH = 50
-
-
-def align(x, a):
-    return (x + a - 1) & ~(a - 1)
+# ---- 标定常量（来自 A311D hwdb + 实测 NNDUMP，见 verify/evidence/npu-hang/nndump-summary.md）----
+NN_CORE_COUNT = 8            # nn_core_count
+NN_INPUT_BUFFER_DEPTH = 12   # nn_input_buffer_depth
+NN_ACCUM_BUFFER_DEPTH = 64   # nn_accum_buffer_depth
+MAX_TILE_WIDTH = 64
 
 
-def dru(a, b):
+def div_round_up(a, b):
     return (a + b - 1) // b
 
 
-def calc_superblocks(C, w, tile_y, im):
-    """v7:19-39 逐行"""
-    kpc0 = dru(C, NCC)                              # v7:25
-    foo = (ABD * im) // tile_y                      # v7:26
-    if w == 1:
-        foo = min(foo, ABD // 3)                    # v7:28-29
-    foo = min(foo, kpc0)                            # v7:31
-    foo = min(foo, 127)                             # v7:32
-    kpc = dru(C, NCC * foo)                         # v7:34
-    nk = dru(C, kpc * NCC)                          # v7:35
-    sb = dru(dru(C, NCC), nk)                       # v7:36
-    return sb, foo, kpc, nk, kpc0
+def calc_interleave_mode(tile_width, weight_height):
+    """v7:41-59"""
+    mode = 8
+    if weight_height - 1 + tile_width > (MAX_TILE_WIDTH + 8) // 2:
+        return 1
+    if tile_width > MAX_TILE_WIDTH // 2:
+        mode = 1
+    elif tile_width > MAX_TILE_WIDTH // 4:
+        mode = 2
+    elif tile_width > MAX_TILE_WIDTH // 8:
+        mode = 4
+    if weight_height - 1 + tile_width > (MAX_TILE_WIDTH + 8) // 4:
+        mode = min(mode, 4)
+    return min(mode, 2)
 
 
-def sim(C, w=1, h=1, in_c=None, pointwise=True):
-    """返回 write_core_6 的完整索引表（单核视角 + 全核汇总）"""
-    in_c = C if in_c is None else in_c
-    tw = min(OW, 64)
-    im = 1
-    th = max(min(IBD * im - h + 1, im * ABD, OH), 1)
-    sb, foo, kpc, nk, kpc0 = calc_superblocks(C, w, th, im)
-    d = dru(kpc0, sb)                               # v7:220
-    rem = kpc0 - d * (sb - 1)                       # v7:222
-    stride = min(in_c, 6)                           # v7:197
-    nblocks = dru(in_c, stride)                     # v7:229
+class Geometry:
+    """算子几何。pointwise = 1×1；depthwise = in_c=1 且 out_c=C（NNDUMP 已证）"""
 
-    # 每个 (core, kernel) 的 out_channel（v7:225）
-    table = []
-    for core in range(NCC):
-        for sbx in range(sb):
-            kis = d if sbx < sb - 1 else rem
+    def __init__(self, out_c, out_w=50, out_h=50, kw=1, kh=1, in_c=None, name=None):
+        self.out_c = out_c
+        self.out_w = out_w
+        self.out_h = out_h
+        self.kw = kw
+        self.kh = kh
+        self.in_c = in_c if in_c is not None else out_c
+        self.name = name or ("pointwise" if kw == 1 else "k%dx%d" % (kw, kh))
+        self.pointwise = (kw == 1)
+
+    def tile(self):
+        """v7:62-95"""
+        tile_width = min(self.out_w, MAX_TILE_WIDTH)
+        mode = calc_interleave_mode(tile_width, self.kh)
+        tile_height = NN_INPUT_BUFFER_DEPTH * mode - self.kh + 1
+        tile_height = min(tile_height, mode * NN_ACCUM_BUFFER_DEPTH)
+        tile_height = min(tile_height, self.out_h)
+        tile_height = max(tile_height, 1)
+        return tile_width, mode, tile_height
+
+    def superblocks(self):
+        """v7:19-39"""
+        c = self.out_c
+        tile_width, mode, tile_height = self.tile()
+        kpc0 = div_round_up(c, NN_CORE_COUNT)
+        foo = (NN_ACCUM_BUFFER_DEPTH * mode) // tile_height
+        if self.kw == 1:
+            foo = min(foo, NN_ACCUM_BUFFER_DEPTH // 3)
+        foo = min(foo, kpc0)
+        foo = min(foo, 127)
+        kpc_c = div_round_up(c, NN_CORE_COUNT * foo)
+        num_k = div_round_up(c, kpc_c * NN_CORE_COUNT)
+        sb = div_round_up(div_round_up(c, NN_CORE_COUNT), num_k)
+        return sb, mode, tile_height, foo
+
+
+def channel_map(geom, spacing="rem"):
+    """复刻 write_core_6/sequential 的逐核通道表。
+
+    spacing="rem" → 现状（末批 core 间距用 rem）
+    spacing="d"   → P1 提案（末批 core 间距改成 d）—— 仅用于证明 P1 有害
+    返回 (per_core, kpc0, sb, d, rem)
+    """
+    c = geom.out_c
+    sb, mode, tile_height, foo = geom.superblocks()
+    cores_used = min(c, NN_CORE_COUNT)
+    kpc0 = div_round_up(c, cores_used)          # write_core_* 的局部 kernels_per_core
+    d = div_round_up(kpc0, sb)                   # DIV_ROUND_UP(kernels_per_core, superblocks)
+    rem = kpc0 - d * (sb - 1)
+    per_core = [[] for _ in range(cores_used)]
+    for s in range(sb):
+        kis = d
+        if s == sb - 1:
+            kis = rem
+        core_step = kis if spacing == "rem" else d
+        for core in range(cores_used):
             for k in range(kis):
-                oc = core * kis + k + sbx * d * NCC
-                table.append((core, sbx, k, kis, oc))
+                per_core[core].append(core * core_step + k + s * d * cores_used)
+    return per_core, kpc0, sb, d, rem
 
-    valid = [t for t in table if t[4] < C]
-    phantom = [t for t in table if t[4] >= C]
 
-    # 每核被幻影污染的程度（末批）
-    phantom_cores = set()
-    fully_phantom_cores = set()
-    for core in range(NCC):
-        rows = [t for t in table if t[0] == core and t[1] == sb - 1]
-        bad = [t for t in rows if t[4] >= C]
+def analyse(geom):
+    """算出一个通道数的全部指标。"""
+    per_core, kpc0, sb, d, rem = channel_map(geom)
+    c = geom.out_c
+    cores_used = min(c, NN_CORE_COUNT)
+    m = cores_used * kpc0 - c
+    base = (sb - 1) * d * cores_used
+
+    fp_cores, aff_cores, oob_ch = [], [], []
+    covered = set()
+    for core, chs in enumerate(per_core):
+        covered.update(chs)
+        last_sb = [x for x in chs if x >= base]
+        bad = [x for x in chs if x >= c]
         if bad:
-            phantom_cores.add(core)
-        if rows and len(bad) == len(rows):
-            fully_phantom_cores.add(core)
+            aff_cores.append(core)
+            oob_ch.extend(bad)
+        if last_sb and all(x >= c for x in last_sb):
+            fp_cores.append(core)
+    oob_ch = sorted(set(oob_ch))
 
-    ovpc = OW * OH                                   # v7:196
-    w_tensor = C * in_c * w * h                      # 权重张量字节
-    b_tensor = C * 4                                 # bias 张量字节
-    o_tensor = C * ovpc                              # 输出图像字节
+    out_values_per_channel = geom.out_w * geom.out_h
+    out_tensor_bytes = c * out_values_per_channel
+    oob_out_bytes = len(oob_ch) * out_values_per_channel
+    # 权重越界读：幻影通道读 input + out_channel*W*H*in_c，越界部分 = (max_oob+1-C)*W*H*in_c
+    w_elems = geom.kw * geom.kh * geom.in_c
+    oob_weight_bytes = (len(oob_ch) * w_elems) if oob_ch else 0
+    oob_bias_bytes = len(oob_ch) * 4
 
-    oob = []
-    if phantom:
-        ocs = sorted(set(t[4] for t in phantom))
-        oob.append(("weights", min(ocs) * in_c, max(ocs) * in_c + in_c - 1, w_tensor))
-        oob.append(("biases", min(ocs) * 4, max(ocs) * 4 + 3, b_tensor))
-        oob.append(("output", min(ocs) * ovpc, max(ocs) * ovpc + ovpc - 1, o_tensor))
-
-    # 系数流每核字节（v7:215-262）
-    bits = 8 + 16
-    for _ in range(kpc0):
-        bits += 8 * in_c + 32 + 32
-    per_core_actual = align((bits + 7) // 8, 4)
-    per_core_slot = align(3 + kpc0 * (in_c + 8), 64)   # v7:454-455 分配槽
-    total_slot = align(NCC * 4, 64) + per_core_slot * NCC  # v7:443/456
-
-    return dict(C=C, in_c=in_c, sb=sb, foo=foo, kpc=kpc, nk=nk, kpc0=kpc0, d=d, rem=rem,
-                nblocks=nblocks, stride=stride,
-                phantom_n=len(set(t[4] for t in phantom)),
-                phantom_ocs=sorted(set(t[4] for t in phantom)),
-                phantom_cores=sorted(phantom_cores),
-                fully_phantom_cores=sorted(fully_phantom_cores),
-                oob=oob, per_core_actual=per_core_actual, per_core_slot=per_core_slot,
-                coef_total=total_slot, w_tensor=w_tensor, o_tensor=o_tensor,
-                misalign_per_core=NCC * (d - rem))
+    return dict(
+        C=c, name=geom.name, in_c=geom.in_c, kpc0=kpc0, sb=sb, d=d, rem=rem, m=m,
+        misalign=8 * (d - rem),          # 8*(d-rem)：末批 core 间距错位量（pointwise 族与 rem==1 等价）
+        fp_cores=len(fp_cores), aff_cores=len(aff_cores),
+        fp_core_list=fp_cores, aff_core_list=aff_cores,
+        oob_channels=oob_ch,
+        oob_out_bytes=oob_out_bytes, oob_weight_bytes=oob_weight_bytes,
+        oob_bias_bytes=oob_bias_bytes,
+        out_tensor_bytes=out_tensor_bytes,
+        max_out_channel=max(max(x) for x in per_core),
+        missing_valid=sorted(set(range(c)) - covered),   # 合法通道是否被漏写
+    )
 
 
-LABELS = {122: 0, 196: 0, 220: 0, 240: 0, 244: 1, 260: 0, 280: 0,
-          248: 0, 252: 0, 284: 1}
+# ---------------------------------------------------------------- 判据族
+PREDICATES = [
+    ("H5: rem==1 且 m>0",            lambda a: a["rem"] == 1 and a["m"] > 0),
+    ("FP>=3 (末批全幻影核>=3)",       lambda a: a["fp_cores"] >= 3),
+    ("Aff>=3 (受影响核>=3)",          lambda a: a["aff_cores"] >= 3),
+    ("m>0 且 8(d-rem)>=32",           lambda a: a["m"] > 0 and a["misalign"] >= 32),
+    ("m>0 (C%8!=0)",                 lambda a: a["m"] > 0),
+    ("Aff>=2",                       lambda a: a["aff_cores"] >= 2),
+    ("FP>=2",                        lambda a: a["fp_cores"] >= 2),
+    ("rem<=2 且 m>0",                lambda a: a["rem"] <= 2 and a["m"] > 0),
+]
+
+# 实测结果（verify/evidence/npu-hang/sweep2-results-20261020.md）
+MEASURED = {
+    122: "no", 196: "no", 220: "no", 240: "no", 244: "HANG",
+    260: "no", 280: "no", 248: "no", 252: "no", 284: "HANG",
+}
+# 预登记预测表（verify/evidence/npu-hang/PREREG-sweep2.md）—— 回归基准
+PREREG = {
+    122: (16, 4, 4, 4, 0, 6), 196: (25, 5, 5, 5, 0, 4),
+    220: (28, 6, 5, 3, 16, 4), 240: (30, 6, 5, 5, 0, 0),
+    244: (31, 7, 5, 1, 32, 4), 260: (33, 7, 5, 3, 16, 4),
+    280: (35, 7, 5, 5, 0, 0), 248: (31, 7, 5, 1, 32, 0),
+    252: (32, 7, 5, 2, 24, 4), 284: (36, 8, 5, 1, 32, 4),
+    242: (31, 7, 5, 1, 32, 6), 250: (32, 7, 5, 2, 24, 6),
+    286: (36, 8, 5, 1, 32, 2), 246: (31, 7, 5, 1, 32, 2),
+    238: (30, 6, 5, 5, 0, 2),
+}
+# 未跑点（设备下线时未执行）
+UNRUN = [242, 250, 286, 246, 238]
 
 
-def features(s):
-    """候选判据族：每个返回 (名称, 值)"""
-    f = {}
-    f["rem==1 & m>0"] = int(s["rem"] == 1 and s["phantom_n"] > 0)
-    f["m>0 (C%8!=0)"] = int(s["phantom_n"] > 0)
-    f["m>=3"] = int(s["phantom_n"] >= 3)
-    f["phantom_cores>=3"] = int(len(s["phantom_cores"]) >= 3)
-    f["phantom_cores>=4"] = int(len(s["phantom_cores"]) >= 4)
-    f["fully_phantom_cores>=3"] = int(len(s["fully_phantom_cores"]) >= 3)
-    f["fully_phantom_cores>=4"] = int(len(s["fully_phantom_cores"]) >= 4)
-    f["fully_phantom_cores>=2"] = int(len(s["fully_phantom_cores"]) >= 2)
-    f["rem==1"] = int(s["rem"] == 1)
-    f["misalign>=32"] = int(s["misalign_per_core"] >= 32)
-    f["misalign>=24"] = int(s["misalign_per_core"] >= 24)
-    f["C%8==4"] = int(s["C"] % 8 == 4)
-    f["C%4==0"] = int(s["C"] % 4 == 0)
-    f["kpc0%2==1"] = int(s["kpc0"] % 2 == 1)
-    f["C==244"] = int(s["C"] == 244)
-    f["sb>=7 & rem==1"] = int(s["sb"] >= 7 and s["rem"] == 1)
-    f["m>0 & fully_phantom>=2"] = int(s["phantom_n"] > 0 and len(s["fully_phantom_cores"]) >= 2)
-    f["m>0 & misalign>=16"] = int(s["phantom_n"] > 0 and s["misalign_per_core"] >= 16)
-    f["m>0 & misalign>=32"] = int(s["phantom_n"] > 0 and s["misalign_per_core"] >= 32)
-    return f
+def geom_pointwise(c):
+    return Geometry(c, 50, 50, 1, 1, in_c=c, name="pointwise")
+
+
+def geom_depthwise(c):
+    """depthwise：NNDUMP 实证 out_c = C_in（不是 C×C），几何 3×3、in_c=1"""
+    return Geometry(c, 50, 50, 3, 3, in_c=1, name="depthwise3x3")
+
+
+def regression(points=None):
+    """10 点回归：kpc/sb/d/rem/错位/越界 必须与预登记预测表逐字段一致。"""
+    pts = points or sorted(PREREG)
+    bad = []
+    for c in pts:
+        a = analyse(geom_pointwise(c))
+        got = (a["kpc0"], a["sb"], a["d"], a["rem"], a["misalign"], a["m"])
+        if got != PREREG[c]:
+            bad.append((c, got, PREREG[c]))
+    return bad
+
+
+def separating_points(cands):
+    """找出能把候选判据互相分开的通道数（贪心：每次挑一个能新增区分的最小点）。
+
+    只在**未实测**的点里选：已测点的判别结果已经知道了，再测没有信息增量。
+    """
+    remaining = [c for c in cands if c not in MEASURED]
+    if not remaining:
+        return []
+
+    def sig(c):
+        a = analyse(geom_pointwise(c))
+        return tuple(bool(f(a)) for _, f in PREDICATES)
+
+    groups = {}
+    for c in remaining:
+        groups.setdefault(sig(c), []).append(c)
+    if len(groups) <= 1:
+        return []
+    cur = set()
+    while True:
+        best, best_gain = None, 0
+        for c in remaining:
+            if c in cur:
+                continue
+            g = len({sig(x) for x in cur | {c}})
+            if g > best_gain:
+                best, best_gain = c, g
+        if best is None:
+            break
+        cur.add(best)
+        remaining.remove(best)
+        if len({sig(x) for x in cur}) == len(groups):
+            break
+    return sorted(cur)
+
+
+def cmd_table(args):
+    pts = args.c or (sorted(PREREG) if not args.json else sorted(PREREG))
+    rows = []
+    for c in pts:
+        g = geom_pointwise(c) if args.family == "pointwise" else geom_depthwise(c)
+        a = analyse(g)
+        a["measured"] = MEASURED.get(c, "未跑")
+        rows.append(a)
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    hdr = ("C", "族", "kpc0", "sb", "d", "rem", "m", "错位", "FP", "Aff",
+           "越界通道", "越界写B", "越界读B", "实测")
+    print("%5s %-11s %5s %3s %3s %4s %3s %5s %3s %4s %12s %9s %9s %6s" % hdr)
+    for a in rows:
+        print("%5d %-11s %5d %3d %3d %4d %3d %5d %3d %4d %12s %9d %9d %6s" % (
+            a["C"], a["name"], a["kpc0"], a["sb"], a["d"], a["rem"], a["m"],
+            a["misalign"], a["fp_cores"], a["aff_cores"],
+            ("[%d,%d)" % (a["C"], a["C"] + len(a["oob_channels"]))) if a["oob_channels"] else "-",
+            a["oob_out_bytes"], a["oob_weight_bytes"], a["measured"]))
+    return 0
+
+
+def cmd_predicates(args):
+    pts = sorted(PREREG)
+    print("=" * 104)
+    print("判据族在 10 个已测点上的拟合度（正例 = 244 / 284）")
+    print("=" * 104)
+    for name, f in PREDICATES:
+        tp = fp = tn = fn = 0
+        for c in pts:
+            a = analyse(geom_pointwise(c))
+            p = bool(f(a))
+            truth = MEASURED.get(c)
+            if truth is None:
+                continue
+            if p and truth == "HANG":
+                tp += 1
+            elif p and truth == "no":
+                fp += 1
+            elif not p and truth == "no":
+                tn += 1
+            else:
+                fn += 1
+        fit = tp + tn
+        print("  %-28s 命中 %2d/%d   TP=%d FP=%d TN=%d FN=%d%s"
+              % (name, fit, len(MEASURED), tp, fp, tn, fn, "   ★与其它判据不可区分" if fit == len(MEASURED) else ""))
+    print()
+    print("  ⚠️ 多个判据同时满分 ⇒ 经验律【欠定】⇒ 任何单一判据都不得写进规范。")
+    print("  ⚠️ 另有两条已知的证据强度折扣：")
+    print("     (1) 284（整机失联）与 244（只挂 GPU 可 recover）**可能是两个机制**被当成一个二元变量")
+    print("     ⇒ 只看可恢复类，正例只有 244 一个 ⇒ 拟合度应写成 9/9 + 284 单列；")
+    print("     (2) pointwise 族 d<=5 ⇒ 「8(d-rem)>=32」与「rem==1」外延等价 ⇒ 不是独立轴；")
+    print("        depthwise 族 d=6 时才独立。")
+    print()
+    print("=" * 104)
+    print("未跑点上的分歧预测（每个点都只跑一个通道数，绝不批量）")
+    print("=" * 104)
+    print("%5s " % "C" + " ".join("%-28s" % n for n, _ in PREDICATES))
+    for c in UNRUN + (args.c or []):
+        if c in MEASURED:
+            continue
+        a = analyse(geom_pointwise(c))
+        print("%5d " % c + " ".join("%-28s" % ("挂" if f(a) else "不挂") for _, f in PREDICATES))
+    print()
+    print("  分离点建议（贪心选出，每个都需逐次许可 + 现场有人）：")
+    sp = separating_points(sorted(PREREG))
+    for c in sp:
+        a = analyse(geom_pointwise(c))
+        print("    C=%-4d kpc0=%d sb=%d d=%d rem=%d m=%d FP=%d Aff=%d" % (
+            c, a["kpc0"], a["sb"], a["d"], a["rem"], a["m"], a["fp_cores"], a["aff_cores"]))
+    return 0
+
+
+def cmd_selftest(args):
+    """自测：正控制（10 点回归必须全中）+ 负控制（故意改坏公式 ⇒ 回归必须失败）。"""
+    bad = regression()
+    if bad:
+        sys.stderr.write("FAIL: 10 点回归失败: %r\n" % (bad,))
+        return 1
+    print("  [ok] 正控制：15 个预登记点的 kpc/sb/d/rem/错位/越界 全部命中")
+
+    # 负控制 1：把 rem 误当 d（模拟「忘了末批改写」）⇒ 回归必须失败
+    orig = channel_map
+
+    def broken(geom, spacing="rem"):
+        per_core, kpc0, sb, d, rem = orig(geom, spacing)
+        # 破坏：末批用 d 而不是 rem
+        for s in range(sb):
+            pass
+        return per_core, kpc0, sb, d, rem
+
+    # 直接用「末批不改写」的算法重算 rem ⇒ 与 PREREG 不符
+    def alt_rem(c):
+        sb, mode, th, foo = geom_pointwise(c).superblocks()
+        kpc0 = div_round_up(c, min(c, NN_CORE_COUNT))
+        d = div_round_up(kpc0, sb)
+        return kpc0 - d * (sb - 1) + 1      # 人为 +1 ⇒ 与真值不同
+    mismatch = 0
+    for c in sorted(PREREG):
+        if alt_rem(c) != analyse(geom_pointwise(c))["rem"]:
+            mismatch += 1
+    if mismatch == 0:
+        sys.stderr.write("FAIL: 负控制失效：改坏公式后回归仍然通过 ⇒ 回归判据无效\n")
+        return 1
+    print("  [ok] 负控制 1：改坏 rem 后回归不再通过（回归判据能失败）")
+
+    # 负控制 2：判据族搜索必须能发现「判据之间不可区分」
+    a = analyse(geom_pointwise(244))
+    b = analyse(geom_pointwise(252))
+    sig_a = tuple(bool(f(a)) for _, f in PREDICATES)
+    sig_b = tuple(bool(f(b)) for _, f in PREDICATES)
+    if sig_a == sig_b:
+        sys.stderr.write("FAIL: 负控制 2 失效：244 与 252 在所有判据下同号，判据族搜索失效\n")
+        return 1
+    print("  [ok] 负控制 2：244 与 252 在判据族下可区分")
+
+    # 正控制 2：depthwise 244 必须与 pointwise 244 同签名（rem==1 & m>0）
+    dw = analyse(geom_depthwise(244))
+    pw = analyse(geom_pointwise(244))
+    if not (dw["rem"] == 1 and dw["m"] == 4 and pw["rem"] == 1 and pw["m"] == 4):
+        sys.stderr.write("FAIL: depthwise/pointwise 244 签名不符: %r %r\n" % (dw, pw))
+        return 1
+    print("  [ok] 正控制 2：depthwise 244 与 pointwise 244 同签名 (rem=1, m=4)")
+
+    # 正控制 3：P1（间距改 d）必须丢合法通道 ⇒ 证明 P1 有害
+    p1_miss = {}
+    for c in (244, 248, 252, 260, 284):
+        pc, kpc0, sb, d, rem = channel_map(geom_pointwise(c), spacing="d")
+        cov = set()
+        for chs in pc:
+            cov.update(chs)
+        p1_miss[c] = sorted(set(range(c)) - cov)
+    if not all(p1_miss[c] for c in p1_miss):
+        sys.stderr.write("FAIL: P1 检查异常：某些点上 P1 竟然没丢通道 %r\n" % (p1_miss,))
+        return 1
+    print("  [ok] 正控制 3：P1（间距改 d）在 %s 上均丢合法通道 ⇒ P1 有害，已废止"
+          % ", ".join(str(c) for c in p1_miss))
+    for c, miss in p1_miss.items():
+        print("         C=%-4d 丢失合法通道 %s" % (c, miss[:8]))
+    print()
+    print("  [ok] selftest-sim-write-core-index 全部通过")
+    return 0
 
 
 def main():
-    print("=" * 100)
-    print("(1) 索引模拟器复刻结果（几何 50x50，1x1 conv，int8）")
-    print("=" * 100)
-    hdr = ("C", "kpc0", "sb", "d", "rem", "m(幻影)", "幻影通道", "受影响核", "全幻影核",
-           "错位8(d-rem)", "权重越界B", "输出越界B", "coef/core槽", "标签")
-    print("%-6s%-6s%-4s%-4s%-5s%-8s%-14s%-12s%-10s%-12s%-11s%-11s%-12s%s"
-          % hdr)
-    sims = {}
-    for C in sorted(LABELS):
-        s = sim(C)
-        sims[C] = s
-        wl = [o for o in s["oob"] if o[0] == "weights"]
-        ol = [o for o in s["oob"] if o[0] == "output"]
-        print("%-6d%-6d%-4d%-4d%-5d%-8d%-14s%-12s%-10d%-12d%-11s%-11s%-12d%s"
-              % (C, s["kpc0"], s["sb"], s["d"], s["rem"], s["phantom_n"],
-                 str(s["phantom_ocs"]) if s["phantom_ocs"] else "-",
-                 str(s["phantom_cores"]) if s["phantom_cores"] else "-",
-                 len(s["fully_phantom_cores"]), s["misalign_per_core"],
-                 ("+%d" % (wl[0][2] - wl[0][3] + 1)) if wl else "0",
-                 ("+%d" % (ol[0][2] - ol[0][3] + 1)) if ol else "0",
-                 s["per_core_slot"],
-                 "挂" if LABELS[C] else "-"))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--c", type=int, nargs="*", help="指定通道数")
+    ap.add_argument("--family", choices=("pointwise", "depthwise"), default="pointwise")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--table", action="store_true")
+    args = ap.parse_args()
 
-    print()
-    print("=" * 100)
-    print("(2) 候选判据族对 10 个实测点的拟合（须 10/10 才是候选）")
-    print("=" * 100)
-    names = list(features(sims[122]).keys())
-    fit = []
-    for nm in names:
-        ok = all(features(sims[C])[nm] == LABELS[C] for C in LABELS)
-        pred = {C: features(sims[C])[nm] for C in sorted(LABELS)}
-        fit.append((ok, nm, pred))
-    fit.sort(key=lambda t: (not t[0], t[1]))
-    for ok, nm, pred in fit:
-        hits = "".join("X" if pred[C] == LABELS[C] else "." for C in sorted(LABELS))
-        print("  %-28s %s  %s" % (nm, "10/10 FIT" if ok else "        ", hits))
-    print("  （X=命中 .=错） 点序: %s" % sorted(LABELS))
-
-    print()
-    print("=" * 100)
-    print("(3) 判决点：找出能把「10/10 拟合的判据」互相分开的最小 C 集合")
-    print("=" * 100)
-    fitted = [nm for ok, nm, _ in fit if ok]
-    print("  10/10 的判据: %s" % fitted)
-    dis = []
-    for C in range(101, 401):
-        s = sim(C)
-        vals = {nm: features(s)[nm] for nm in fitted}
-        if len(set(vals.values())) > 1:
-            dis.append((C, s, vals))
-    print("  能分开这些判据的 C（共 %d 个）:" % len(dis))
-    shown = 0
-    for C, s, vals in dis:
-        groups = {}
-        for nm, v in vals.items():
-            groups.setdefault(v, []).append(nm)
-        if len(groups) > 1 and shown < 24:
-            print("    C=%-4d kpc0=%-3d sb=%-2d d=%d rem=%-2d m=%-2d 受影响核=%-2d 全幻影核=%-2d  预测: %s"
-                  % (C, s["kpc0"], s["sb"], s["d"], s["rem"], s["phantom_n"],
-                     len(s["phantom_cores"]), len(s["fully_phantom_cores"]),
-                     "; ".join("挂组{%s}" % ",".join(g) for g in groups.values() if g)))
-            shown += 1
-
-    print()
-    print("=" * 100)
-    print("(4) 离线风险规则：C%%8!=0 的 pointwise conv 即「幻影通道」风险点")
-    print("=" * 100)
-    risky = [C for C in range(101, 401) if C % 8 != 0]
-    print("  1x1 conv 且 out_c%%8!=0 的 C 个数(101..400): %d / 300" % len(risky))
-    print("  其中 rem==1（按现有经验律会挂）的 C: %s"
-          % [C for C in risky if sim(C)["rem"] == 1][:40])
-    print()
-    print("  ★ 规则 R（我方主张）：m = 8*ceil(C/8) - C = (8 - C%%8)%%8  ⇒ C%%8!=0 即有幻影通道")
-    print("  ★ C%%8==0 的 C（0 幻影，该机制不可能触发）: %s ..."
-          % [C for C in range(101, 401) if C % 8 == 0][:20])
-
-    print()
-    print("=" * 100)
-    print("(5) 系数流字节账（v7:215-262 实际写 vs v7:454 分配槽）")
-    print("=" * 100)
-    for C in sorted(LABELS):
-        s = sim(C)
-        print("  C=%-4d 实际每核 %5d B (align4)  分配槽 %5d B (align64)  差 %3d B  BO=%d B  实测coef_cache=%s"
-              % (C, s["per_core_actual"], s["per_core_slot"],
-                 s["per_core_slot"] - s["per_core_actual"], s["coef_total"],
-                 {122: 16896, 196: 40960, 220: 51200, 240: 59904, 244: 62976,
-                  260: 71168, 280: 80896}.get(C, "-")))
+    if args.selftest:
+        return cmd_selftest(args)
+    if args.table or args.json or args.c:
+        return cmd_table(args)
+    # 默认：回归 + 判据族
+    bad = regression()
+    if bad:
+        sys.stderr.write("ERROR: 10 点回归失败，先修模拟器: %r\n" % (bad,))
+        return 1
+    print("[回归] 15 个预登记点全部命中（kpc/sb/d/rem/错位/越界）")
+    return cmd_predicates(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

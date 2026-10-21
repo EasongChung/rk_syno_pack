@@ -1,0 +1,105 @@
+[2026-10-18 01:19] ASSISTANT msg_14c975023001u9VhF4EvWEUO0s (space-bunny-free)
+  [tool:shell] {"command": "gh run watch 39086043545 --repo EasongChung/rk_syno_pack --exit-status --interval 25 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-18 01:19] ASSISTANT msg_14c975993001AZ7nxRxEyNGBlq (space-bunny-free)
+## 给 och —— 已提交并触发，但有**一件我必须先说的事**
+
+### ⚠️ 0️⃣ 我誊写你的补丁时引入了一个未定义名（已修，但你应该知道）
+
+`patch-etnaviv-outchannel-fix.py` 我第一次落地后，`py_compile` 通过 —— 但我用 **AST 级未定义名检查**扫出一处：
+
+```
+L102: "ERROR: 在 " + args_fn_name_placeholder + " 函数体内 `" + token ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+`args_fn_name_placeholder` 是我打字留下的垃圾名，位置**恰好在结构计数门的错误分支** —— 也就是你精心设计的那道门的错误信息路径。后果：那道门一旦触发会抛 `NameError`，只看到 traceback，看不到「哪个 token 计数不对」。**已修为 `TARGET_FN`，并复检残留为 0。**
+
+`py_compile` 抓不到这类问题（语法合法，只是名字不存在）。我已把 AST 检查保留在本地流程里。
+
+### 1️⃣ 提交
+
+```
+50c343bd  (main)
+  oes-teflon/build-recipe/build-teflon.sh              ← rev6（3g 步骤 + 头部清单）
+  oes-teflon/build-recipe/patch-etnaviv-outchannel-fix.py  ← 新增（已修未定义名）
+  .github/workflows/build-teflon-fix.yml               ← 新建：stripped 交付候选
+```
+
+脚本 diff 精确落在 3 处（头部 OCFIX 清单 + 3f 注释改为「已证实」 + 3g 段），`sh -n` 通过。
+
+### 2️⃣ 为什么不复用 diag workflow，而是新建 `build-teflon-fix.yml`
+
+diag workflow 的硬门是**反向**的（要求 `.debug_info` 存在、要求 `[och-wc]` 存在），交付候选要的正好相反。所以新建，且 artifact 名分开：
+
+| workflow | artifact | 用途 |
+|---|---|---|
+| `build-teflon.yml` | `libteflon-aarch64-glibc` | 生产，无补丁 |
+| `build-teflon-diag.yml` | `libteflon-diag` | 诊断 + 调试段 |
+| **`build-teflon-fix.yml`** | **`libteflon-fix`** | **本轮，交付候选** |
+
+env 严格按你指定：`FIX_V7=1 OCFIX=1`，`DIAG=0 WCDIAG=0 DEBUG_INFO=0 NO_STRIP=0`。
+
+### 3️⃣ 除了你要的四样，我加了**反向硬门**
+
+你要的是「`strings` 命中 `och patch: out_channel`」+「确认没有 `[och-wc]`」。我把后者做成了**硬失败**而不是「报告一下」：
+
+```
+反向门（日志层）：strip：跳过 / [och-wc] 已注入 / 调试信息：开启  三行必须【不】出现
+反向门（二进制层）：strings 里 [och-wc] 必须【不】命中，否则 exit 1
+反向门（产物层）：.debug_info 必须【不】存在，否则 exit 1（证明 NO_STRIP 生效）
+```
+
+理由：**这正是你担心的「开关被静默忽略」的镜像** —— 如果 `TEFLON_OCFIX` 拼错，构建会照跑、产物照出、只有崩溃照旧。三条反向门把这种情况变成显式红灯。
+
+**回答你第六点**：`build-teflon.sh` 里**没有开关组合白名单**，七个开关是彼此独立的 `if` 块，所以**没有需要加的东西**。而且正因为没有白名单，"静默忽略"的风险更高 —— 这也是我加反向门的动机。
+
+### 4️⃣ ★ 一个**必须提前告诉你的风险**（我验出来了）
+
+你给的计数门里有一处函数体边界假设：
+
+```python
+nxt = src.find("\nstatic", fn_at)      # 假设：下一个函数一定是 static
+fn_body = src[fn_at: nxt ...]
+```
+
+我本机实测（把下一个函数改成非 static）：
+
+```
+下一个函数为非 static   →  biases[out_channel] 出现 2 处，期望 1 处  →  rc=1（拒绝）
+```
+
+**好消息**：方向是安全的 —— 它**大声拒绝**，不会误放行（不会静默产出护栏失效的 `.so`）。
+**坏消息**：如果真实 `mesa-26.2.5` 里 `write_core_interleaved` 后面那个函数**不是** `static`，这次构建会失败。
+
+**我无法本地排除这个风险** —— GitLab 挡在反爬后面，GitHub 镜像 404（`Mesa3D/mesa` 与 API 都取不到）。所以我做了两件事：
+
+- 在 fix workflow 加了一步 **`if: failure()` 的现场转储**：一旦补丁失败，自动打印 `write_core_interleaved` 的源码邻域 + **紧随其后的函数声明** + 构建日志尾部。这样即使失败，你也能**一轮拿到改门所需的全部信息**，不用我再往返一次。
+- 计数门本身我在本机实测了 **8 个用例**（正例注入 / 改一处 weights_map / 删 biases / 删 append_bits / 删 calculate_bias_correction / 目标函数不存在 / 锚点 2 处 / 幂等）—— 全过，并已接进 CI Preflight。
+
+### 5️⃣ 一个我建议的**实验设计**（等你决定，我没擅自做）
+
+你的补丁其实包含**两个独立改动**：
+
+|改动 | 是否可证 | 后果 |
+|---|---|---|
+| **钳位**（`out_channel >= output_channels → output_channels-1`） | ✅ 由越界读直接推出，**必然消掉崩溃** | 只影响越界那几个槽 |
+| **重映射**（`kernels_in_superblock → kernels_per_core`、去掉 `* cores_used`） | ⚠️ **语义假设**，136 组数据只证明了「旧公式复现了实测值」，**没证明新公式才是对的** | 改动**所有**槽的权重落位 |
+
+关键点：**旧公式 136/136 复现实测值** ⇒ 重映射会让**每个槽的 `out_channel` 都变** ⇒ 权重写到不同通道 ⇒ 这是**全量行为变更**，不是局部护栏。
+
+所以：如果第 ④ 级不通过，**最省事的二分是「钳位 + 旧公式」**（只动越界槽，其余逐字节不变）。若那版能过 ④，说明钳位就够、重映射反而多余；若只有重映射能过，说明钳位在掩盖一个更深的问题。
+
+**要不要我把「钳位 + 旧公式」也做成一个可选开关**（比如 `TEFLON_OCFIX=2` 表示只钳位）？一行 patch 改动 + 一个 env 分支，但能省掉一整轮「不通过 → 猜哪里错 → 再改」的往返。**你定，我不擅自加。**
+
+### 6️⃣ 三个 workflow 的完整判据对照
+
+| 判据 | 值 |
+|---|---|
+| 只修1 处、另 3 处不碰 | ✅ `write_core_6 ×2` / `write_core_sequential` 未动，`BUILD-INFO.txt` 里明确写了「remain UNPATCHED by design」 |
+| 产物未验证前不写「可用」 | ✅ `BUILD-INFO.txt` 首行 `delivery candidate, NOT yet validated`，并写明必须过第 ④ 级 |
+| 四级判据由你执行 | ✅ 我不碰设备 |
+
+CI `39086043545` 跑完立刻回四样：提交 sha、`[och-ocfix]` 那行原文、`.so` sha256+字节数、`strings` 两个 marker 命中 + `[och-wc]` 缺席的确认。
+
+[2026-10-18 01:19] IDLE msg_14c978034001lm4eCQS93KB65q succeeded
+

@@ -1,0 +1,234 @@
+[2026-10-17 06:36] ASSISTANT msg_1489392a0001As7gCOCdloJPif (step-5-preview)
+**假设被证伪了 —— 这是决定性的否定结果。**
+
+| | 退化张量数 |
+|---|---|
+| BEFORE（per-tensor 原样） | **6**（t127/131/133/139/140/141） |
+| AFTER（PADV2→PAD 删掉 133） | **6**（不变） |
+
+t133 已从算子输入移除（`op#4 n_in=3→2`），但**它仍留在张量表里且 scale 仍退化**，其余 5 个也**一个没修好**。
+
+**所以：退化已烘焙进各张量自身的量化参数，不是"被 133 连坐"。删掉 133 不能治愈整条链。**
+
+取该产物在门下的判定：
+  [tool:shell] {"command": "$log = gh run view 39009507872 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = $log -split \"`n\" | Where-Object { $_ -notmatch '\\[36;1m|shell:|env:|endgroup|oneDNN|DBG |cuda|absl|AVX|comp...
+
+[2026-10-17 06:37] ASSISTANT msg_1489440ef001IDOYPoexyt7Jno (step-5-preview)
+## 实验结果（CI `39009507872`）—— 假设被证伪，且找到一个具体修法线索
+
+### 一、och 的假设（133 是退化源头）**不成立**
+
+| | 退化张量数 |
+|---|---|
+| BEFORE | **6**：`t127, t131, t133, t139, t140, t141` |
+| AFTER（PADV2→PAD 删掉 133） | **6**：**一个一个都没少** |
+
+算子层面确实改了（`op#4 n_in=3→2`），但 t133 仍留在张量表、scale 仍退化，其余 5 个**完全没变**。
+
+**结论：退化已烘焙进每个张量自身的量化参数，不是"被 133 连坐"。** 门也确认了：
+
+```
+SENS concept_int8_pertensor_padfix: distinct hashes 1/4 -> CONSTANT OUTPUT
+```
+
+**所以：修 PadV2 不能治愈退化链。** 这条路堵死了，我不再往这上面花时间。
+
+### 二、但我找到了**具体可执行的修法线索**
+
+对比同一位置（op#4，即 PadV2）在两个模型里的尺度：
+
+| 模型 | op#4 的输入张量 | scale |
+|---|---|---|
+| **legacy**（可用，0 退化） | `t139(i8)` | **s=0.473** ← 正常 |
+| **MLIR per-tensor**（常量输出） | `t139(i8)` | **s=1.334e+36** ← 退化 |
+
+**同一个张量，同一个位置，legacy 量化器算出 0.473，MLIR 算出 FLT_MAX/255。**
+
+这证明：**退化是 MLIR 量化器的产出缺陷，而正确的值客观存在（在 legacy 产物里）。**
+
+**修法**：按**张量名**把 legacy 模型里的正确 scale 移植到 MLIR per-tensor 模型的对应张量上（用名字匹配，不靠索引猜——两个模型张量数不同：354 vs 337）。
+
+这比 och 的二分搜索更可靠：**不需要猜，有真值来源**。
+
+### 三、`concept_int8_fixed` 的最终判定（两面都摆出来）
+
+```
+regress 200 张:  cos=0.8879  top1=0.73   -> 双门 MISS
+SENS 4 输入:     4/4 哈希不同            -> PASS（对输入有响应）
+vs float 参照:   cos=0.8718 top1=0.72    -> FAIL
+```
+
+- **对 och**：你是对的，**它不可交付**，我新加的 float 参照门已经拒了它。**top1=0.73 我不解释掉。**
+- **但**：它不是常量输出（4/4）。是「精度不足」，不是「完全不工作」——**这两种失败机理不同**，混为一谈会把排查引偏。
+
+### 四、当前状态汇总
+
+| 产物 | 退化 | 输入敏感 | 可用性 |
+|---|---|---|---|
+| `concept_int8_fixed`（legacy） | **0** | 4/4 ✅ | cos 0.8879/top1 0.73 → 精度不够 |
+| `concept_int8_pertensor`（MLIR） | 6 | 1/4 ❌ | 常量输出 |
+| `concept_int8_pertensor_padfix` | 6 | 1/4 ❌ | 同上（本实验） |
+| `concept_int8_tf`（MLIR） | 6 | 1/4 ❌ | 常量输出 |
+
+**没有任何一个同时满足「零退化 + 输入敏感 + per-tensor」。** 所以现在拿任何东西上机测 NPU，测到的都是崩溃或常量，**不构成对 NPU 的检验**。
+
+### 五、下一步（我要做的）
+
+**按张量名移植 scale**：legacy 的正确 scale → MLIR per-tensor 的退化张量。产出后立刻过四道门（零退化 / 无空形状 / 4 输入敏感 / vs float 参照 cos≥0.98 top1≥0.95）。
+
+**这才是 och 优先级 1 的正解**——不是二分搜索，是从一个已知正确的模型里取真值。
+
+**同时我不会声称**：移植后 per-tensor 就能用（SIGSEGV 是 och 侧的、我无法验证），以及任何 NPU 加速结论。
+
+[2026-10-17 06:37] IDLE msg_14894ce92001DoQlJhutl7V5zD succeeded
+
+[2026-10-17 10:40] ASSISTANT msg_1497278990015tZLRccke8kh0s (step-5-preview)
+我有旧产物可先验证**名字匹配可行性**，但更该用 och 手上那份。下载最新 CI 产物：
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; New-Item -ItemType Directory -Force -Path art13\\out | Out-Null; gh run download 39009507872 --repo EasongChung/rk_syno_pack --name oes-int8-cleaned --dir art13\\dl 2>&1 | Select-O...
+
+[2026-10-17 10:40] ASSISTANT msg_1497328c2001lflwFF45eHB7Pk (step-5-preview)
+拿到 och 手上的那份了。现在验证**按名字移植**是否可行（这是修法的前提，不能假设）：
+  [tool:write] {"content": "\"\"\"验证「按张量名移植 scale」的可行性（och 第21轮修法方向的前提）。\n\n## 要回答的问题\nMLIR per-tensor 模型有 6 个退化张量，legacy 模型 0 个。\n能否按**张量名**把 legacy 的正确 scale 移植过去？\n\noch 提醒的两个坑：\n  1. 两模型张量数不同（354 vs 337）——名字匹配必须带**类型/形状校验**，\n     ...
+
+[2026-10-17 10:41] ASSISTANT msg_1497396f4001yRmY0d9jQR7x7k (step-5-preview)
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; python3 check_name_match.py 2>&1 | Out-String", "timeout": 900000}
+
+[2026-10-17 10:41] ASSISTANT msg_1497413d000173t6HSeGyV6eH9 (step-5-preview)
+
+
+[2026-10-17 10:42] SYNTHETIC msg_14975036a001MkpMBM5Fbu91R1
+
+[2026-10-17 10:42] ASSISTANT msg_149750373001v6ExmIraJNxMdE (step-5-preview)
+继续。先验证 **bias scale 的公式**（`in_scale × w_scale`）——这是修 t127/t131 的原则性依据，先证明公式在两个模型上都成立：
+  [tool:write] {"content": "\"\"\"验证 bias scale 的推导公式：bias_scale == in_scale * w_scale。\n\n## 为什么要先证明公式\nt127/t131 是 INT32 bias（tfl.pseudo_qconst106/110），名字匹配不上\nlegacy 模型（它们没有名字）。要修就得算，不能猜。\n\nTFLite 的 bias 量化尺度定义就是 `input_scale * wei...
+
+[2026-10-17 10:43] ASSISTANT msg_149754a01001V7LcWQeErmf7fc (step-5-preview)
+  [tool:shell] {"command": "cd D:\\clawtemp\\o2tf-src; python3 check_bias_formula.py 2>&1 | Out-String", "timeout": 900000}
+
+[2026-10-17 10:43] ASSISTANT msg_14975ab460016qIX1t5He4ZZWB (step-5-preview)
+**公式在两个模型上都成立（57/57，rel_err ~1e-8）**，而且直接证明了 t127/t131 的退化来源：
+
+```
+op#6 DWCONV: in=1.33444e+36 × w=0.0341105 -> pred=4.55184e+34 = t131 的 scale ✓
+op#8 CONV  : in=1.33444e+36 × w=0.0134412 -> pred=1.79365e+34 = t127 的 scale ✓
+```
+
+**bias 是"被连坐"的** —— 输入尺度退化，bias 尺度就跟着退化。而 legacy 里 57/57 都精确满足 `bias_scale = in_scale × w_scale`，所以**这个公式可以从已知量算出正确值，不需要猜**。
+
+三条修法依据齐全，写移植工具：
+  [tool:write] {"content": "#!/usr/bin/env python3\n\"\"\"按张量名 + 公式，把 legacy 的正确量化尺度移植到 MLIR per-tensor 模型。\n\n## 背景\nMLIR per-tensor 模型（`concept_int8_pertensor.tflite`）有 6 个退化张量\n（scale=FLT_MAX/255=1.334441e+36），导致输出坍缩成常量：\n  t127 INT...
+
+[2026-10-17 10:44] ASSISTANT msg_149766df5001VDogJtPIcKXMhH (step-5-preview)
+  [tool:shell] {"command": "python3 D:\\clawtemp\\o2tf-src\\verify_all.py 2>&1 | Select-Object -Last 5", "timeout": 600000}
+
+[2026-10-17 10:44] ASSISTANT msg_14976d7fd001dYtwzKmY0VtwA6 (step-5-preview)
+加 och 要求的**饱和率独立读数**（门 f）：
+  [tool:edit] {"newString": "print('  => VERDICT: PASS - output responds to input.')\n    return _ref_check(args, it)\n\n\ndef saturation_rate(arr):\n    \"\"\"och 门 f：量化值落在两端 1% 量程带内的元素占比。\n\n    按 int8 真实量程算（-128..127），**不能**用\"与原 f...
+
+[2026-10-17 10:45] ASSISTANT msg_14977a1fc001oa6z12xhjMFzpQ (step-5-preview)
+  [tool:edit] {"newString": "hashes = {}\n    raw_out = {}\n    sat_max = 0.0\n    for name, arr in variants:\n        it.set_tensor(inp['index'], arr)\n        it.invoke()\n        o = it.get_tensor(out['index'])\n        h = fnv1a64...
+
+[2026-10-17 10:45] ASSISTANT msg_14977dec6001esKowC2RnRt4nZ (step-5-preview)
+  [tool:edit] {"newString": "if m < args.min_cos or t1 < args.min_top1:\n        print('  => VERDICT: FAIL vs float reference '\n              '(need cos>=%.2f top1>=%.2f)' % (args.min_cos, args.min_top1))\n        return 5\n    print...
+
+[2026-10-17 10:46] ASSISTANT msg_1497809de0012qSD5PlXVL0xdQ (step-5-preview)
+现在加 workflow 步骤：移植 → 六门静态项 → 产出到 art13 路径。
+  [tool:edit] {"newString": "ls -la \"$DST\" 2>/dev/null || echo \"(no output model)\"\n\n      # ★ 移植 legacy 的正确尺度到 per-tensor 模型的退化张量（och 第21轮）\n      #\n      # 三条依据全部经本地数据验证（不是猜）：\n      #  1. t139/t140/t141 名字+类型+形状与 legacy 完全匹配，...
+
+[2026-10-17 10:46] ASSISTANT msg_149786bac001sz8SLpvohRERYI (step-5-preview)
+  [tool:shell] {"command": "python3 D:\\clawtemp\\o2tf-src\\verify_all.py 2>&1 | Select-Object -Last 5", "timeout": 600000}
+
+[2026-10-17 10:47] ASSISTANT msg_14979451c001NgQUcE6EdcV3kw (step-5-preview)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree add --detach D:\\clawtemp\\_wtA1 origin/main 2>&1 | Select-Object -Last 1; Copy-Item D:...
+
+[2026-10-17 10:48] ASSISTANT msg_1497a41c1001NovGe6rZL28g6f (step-5-preview)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object -Last 1; git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtA1 --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree pru...
+
+[2026-10-17 10:49] ASSISTANT msg_1497b333b001PKTMRAKlV01zl5 (step-5-preview)
+  [tool:shell] {"command": "gh run watch 39026333343 --repo EasongChung/rk_syno_pack --exit-status --interval 20 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-17 10:50] ASSISTANT msg_1497b9c96001B0i6IUzRPq0mXN (step-5-preview)
+**给 och 的回复 —— 你的三条补充我全部采纳，六门已实现，修法依据已用数据验证完毕。**
+
+## 一、你的三点补充我逐条落实
+
+**1) 「零退化」不充分** —— 采纳，你举的反例（`concept_int8_fixed` 退化=0 仍被 float 参照门拒）正是我实测的数字。所以**六门必须同时成立**，我不会再用单条门说话。
+
+**2) 饱和率要按 int8 量程算** —— 采纳，你说得对，我上一轮"mean 同量级"是弱推理。已实现**独立读数**：
+```
+饱和率 = 落在 [lo, lo+1%·span] ∪ [hi-1%·span, hi] 的元素占比
+```
+按 int8 真实量程（−128..127）算，门限 <50%，并打印 band 宽度。**不是要分胜负——是防止"机制跑到一半当成可用"，这条我认。**
+
+**3) 六门定稿** —— 实现如下：
+
+| 门 | 实现位置 | 静态/需 CI |
+|---|---|---|
+| a 退化=0 | `transplant_scales._revalidate` | 静态 |
+| b 无空形状 | 同上 | 静态 |
+| c conv/dwconv per-tensor | 同上 + `check_pc.py` | 静态 |
+| d 4/4 distinct hashes | `input_sensitivity.py` | CI |
+| e cos≥0.98 且 top-1 一致 | `input_sensitivity.py --ref` | CI |
+| f 饱和率<50% | 同上（新读数） | CI |
+
+## 二、修法依据**全部用数据验证**，不是猜
+
+**依据 1（名字匹配）** —— `check_name_match.py` 实测：
+
+```
+t139 <- t139  type=INT8 OK  shape=[1,198,198,24] OK  scale 0.4730178415775299 zp=-128
+t140 <- t140  type=INT8 OK  shape=[1,200,200,24] OK  scale 0.4730178415775299 zp=-128
+t141 <- t141  type=INT8 OK  shape=[1,99,99,24]   OK  scale 0.4730178415775299 zp=-128
+```
+**3/6 可移植**（名字+类型+形状三者全匹配）。t139/t140/t141 在 legacy 里共享同一 scale → 是统一量化组，移植后仍统一。
+
+**依据 2（bias 公式）** —— `check_bias_formula.py` 实测：
+```
+LEGACY:      bias_scale == in_scale * w_scale   OK=57  BAD=0
+PER-TENSOR:  同上公式                            OK=57  BAD=0
+```
+且**直接证明 t127/t131 是"被连坐"**：
+```
+op#6 DWCONV: in=1.33444e+36 × w=0.0341105 -> 4.55184e+34 = t131 的 scale ✓
+op#8 CONV  : in=1.33444e+36 × w=0.0134412 -> 1.79365e+34 = t127 的 scale ✓
+```
+所以 bias 用**公式重算**（先移激活、再算 bias，顺序关键），不靠猜 legacy 的下标。
+
+**依据 3（t133）** —— 你指出的空形状常量。它是 PADV2 的 constant_values，改写后**成为孤立张量**（内核不读）。给它合法形状 `[1]` + 中性尺度，使 a/b 两门通过。**这是"让它不再畸形"，不是"修好它"——它本来就不参与推理，我会在交付说明里写明。**
+
+**依你的两个坑提示**：匹配不上的**显式报出**（不跳过）；t127/t131 **不用"数据全零所以无害"处理**，而是按公式重算真值。
+
+## 三、已证伪的方向（不再投入）
+
+「删掉 t133 能治愈整条退化链」—— 实测 **6 → 6 不变**，`concept_int8_pertensor_padfix` 仍 1/4 常量输出（CI `39009507872`）。这条路堵死了。
+
+你另一条更正我也收到：`concept_int8_tf_legacy` 是 **loader 问题**（pad.cc:230），与它退化=0 **不矛盾**，我不混为一谈。
+
+## 四、产出与交接
+
+CI `39026333343` 运行中，产出后将给你：
+
+```
+D:\clawtemp\o2tf-src\art13\out\concept_int8_art13.tflite
+sha256=<...>
+a) 退化张量数        b) 空形状张量数      c) per-tensor conv 数
+d) 4 输入哈希         e) vs model_float16 cos/top1   f) 饱和率
+```
+
+**在六门全过之前，我不会声称 NPU 能加速**——包括不会用坏模型让你上机。你那边也不用。
+
+## 五、一处仍需你注意的边界
+
+**移植后的 t139/t140/t141 = 0.4730178415775299**，这个值来自 legacy 量化器的标定结果。**它是否"真值"取决于 legacy 标定本身是否正确** —— 而 legacy 的 cos=0.8879、top1=0.73 只算"可用但不是很好"。所以**若门 e 不过，可能是移植值本身不够准**，那时需要考虑用 float 模型的实测激活范围重算，而不是继续从 legacy 取。这条我先标明，免得到时误判。
+
+[2026-10-17 10:50] IDLE msg_1497be7680011xpocrgNcv5ixY succeeded
+
+[2026-10-17 17:38] SYSTEM msg_14af1bd11001r2zA4HxqcP7jPI
+
+[2026-10-17 17:38] USER msg_14af1bb52001jZXIHw6PvxNh7U
+
+
+[2026-10-17 17:38] ASSISTANT msg_14af1bd67001kfWFo8HKyDyWES (step-5-preview)
+och 独立复现确认了清单，并给了**六条交付门定稿**。我按他的规格来做。先看本地有哪些模型可用于验证名字匹配可行性：
+  [tool:shell] {"command": "Get-ChildItem D:\\clawtemp\\o2tf-src -Directory | Select-Object Name | Format-Table -AutoSize | Out-String; echo \"--- artN 下的 tflite ---\"; Get-ChildItem D:\\clawtemp\\o2tf-src -Recurse -Filter *.tflite -Er...
+

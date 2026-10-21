@@ -1,0 +1,346 @@
+From 97ff04e51d544f526f9409085bfb3ebe5120526b Mon Sep 17 00:00:00 2001
+From: och <och@local>
+Date: Thu, 15 Oct 2026 16:02:31 +0000
+Subject: [PATCH] build-teflon: avoid apt arm64 index 404 by using Debian glibc
+ 2.31 sysroot
+
+CI run 38762530587 failed at 'Add arm64 architecture': dpkg --add-architecture
+arm64 makes apt request arm64 indexes from azure.archive/security.ubuntu.com,
+which do not host them (404). Ubuntu arm64 lives on ports.ubuntu.com.
+
+Fix chosen: drop foreign-arch apt entirely. All CI packages are amd64, and the
+aarch64 sysroot is assembled from Debian bullseye glibc 2.31 by the build script
+(SYSROOT_MODE=deb, now the default). This avoids the 404 and also keeps the
+sysroot below the device's glibc 2.36.
+
+Why not just fix the apt sources: Ubuntu 24.04 libc6-dev-arm64-cross is glibc
+2.39. glibc >= 2.38 defines 'strtol' to __isoc23_strtol in stdlib.h; those
+symbols are versioned GLIBC_2.38 and absent on the device (2.36), so a .so
+built against noble's sysroot would fail dlopen on device. Debian 2.31 yields
+GLIBC_2.29 at most.
+
+Adds a symbol-ceiling gate that fails the build if any artifact requires a
+glibc symbol newer than 2.36, or references __isoc23_*.
+---
+ .github/workflows/build-teflon.yml      | 180 +++++++++++-------------
+ oes-teflon/build-recipe/build-teflon.sh |  14 +-
+ oes-teflon/verify/teflon_dlopen.c       |   0
+ 3 files changed, 96 insertions(+), 98 deletions(-)
+ mode change 100644 => 100755 .github/workflows/build-teflon.yml
+ mode change 100644 => 100755 oes-teflon/build-recipe/build-teflon.sh
+ mode change 100644 => 100755 oes-teflon/verify/teflon_dlopen.c
+
+diff --git a/.github/workflows/build-teflon.yml b/.github/workflows/build-teflon.yml
+old mode 100644
+new mode 100755
+index 9fbc48c..d85347e
+--- a/.github/workflows/build-teflon.yml
++++ b/.github/workflows/build-teflon.yml
+@@ -1,15 +1,27 @@
+ name: build-teflon
+ 
+ # 交叉编译 Mesa Teflon → libteflon.so (aarch64 / glibc)
+-# 目标设备：Amlogic A311D (G12B) + DSM 7.4.1-90080
++# 目标设备：Amlogic A311D (G12B) + DSM 7.4.1-90080 (glibc 2.36)
+ #
+-# 本 workflow 不写任何仓库内容、不部署到设备，只产出构建产物。
+-
+-# ⚠️ 部署要求（DSM 7.4.1 实测结论）：
++# ⚠️ 部署硬约束（DSM 实测得出）：
+ #   1) 设备系统级**完全没有 libdrm**（find / -name 'libdrm*' 全空）
+-#      → artifact 里的 libteflon.so 与 libdrm.so.2 **必须放同一目录**
++#      → libteflon.so 与 libdrm.so.2 **必须放同一目录**
+ #   2) libteflon.so 带 RUNPATH=$ORIGIN，同目录即可自动找到 libdrm.so.2
+-#   3) 设备 glibc = 2.36，产物的 glibc 符号版本不得高于 2.36
++#      无需设置 LD_LIBRARY_PATH，也无需动 ldconfig
++#   3) 设备 glibc = 2.36，产物的 glibc 符号版本**必须 ≤ 2.36**
++#
++# ⚠️ 为什么用 SYSROOT_MODE=deb 而不是直接用 apt 的 arm64 交叉包：
++#   Ubuntu 24.04 (noble) 的 libc6-dev-arm64-cross 是 **glibc 2.39**，
++#   而设备只有 2.36。glibc 自 2.38 起，stdlib.h 里有
++#       #define strtol __isoc23_strtol
++#       #define strtoll __isoc23_strtoll
++#       #define strtoul __isoc23_strtoul
++#       #define strtoull __isoc23_strtoull
++#   这些符号的版本节点是 GLIBC_2.38，设备 2.36 不存在 →
++#   用 noble sysroot 编出的 .so 在设备上 dlopen 会直接失败。
++#   故本workflow 从 Debian bullseye 下载 glibc **2.31** sysroot，
++#   产物最高符号 GLIBC_2.29，安全低于设备 2.36。
++#   （2.31 的选法是保守：越旧的 sysroot，符号版本越低，越安全。）
+ 
+ on:
+   workflow_dispatch:
+@@ -19,7 +31,6 @@ on:
+         required: false
+         default: 'mesa-24.3.0'
+   push:
+-    # 仅当构建相关文件变更时触发，避免无关提交空跑
+     paths:
+       - '.github/workflows/build-teflon.yml'
+       - 'oes-teflon/build-recipe/build-teflon.sh'
+@@ -37,29 +48,23 @@ jobs:
+         uses: actions/checkout@v4
+ 
+       # ---------------------------------------------------------------
+-      # 工具链选择：用 Ubuntu 官方 gcc-aarch64-linux-gnu，
+-      # 不用 Linaro / ARM GNU toolchain。理由：
+-      #  1) ubuntu-latest 自带，零额外下载，版本随 runner 稳定更新
+-      #  2) 默认就是 glibc 目标；sysroot 由 apt 的 arm64 包自动填充到
+-      #     /usr/aarch64-linux-gnu，不需要手工下载 .deb 拼 sysroot
+-      #  3) 与 Ubuntu 的 meson/ninja 版本矩阵兼容性最好
+-      # 若要换 Linaro，只需改本步 + 调整 PKG_CONFIG_PATH。
++      # 全部包都是 **amd64 原生包**，不执行 dpkg --add-architecture，
++      # 因此不会向 Ubuntu 源请求 arm64 索引，也就绕开了
++      # "security.ubuntu.com ... binary-arm64/Packages 404" 的问题。
++      #
++      # aarch64 sysroot 由 build-teflon.sh 从 Debian 池自行组装
++      # （SYSROOT_MODE=deb），版本固定为 bullseye 2.31。
+       # ---------------------------------------------------------------
+-      - name: Add arm64 architecture
++      - name: Install build deps (amd64 only)
+         run: |
+-          sudo dpkg --add-architecture arm64
++          set -eux
+           sudo apt-get update
+-
+-      - name: Install cross toolchain and build deps
+-        run: |
+           sudo apt-get install -y --no-install-recommends \
+-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
++            gcc-aarch64-linux-gnu \
++            g++-aarch64-linux-gnu \
+             binutils-aarch64-linux-gnu \
+             pkg-config \
+-            libc6-dev-arm64-cross \
+-            linux-libc-dev-arm64-cross \
+-            libdrm-dev:arm64 \
+-            zlib1g-dev:arm64 \
++            meson ninja-build \
+             python3 python3-pip \
+             python3-mako python3-yaml \
+             bison flex \
+@@ -67,7 +72,7 @@ jobs:
+             ca-certificates curl wget git binutils
+ 
+       # Mesa 的 etnaviv hwdb 生成器需要 pycparser >= 2.20
+-      # （apt 无对应 arm64-independent 包名差异，直接用 pip 最稳）
++      # （Ubuntu 24.04 的系统 python3 有 PEP 668 保护，需 --break-system-packages）
+       - name: Install pycparser
+         run: python3 -m pip install --break-system-packages "pycparser>=2.20"
+ 
+@@ -76,49 +81,35 @@ jobs:
+           set -eux
+           aarch64-linux-gnu-gcc --version | head -1
+           aarch64-linux-gnu-gcc -dumpmachine
+-          meson --version || pip install --break-system-packages meson && meson --version
+-          ninja --version || pip install --break-system-packages ninja && ninja --version
++          meson --version
++          ninja --version
+           python3 -c "import mako, yaml, pycparser; print('python deps OK')"
+ 
+-      - name: Inspect cross sysroot
+-        run: |
+-          set -eu
+-          SR="/usr/aarch64-linux-gnu"
+-          echo "=== cross sysroot: $SR ==="
+-          ls "$SR" 2>&1 | head
+-          echo
+-          # Ubuntu 上有两套布局，这里全部打印出来便于排查：
+-          echo "=== A) cross 包 (libc6-dev-arm64-cross 等) ==="
+-          ls "$SR/lib/pkgconfig" 2>&1 | head || echo "  (无)"
+-          echo "=== B) foreign-arch 包 (libdrm-dev:arm64 等) ==="
+-          ls /usr/lib/aarch64-linux-gnu/pkgconfig 2>&1 | head || echo "  (无)"
+-          echo
+-          echo "=== 依赖定位（用于诊断，不因缺失而中断构建）==="
+-          export PKG_CONFIG_PATH="$SR/lib/pkgconfig:/usr/lib/aarch64-linux-gnu/pkgconfig"
+-          export PKG_CONFIG_SYSROOT_DIR="$SR"
+-          for p in libdrm zlib; do
+-            v=$(pkg-config --modversion "$p" 2>/dev/null || echo "NOT FOUND")
+-            echo "  $p = $v"
+-          done
+-          echo
+-          echo "=== 头文件位置 ==="
+-          ls /usr/include/aarch64-linux-gnu/libdrm/ 2>/dev/null | head -3 || echo "  libdrm 头未找到"
+-          ls "$SR/include/stdio.h" 2>/dev/null && echo "  libc 头 OK"
+-          echo
+-          echo "=== libdrm.so.2（需随包部署到设备）==="
+-          ls -la /usr/lib/aarch64-linux-gnu/libdrm.so.2.* 2>/dev/null | head -2 \
+-            || ls -la "$SR"/lib/libdrm.so.2* 2>/dev/null | head -2 \
+-            || echo "  ERROR: 未找到 libdrm.so.2 —— DSM 无 libdrm，产物无法加载"
+-
+       - name: Build libteflon.so
+         env:
+           MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-24.3.0' }}
+         run: |
+           set -eux
+           chmod +x oes-teflon/build-recipe/build-teflon.sh
+-          # CI 默认路径：apt 提供的 cross sysroot（脚本内部 SYSROOT_MODE=apt）
++          # SYSROOT_MODE=deb：从 Debian 池组装 glibc 2.31 aarch64 sysroot
+           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build"
+ 
++      # 交叉编译上机测试程序：设备（DSM）没有 gcc，必须在 CI 编好
++      - name: Build device-side dlopen tester
++        run: |
++          set -eux
++          SR="$RUNNER_TEMP/teflon-build/sysroot"
++          aarch64-linux-gnu-gcc -O2 --sysroot="$SR" \
++            -isystem "$SR/usr/include/aarch64-linux-gnu" \
++            -isystem "$SR/usr/include" \
++            -B "$SR/usr/lib/aarch64-linux-gnu/" \
++            -L "$SR/usr/lib/aarch64-linux-gnu" \
++            -o "$RUNNER_TEMP/teflon_dlopen" \
++            oes-teflon/verify/teflon_dlopen.c \
++            "$SR/lib/aarch64-linux-gnu/libdl.so.2" \
++            "$SR/lib/aarch64-linux-gnu/libc.so.6"
++          readelf -h "$RUNNER_TEMP/teflon_dlopen" | grep Machine
++
+       - name: Verify artifact
+         run: |
+           set -eux
+@@ -126,30 +117,41 @@ jobs:
+           test -f "$SO"
+           echo "=== ELF header ==="
+           readelf -h "$SO" | grep -E 'Class|Type|Machine'
+-          echo "=== NEEDED（必须无 musl）==="
++          echo "=== NEEDED（必须含 libdrm.so.2，且无 musl）==="
+           readelf -d "$SO" | grep NEEDED
+-          ! readelf -d "$SO" | grep -q musl
++          readelf -d "$SO" | grep -q musl && { echo "ERROR: 含 musl 依赖"; exit 1; } || true
++          echo "=== RUNPATH（须含 \$ORIGIN）==="
++          readelf -d "$SO" | grep -E 'RUNPATH|RPATH'
+           echo "=== delegate ABI ==="
+           readelf -sW "$SO" | grep -E 'tflite_plugin_(create|destroy)_delegate'
+-          echo "=== glibc symbol versions ==="
+-          readelf -V "$SO" | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tr '\n' ' '; echo
+-          echo "=== NPU symbols ==="
+-          readelf -sW "$SO" | grep -oE 'etna_ml_get_core_info|etna_gpu_get_core_info' | sort -u
+-          echo "=== size ==="
+-          ls -l "$SO"
+ 
+-      # 交叉编译上机测试程序：设备（DSM）没有 gcc，
+-      # 必须在 CI 里编好，宿主直接 scp 上去就能跑。
+-      - name: Build device-side dlopen tester
++      # 关键安全闸：设备 glibc = 2.36，符号版本不得高于它。
++      # 这条专门拦截 __isoc23_*（GLIBC_2.38）这类"CI 能过但上机失败"的坑。
++      - name: Glibc symbol ceiling check (device = 2.36)
+         run: |
+-          set -eux
+-          SR="/usr/aarch64-linux-gnu"
+-          aarch64-linux-gnu-gcc -O2 --sysroot="$SR" \
+-            -isystem "$SR/include" \
+-            -B "$SR/lib/" -L "$SR/lib" \
+-            -o "$RUNNER_TEMP/teflon_dlopen" \
+-            oes-teflon/verify/teflon_dlopen.c -ldl
+-          readelf -h "$RUNNER_TEMP/teflon_dlopen" | grep Machine
++          set -eu
++          CEIL=36
++          fail=0
++          for f in "$RUNNER_TEMP/teflon-build/out/libteflon.so" \
++                   "$RUNNER_TEMP/teflon-build/out/libdrm.so.2" \
++                   "$RUNNER_TEMP/teflon_dlopen"; do
++            [ -f "$f" ] || continue
++            name=$(basename "$f")
++            max=$(readelf -V "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' \
++                  | sort -uV | tail -1 | cut -d. -f2)
++            echo "  $name: 最高 GLIBC_2.${max:-?}  (上限 2.$CEIL)"
++            if [ -n "$max" ] && [ "$max" -gt "$CEIL" ]; then
++              echo "  ERROR: $name 使用 GLIBC_2.$max > 设备 2.$CEIL，会在设备上加载失败"
++              fail=1
++            fi
++            # 显式拦截 isoc23 系列
++            if readelf -sW "$f" 2>/dev/null | grep -q "__isoc23"; then
++              echo "  ERROR: $name 引用了 __isoc23_*（需 GLIBC_2.38+），设备 2.36 无此符号"
++              fail=1
++            fi
++          done
++          [ $fail -eq 0 ] || exit 1
++          echo "OK: 全部产物符号版本 ≤ 设备 glibc 2.36"
+ 
+       - name: Collect artifact
+         run: |
+@@ -157,41 +159,25 @@ jobs:
+           OUT="$RUNNER_TEMP/teflon-build/out"
+           mkdir -p artifact
+           cp "$OUT/libteflon.so" artifact/
+-          # DSM 7.4.1 实测系统级无任何 libdrm，必须随包部署。
+-          # libteflon.so 带 RUNPATH=$ORIGIN，同目录即可自动解析。
++          # DSM 无 libdrm，必须随包部署；libteflon.so 带 RUNPATH=$ORIGIN
+           [ -f "$OUT/libdrm.so.2" ] && cp "$OUT/libdrm.so.2" artifact/ \
+             || { echo "ERROR: 缺少 libdrm.so.2，产物在 DSM 上无法 dlopen"; exit 1; }
+           cp "$RUNNER_TEMP/teflon_dlopen" artifact/
+           {
+             echo "mesa_tag=${MESA_TAG:-mesa-24.3.0}"
+-            echo "target=aarch64 / glibc (sysroot: apt aarch64-linux-gnu)"
++            echo "target=aarch64 / glibc 2.31 sysroot (Debian bullseye)"
+             echo "toolchain=$(aarch64-linux-gnu-gcc -dumpmachine)"
+             echo "gcc=$(aarch64-linux-gnu-gcc --version | head -1)"
+             echo "meson=$(meson --version)"
+-            echo "runner_image=ubuntu-latest"
++            echo "runner=ubuntu-latest (amd64 packages only, no arm64 apt arch)"
+             echo "device=Synology DSM 7.4.1-90080 / glibc 2.36 / A311D NPU"
+-            echo "deploy=libteflon.so + libdrm.so.2 必须放同一目录（RUNPATH=\$ORIGIN）"
++            echo "deploy=libteflon.so + libdrm.so.2 必须同目录（RUNPATH=\$ORIGIN）"
+             echo "build_date=$(date -u +%FT%TZ)"
+           } > artifact/BUILD-INFO.txt
+           cat artifact/BUILD-INFO.txt
+           ( cd artifact && sha256sum libteflon.so libdrm.so.2 teflon_dlopen > SHA256SUMS )
+           cat artifact/SHA256SUMS
+ 
+-      - name: Final sanity check
+-        run: |
+-          set -eux
+-          # 设备侧 glibc 2.36 —— 产物的符号版本必须不高于它
+-          MAXGLIBC=$(readelf -V artifact/libteflon.so | grep -oE 'GLIBC_2\.[0-9]+' \
+-                     | sort -uV | tail -1)
+-          echo "libteflon.so 最高 glibc 符号: $MAXGLIBC  (设备 2.36)"
+-          MAXGLIBC_LIB=$(readelf -V artifact/libdrm.so.2 | grep -oE 'GLIBC_2\.[0-9]+' \
+-                     | sort -uV | tail -1)
+-          echo "libdrm.so.2 最高 glibc 符号: $MAXGLIBC_LIB  (设备 2.36)"
+-          echo "=== 依赖清单（libdrm.so.2 须随包）==="
+-          readelf -d artifact/libteflon.so | grep NEEDED
+-          readelf -d artifact/libteflon.so | grep -E 'RUNPATH|RPATH'
+-          ls -la artifact/
+-
+       - name: Upload artifact
+         uses: actions/upload-artifact@v4
+         with:
+diff --git a/oes-teflon/build-recipe/build-teflon.sh b/oes-teflon/build-recipe/build-teflon.sh
+old mode 100644
+new mode 100755
+index 9878602..5035954
+--- a/oes-teflon/build-recipe/build-teflon.sh
++++ b/oes-teflon/build-recipe/build-teflon.sh
+@@ -61,7 +61,13 @@ echo "=============================================="
+ #                       填到 /usr/aarch64-linux-gnu，无需手工下载
+ #   SYSROOT_MODE=deb    （musl 宿主）从 Debian 池下载 .deb 自行拼 sysroot
+ # ---------------------------------------------------------------- #
+-SR_MODE="${SYSROOT_MODE:-apt}"
++# 默认用 deb 模式（从 Debian 池装 glibc 2.31 sysroot），而不是 apt 的
++# aarch64 交叉包。原因：Ubuntu 24.04 的 libc6-dev-arm64-cross 是 glibc 2.39，
++# 而设备只有 2.36；glibc ≥2.38 的 stdlib.h 会把 strtol/strtoll 重定向到
++# __isoc23_*（GLIBC_2.38 版本节点），设备 2.36 无此符号 → dlopen 必失败。
++# deb 模式 sysroot 固定在 2.31，产物最高 GLIBC_2.29，安全。
++# 若确实要用 apt sysroot，需显式 SYSROOT_MODE=apt，并自行确认版本 ≤ 2.36。
++SR_MODE="${SYSROOT_MODE:-deb}"
+ mkdir -p "$BUILD_DIR/sysroot"
+ 
+ if [ "$SR_MODE" = "apt" ]; then
+@@ -203,6 +209,12 @@ rm -rf "$BUILD_DIR/_x"
+ # 会退化为 "Package zlib was not found" 并在链接期报 cannot find -lz。
+ export PKG_CONFIG_SYSROOT_DIR="$SR"
+ export PKG_CONFIG_PATH="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
++# PKG_CONFIG_LIBDIR 会**替换**默认搜索路径，比 PKG_CONFIG_PATH 更严格。
++# 交叉编译时必须用它：否则若 runner 上装了 libdrm-dev:arm64 /
++# zlib1g-dev:arm64（Ubuntu 24.04 的 glibc 2.39），pkg-config 会优先命中
++# /usr/lib/aarch64-linux-gnu/pkgconfig 里的 .pc，导致链接到 2.39 的库，
++# 产物就会带上设备（glibc 2.36）不存在的符号。
++export PKG_CONFIG_LIBDIR="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig"
+ for pc in libdrm zlib; do
+ 	f="$SR/usr/lib/${SYS_TRIPLET}/pkgconfig/$pc.pc"
+ 	[ -f "$f" ] && sed -i "s#^prefix=/usr#prefix=$SR/usr#" "$f"
+diff --git a/oes-teflon/verify/teflon_dlopen.c b/oes-teflon/verify/teflon_dlopen.c
+old mode 100644
+new mode 100755
+-- 
+2.54.0
+

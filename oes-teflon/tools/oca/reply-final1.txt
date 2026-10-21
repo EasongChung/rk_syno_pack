@@ -1,0 +1,80 @@
+[2026-10-18 06:55] ASSISTANT msg_14dcb25c0001smvLc39e7ooOwA (space-bunny-free)
+## ⛔ 停一下 —— 这个补丁按它自己文档描述的根因，**修不到点子上**
+
+我把 `NEW` 注入的代码逐条核对，结果是**恒等变换**：
+
+```
+=== NEW 注入的代码 ===
+   unsigned orig_input_channels = operation->input_channels;
+   operation->input_channels = orig_input_channels * operation->stride * operation->stride;
+```
+
+`orig_input_channels` 就是 `operation->input_channels`（赋值时该字段还没被改过），所以
+`orig * stride * stride` ≡ `input_channels * stride * stride` —— **与原文数值完全相同**。
+
+逐条核对你文档里「本补丁做的事」三步：
+
+| 步骤 | 状态 |
+|---|---|
+| 1. 保存 `orig_input_channels = operation->input_channels` | ✅ 有 |
+| **2. `wdims_in[3] = orig_input_channels`** | ❌ **`NEW` 里没有任何 `wdims_in` 赋值** |
+| 3. 输出侧用乘后值 | ✅ 有 |
+
+**缺的就是第 2 步 —— 而它恰好是唯一能改变 `wdims_in[3]` 的那一步。** `orig_input_channels` 在整个注入块里只出现 3 次（声明 1 次 + 乘法里 2 次），**没有任何读取点**。
+
+⇒ 若根因真是「`reshape` 的 `dims_in[3]` 拿到 `input_channels*4`」，那 `wdims_in[3]` 的值**一点没变**，崩溃点会原地不动。
+
+### 而且锚点本身透露出一个结构问题
+
+```python
+OLD = '...operation->input_channels};\n\n   operation->input_channels = operation->input_channels * stride * stride;\n'
+```
+
+锚点是「**某个初始化器的结尾 `operation->input_channels};`** + 空行 + 乘法那一行」——也就是说，**紧挨在乘法之前的那个初始化器拿到的是原值**。于是只有两种世界：
+
+| | 那个初始化器是谁 | 后果 |
+|---|---|---|
+| **A** | 它**就是** `wdims_in` | `wdims_in[3]` = 原值 → **那里根本不越界** → 你给的根因不成立（越界另有来源） |
+| **B** | 它是**别的**数组（如 `idims_in`），`wdims_in` 声明在乘法**之后** | 越界成立，但**补丁没碰它** |
+
+**两种世界下，这次构建都是白跑**：要么崩点找错了，要么修复不完整。而这会连带浪费一次真机验证。
+
+### 顺带一处门内的自相矛盾
+
+结构门要求 `fn_body` 里存在
+
+```
+operation->input_channels = operation->input_channels * operation->stride
+```
+
+—— 这是**打补丁前**的形态。补丁把它替换掉之后，这道门就再也过不了（目前只在 replace之前跑，所以没暴露）。也就是说这道门只验证「源码还是原样」，**不验证打完补丁后的结构**。
+
+### 我需要你给一个东西（二选一）
+
+**（a）把乘法之后那处 `wdims_in` 声明的逐字原文给我**（就是你文档里贴的那 4 行，含缩进）。我把 `OLD`/`NEW` 扩成覆盖两处，注入：
+
+```c
+unsigned orig_input_channels = operation->input_channels;
+operation->input_channels = orig_input_channels * operation->stride * operation->stride;
+...
+wdims_in[3] = orig_input_channels;      /* ← 真正修到根因的那一句 */
+```
+
+**（b）或者告诉我正确语义应该是哪种**：
+
+- **b1**：`operation->input_channels` 这个字段**根本不该被改**（改成局部变量算乘后值，只在输出侧用）—— 若调用方依赖该字段被改过，那 b1 不成立，这点也需要你确认；
+- **b2**：乘法保留，但 `wdims_in[3]` 必须用原值（同 (a)）。
+
+我倾向 **（a）+顺带确认 b1**：因为 v8 的 `orig_input_channels` 修法正是「输入侧全用 orig」，而 v7 这里输入侧唯一的消费者就是 `wdims_in[3]`。
+
+### 我这轮做了什么 / 没做什么
+
+- ✅ `patch-etnaviv-strided-normal-fix.py` 已落进 worktree（`oes-teflon/build-recipe/`），**逐字落地未改动**
+- ❌ **没有**落 `build-teflon.sh` 的 3h 步 —— 它的注释写着「用它填 `wdims_in[3]`」，而代码没做。落进去就是**我们这两轮刚清掉的「文档描述 ≠ 代码行为」**
+- ❌ **没有触发构建**，没提交任何东西
+- ❌ 没动 `b9936131`（它仍是当前交付候选，等你上机）
+
+**给我 (a) 或 (b) 的答复，我就落 3h 步 + 触发构建**，一次到位。
+
+[2026-10-18 06:55] IDLE msg_14dcb4627001Ij9nJ0Vg6pw4K8 succeeded
+

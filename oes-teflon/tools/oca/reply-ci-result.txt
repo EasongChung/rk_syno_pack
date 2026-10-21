@@ -1,0 +1,85 @@
+[2026-10-17 13:47] ASSISTANT msg_14a1db87c0018L7NkuyZBqF2PM (deepseek-v4.1-flash)
+  [tool:shell] {"command": "$log = gh run view 39037768379 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = ($log -split \"`n\") | Where-Object { $_ -like '*Assert FIX_V7 switches*' }; $lines | Where-Object { $_ -match...
+
+[2026-10-17 13:47] ASSISTANT msg_14a1dd58f001Ywgy6UTRNStkAa (deepseek-v4.1-flash)
+**三行断言全部 PASSED。** 取产物 sha256 / 大小 / debug 段 / 字符串门：
+  [tool:shell] {"command": "$log = gh run view 39037768379 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = ($log -split \"`n\") | Where-Object { $_ -like '*Verify artifact*' -or $_ -like '*Collect artifact*' }; $lines...
+
+[2026-10-17 13:47] ASSISTANT msg_14a1df54d001gVffDzml56YLgZ (deepseek-v4.1-flash)
+  [tool:shell] {"command": "$log = gh run view 39037768379 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; $lines = ($log -split \"`n\") | Where-Object { $_ -like '*Collect artifact*' }; $i = ($lines | Select-String -Pattern '...
+
+[2026-10-17 13:47] ASSISTANT msg_14a1e1393001J4p0Qay3QKxclC (deepseek-v4.1-flash)
+  [tool:shell] {"command": "$log = gh run view 39037768379 --repo EasongChung/rk_syno_pack --log 2>&1 | Out-String; ($log -split \"`n\") | Where-Object { $_ -match '^\\S+\\s+[0-9a-f]{64}\\s+libteflon' -or $_ -match '[0-9a-f]{64}\\s+(li...
+
+[2026-10-17 13:47] ASSISTANT msg_14a1e3220001x1y4b4slqXkVDr (deepseek-v4.1-flash)
+## 给 och 的完整交付回执 —— 四样齐了
+
+### 1️⃣ 提交 sha
+
+```
+aceffa7e  (main)
+  oes-teflon/build-recipe/build-teflon.sh            (你的修订版)
+  oes-teflon/build-recipe/patch-etnaviv-v7-biasfix.py (新)
+  .github/workflows/build-teflon-diag.yml            (FIX_V7 + 仅 dispatch)
+```
+
+**CI `39037768379` = success**（Mesa `mesa-26.2.5`）
+
+### 2️⃣ 三行日志原文（全部 PASSED）
+
+```
+  OK: 调试信息：开启（-g3）
+  OK: [3e/6] 打【修复】v7
+  OK: [och-fix] 已修复 v7 calculate_bias_correction
+ALL SWITCH ASSERTIONS PASSED
+```
+
+### 3️⃣ 产物
+
+| 文件 | sha256 | 大小 |
+|---|---|---|
+| **libteflon.so** | `ffce949e954c9ef300482364e98580688a0b1631d9b74e8dd9bace0227443e48` | **11,975,792 B** |
+| libdrm.so.2 | `2d9d3c8d24be2cabf6ff8af026928ffc6b1f7782d4b8f19f859f6a0918a40ab3` | — |
+
+`Machine: AArch64` ✓，artifact 名 `libteflon-diag`。
+
+### 4️⃣ ⚠️ `.debug_*` 段：**ABSENT** —— 但根因已定位，不是 `-g3` 没生效
+
+```
+DEBUG-SECTIONS: ABSENT（strip --strip-unneeded 可能已移除）
+```
+
+**这是构建脚本的 `strip` 把调试段删掉了**（`build-teflon.sh` 第 6 步无条件执行 `strip --strip-unneeded`）。
+
+**证据表明 `-g3` 确实生效了**：`-g3` 出现在编译器命令行里（我上轮验证过 cross.ini），且 `Assert` 抓到了 `调试信息：开启（-g3）`。
+
+**要不要保留 debug 段，请你裁决**：若你要用 `addr2line` 定位源码行，我需要在诊断 workflow 里跳过 strip。这只需在 `build-teflon.sh` 加一个 `TEFLON_NO_STRIP=1`（默认关，不影响生产）——**但那是你维护的脚本，我不擅自加**。
+
+### 5️⃣ 修复代码确实编入二进制（比日志更强的证据）
+
+```
+STRING-CHECK: fix printf present  <- 修复代码已编入
+STRING-CHECK: OOB warning string present
+```
+
+`strings libteflon.so` 能找到 `calc_bias_correction depthwise` 与 `still OOB after fix` —— **这证明补丁进了最终产物，不只是日志说说**。
+
+### 6️⃣ 你上一条的澄清我核对过了
+
+**a) diag 补丁的 `ANCHOR = "   int32_t correction = 0;\n"` 确实不含 `for`** —— 我上一轮说"两个补丁看到两种不同写法"是**我误读**，你的说明是对的。撤回那个疑问。
+
+**b) `operation->output_channels` 在 `etnaviv_ml.h:118`** —— 且你用它做了**结构体布局的独立交叉验证**（`weight_width` @260 / `weight_height` @264 与反汇编偏移一致）。这条比我的 CI 编译通过更有说服力。
+
+**c) 「先 fix 后 diag 能共存」** —— 接受。你的措辞修正（"防混淆安全栏"而非"技术必然失败"）是对的，**我原来那句「两个一起开会以匹配到 0 处失败」是错的**。
+
+### 7️⃣ 我这边未验证的（不声称）
+
+- **`buggy_bound ≫ fixed_bound` 的实际数值** —— 要你上机读日志
+- **是否不再 SIGSEGV** —— 要真机
+- **接管节点数是否上升** —— 要真机
+- **`--invoke` 与 x86 基准逐字节比对** —— 这才是"NPU 真能用"的判据，前面三条只是"不崩了"
+
+**在拿到你第 4 项之前，我不会声称 NPU 能用。**
+
+[2026-10-17 13:47] IDLE msg_14a1e5b43001uEa1hEnVfAengS succeeded
+

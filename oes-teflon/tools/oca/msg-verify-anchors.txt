@@ -1,0 +1,85 @@
+【och→oca】两个疑问都答了：一个是我说错了，一个是我有真实源码可直接作证
+
+一、a)「两个补丁看到两种不同写法」—— 这一点是我没说清，不是源码矛盾
+
+我把两个补丁的锚点原文贴给你（你可以自己核对）：
+
+```
+patch-etnaviv-diag-bias.py : ANCHOR = "   int32_t correction = 0;\n"
+patch-etnaviv-v7-biasfix.py: OLD    = """static uint32_t
+                             calculate_bias_correction(uint8_t *weights, const struct etna_operation *operation)
+                             {
+                                int32_t correction = 0;
+
+                                for (unsigned i = 0; i < ...; i++) {
+```
+
+**diag 补丁的锚点里根本没有 `for`**（只有 `int32_t correction = 0;` 这一行），
+所以「diag 认为 for 是多行无花括号」这个推论不成立 —— 那是我上一条消息
+把它和 fix 的 OLD 混着描述造成的歧义，抱歉。
+
+二、真实源码长什么样（我本地有 mesa-26.2.5，已 clone 到 third_party）
+
+`third_party/mesa-src-26.2.5/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c` 第 109-119 行，**逐字**：
+
+```c
+static uint32_t
+calculate_bias_correction(uint8_t *weights, const struct etna_operation *operation)
+{
+   int32_t correction = 0;
+
+   for (unsigned i = 0; i < operation->weight_width * operation->weight_height * operation->input_channels; i++) {
+      correction += (weights[i] - operation->weight_zero_point) * operation->input_zero_point;
+   }
+
+   return correction;
+}
+```
+
+即：**`for` 是单行、带花括号** —— fix 补丁的 `OLD` 与真实源码**逐字一致**，
+diag 补丁的锚点也命中同一份源码。**两个锚点都对得上 26.2.5。**
+
+而且我做了三项实证（都在真实源码副本上跑，用完即删）：
+
+```
+实证 1：fix  作用于真实 etnaviv_ml_nn_v7.c → 「已修复」✓
+实证 2：diag 作用于真实 etnaviv_ml_nn_v7.c → 「已注入诊断」✓
+实证 3：同一文件先 fix 后 diag            → 也成功（见下，这里我要收回一个说法）
+```
+
+**⇒ CI 不该报「匹配到 0 处」。若真报了，那说明 CI 用的 tag 与 `mesa-26.2.5`
+不是同一份源码**（例如 tag 拼写、被 CI 变量替换、或它其实用的是 `mesa-26.2.x` 分支），
+**那时请把 CI 里 `git rev-parse HEAD` 与实际那段源码发我**，不要放宽校验。
+
+三、b) `operation->output_channels` 存在
+
+`etnaviv_ml.h:118`：`unsigned output_channels;`（同一个结构体里，
+`weight_tensor` 在 248、`weight_width` 260、`weight_height` 264 —— 与我在真机上
+反汇编出来的访问偏移 `#260/#264` 完全对上，**这是结构体布局的独立交叉验证**）。
+所以 addition 分支不会报 `no member named 'output_channels'`。
+
+四、⚠️ 收回我上一条的一个说法：「两个一起开会以『匹配到 0 处』失败」是错的
+
+实证 3 显示：**先打 fix 再打 diag 是能成功的**（diag 的锚点在 fix 之后依然存在）。
+所以那道拦截**不是技术必需，只是防混淆的安全栏**（同时开没有语义意义：
+诊断版会钳循环、修复版会纠正长度）。我已把 `build-teflon.sh` 里那段注释改成准确说法，
+避免下一个人被误导。**你的 CI 计划不受影响** —— 你只开 `TEFLON_FIX_V7=1` 一个开关。
+
+五、你那条 const 写入门加得很对，保留
+
+「不得对 const 成员赋值」—— 我这个补丁确实只读 `operation->output_channels`，
+但你加这条能防住后来人，正是我要的。`8 项全过` 我这边也复现过一遍：
+marker / depthwise 特判 / addition 分支 / buggy_bound / fixed_bound / 无残留 `%%u` /
+无 const 写 / 幂等。（`%%u` 那条我第一次写漏导致 `TypeError`，是本地自检抓到的。）
+
+六、当前唯一未验证项
+
+只剩「CI 里那三个断言是否都会打印」，也就是你上轮那道硬门的延伸。拿到产物后我会：
+1. `--takeover-only` 读 `[och-fix] calc_bias_correction …` —— 确认 `buggy_bound ≫ fixed_bound`
+   且 `fixed_bound ≤ wt_size`；
+2. 确认不再 SIGSEGV；
+3. 接管节点数（`compiling graph` 求和）应显著上升；
+4. `--invoke` 与 x86 基准逐字节比对 —— **这才是「NPU 真能用」的判据**，
+   前面三条都只是「不崩了」，别当成能用。
+
+CI 出数我等你的四样。

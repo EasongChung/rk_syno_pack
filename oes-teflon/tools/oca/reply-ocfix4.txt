@@ -1,0 +1,99 @@
+[2026-10-18 02:32] ASSISTANT msg_14cdacd1f001WYe2RDF9cNVBlX (space-bunny-free)
+## 给 och —— 四样齐了，`39090248835` = **success（14/14，含 artifact 上传）**
+
+### 1️⃣ 提交 sha
+
+```
+4890fee4  (main)  同步断言文案 + 把「原式保留未动」纳入门
+37943bb7           清 __pycache__ + .gitignore
+7baf5683           clamp 补丁（新增）/ 删 remap 补丁 / strings 硬门 / AST 门
+```
+
+### 2️⃣ 你要的两行日志原文（**三条**，补丁多打了一行）
+
+```
+==> [3g/6] 打【修复】write_core_interleaved out_channel 尾部越界钳位
+  [och-ocfix] 已加 out_channel 尾部越界钳位: mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c
+  [och-ocfix] 原式保留未动（与上游 v8 fill_weights() 结构一致）
+  [och-ocfix] ⚠️ 只算「越界消失」；能否用要看四级判据第 ④ 级（逐字节比对）
+```
+
+**七行断言全过**：
+```
+OK: [3e/6] 打【修复】v7
+OK: [och-fix] 已修复 v7 calculate_bias_correction
+OK: [3g/6] 打【修复】write_core_interleaved
+OK: [och-ocfix] 已加 out_channel 尾部越界钳位
+OK: [och-ocfix] 原式保留未动            ← 我新加的门
+OK(absent): strip：跳过（保留调试段…
+OK(absent): [och-wc] 已注入 out_channel 诊断
+OK(absent): 调试信息：开启（-g3
+ALL SWITCH ASSERTIONS PASSED
+```
+
+### 3️⃣ 产物
+
+| 项 | 值 |
+|---|---|
+| sha256 | **`b99361316bdf13ccdfb3953edb6eab3aeadc5d388b238602e0678f157cd76020`** |
+| 字节数 | **11,975,792** |
+| `STRIPPED` | `OK (no .debug_info)` |
+| glibc | `OK: 全部产物符号版本 <= 设备 glibc 2.36` |
+| artifact | `libteflon-fix` |
+
+sha256 **三方一致**：CI 声明 = artifact 内 `SHA256SUMS` = 我本地实算。
+
+### 4️⃣ `strings` 双结果（你要的两条）
+
+```
+STRING-CHECK: och-patch-v7-outchannel-clamp PRESENT (clamp really in .so)   ← 存在 ✅
+STRING-CHECK: [och-wc] absent (diag switch really off)                       ← 不存在 ✅
+STRING-CHECK: [och-fix] calc_bias_correction depthwise present                ← v7 也在
+```
+
+**我又做了一遍本机独立复核**（纯字节搜索，不信 CI 的 `strings`）：
+
+| 串 | 结果 |
+|---|---|
+| `och-patch-v7-outchannel-clamp` | **存在=True** ✅ |
+| `calc_bias_correction depthwise` | 存在=True ✅ |
+| `[och-fix]` | 存在=True ✅ |
+| `[och-wc]` | **存在=False** ✅ |
+| `och patch: out_channel`（注释 marker） | 存在=False（再次印证注释不进产物） |
+
+### 5️⃣ ★ 额外做了一件事：**证明这次补丁真的生效了**
+
+我把 clamp 版和作废的 remap 版（`f9bf1d51`）做了**逐字节对比**：
+
+```
+两版是否完全相同: False        ← 相同就说明补丁没起作用首个不同字节偏移: 0x60
+remap 标记在 clamp 版里: False
+```
+
+**体积相同（都是 11,975,792）但内容不同** —— 这正面回答了上一轮我说过的那句「体积一样不能当证据」：现在我有内容级证据了。
+
+### 6️⃣ 三元组标注
+
+| sha256(前8) | 配置 | 上过机 | 状态 |
+|---|---|---|---|
+| `ffce949e` | FIX_V7，strip | ✅ 崩过（EXIT=139） | 旧基线 |
+| `bdf39e55` | FIX_V7+WCDIAG，NO_STRIP | ✅ 取证（136组合） | 诊断产物 |
+| `f9bf1d51` | FIX_V7+**OCFIX remap**，strip | ❌ | **作废**（已被 v8 否证） |
+| **`b9936131`** | **FIX_V7+OCFIX clamp**，strip | ❌ **未上过机** | **交付候选，未验证** |
+
+**这版我不写「已修复」。** 它是交付候选，能不能用由你的第 ①–④ 级说话。
+
+### 7️⃣ 仍等你裁决的一件事
+
+**头部 `TEFLON_OCFIX` 说明仍在描述已作废的重映射**（`core*kernels_per_core … 去掉多余的 * cores_used`），只有 3g 注释和补丁本身是「只钳位」。头部是大多数人第一个读的段落 —— 替换文本我上一条已给出，**你说一声我就改**（一个 commit）。
+
+### 8️⃣ 落盘
+
+这版**没落 `o2tf-src`**（你说「不急，新构建优先」）。产物在我的临时目录 `D:\clawtemp\oc-verify-tmp2\`，**你需要时说一声**（12 MB，与上轮同等量级）。`f9bf1d51` 那份作废对照点已在 `D:\clawtemp\o2tf-src\libteflon-void-remap-f9bf1d51.so`，可以先上机跑第 ④ 级。
+
+### 9️⃣ 这轮的收获（值得固化成流程）
+
+**「门文案漂移」这已经是第三次伤到我们**（不可能的 strings 门 → 文案没跟着改 → 我自检里 grep 到自己写的文档）。我已在本地校验里加了**门文案对账**：把每个断言 pattern 拿去和 `build-teflon.sh` / 补丁脚本实际会打印的字面量逐条比对，缺一个本地就红。**这类错以后不再消耗 CI 轮次。**
+
+[2026-10-18 02:32] IDLE msg_14cdae698001gEeYCAjOz6IvGF succeeded
+

@@ -1,0 +1,81 @@
+[2026-10-17 13:43] ASSISTANT msg_14a1a9d53001XIalInnjx6u5cq (deepseek-v4.1-flash)
+  [tool:shell] {"command": "git -C D:\\clawtemp\\rk_syno_pack worktree remove D:\\clawtemp\\_wtE1 --force 2>&1; git -C D:\\clawtemp\\rk_syno_pack worktree prune 2>&1; git -C D:\\clawtemp\\rk_syno_pack fetch origin 2>&1 | Select-Object ...
+
+[2026-10-17 13:44] ASSISTANT msg_14a1b4140001tqyWKuoaroLS74 (deepseek-v4.1-flash)
+生产 workflow 仍被触发了（改了 `build-teflon.sh`，它在生产 workflow 的 push paths 里——**这符合 och 的设计，生产不该改**）。取消它，只留诊断：
+  [tool:shell] {"command": "gh run cancel 39037752191 --repo EasongChung/rk_syno_pack 2>&1 | Select-Object -Last 1; Start-Sleep 5; gh run watch 39037768379 --repo EasongChung/rk_syno_pack --exit-status --interval 20 2>&1 | Select-Objec...
+
+[2026-10-17 13:44] ASSISTANT msg_14a1b5b56001W0qoZiG1YykwaL (deepseek-v4.1-flash)
+## 给 och 的回执 —— 已按第 22 轮全部执行
+
+### 1️⃣ 提交 sha
+
+```
+aceffa7e  (main)
+oes-teflon/build-recipe/build-teflon.sh           覆盖为你的新版
+oes-teflon/build-recipe/patch-etnaviv-v7-biasfix.py   新增
+.github/workflows/build-teflon-diag.yml           改为 FIX_V7 + 仅 dispatch 触发
+```
+
+### 2️⃣ 你要的四点
+
+| 你的要求 | 执行情况 |
+|---|---|
+| ① 覆盖旧版 `build-teflon.sh` | ✅ `sh -n` 通过；diff 仅含头部注释 + 互斥硬拦 + 3e 步骤 |
+| ② env 改 `TEFLON_FIX_V7=1` + `TEFLON_DEBUG_INFO=1`，不用 `TEFLON_DIAG` | ✅ 且显式设 `TEFLON_DIAG=0` |
+| ③ 触发 + 回传四样 | ⏳ CI `39037768379` 运行中 |
+| ④ 断言两行日志 | ✅ 已加，**且要求三行**（多了 `[3e/6] 打【修复】v7`） |
+
+### 3️⃣ 结构性问题按你的建议解决
+
+`build-teflon-diag.yml` **去掉了 push 触发，只有 `workflow_dispatch`**。这样改 `build-teflon.sh` 不会再自动触发它。
+
+（生产 `build-teflon.yml` 仍会被 `build-teflon.sh` 的 push 触发——这是它的原有设计，我没动它，只是手动 cancel 了那次。）
+
+### 4️⃣ 我给修复补丁加了一项你可能没要求的检查
+
+`Preflight` 里除了你说的三条（正常注入/防重入/锚点缺失），我还断言：
+
+```python
+# 不得对 const 成员赋值（上一轮 diag 补丁的编译错误）
+for ln in b.splitlines():
+    s = ln.strip()
+    if s.startswith('operation->') and '=' in s and '==' not in s:
+        raise AssertionError('assigns const member: %s' % s)
+```
+
+**因为你这个补丁也用了 `operation->output_channels` 读操作**——虽然只读不写应该没事，但这条门能防止未来任何人在这个函数里加写操作。
+
+**本地自检 8 项全过**（marker / depthwise / addition / buggy_bound / fixed_bound / 无 `%%u` / 无 const 写 / 幂等）。
+
+### 5️⃣ 两处需要你确认的地方
+
+**a) 修复补丁的 `OLD` 模板依赖精确格式**
+
+```python
+OLD = """static uint32_t
+calculate_bias_correction(uint8_t *weights, const struct etna_operation *operation)
+{
+   int32_t correction = 0;
+
+   for (unsigned i = 0; i < ...; i++) {
+```
+
+注意这里 `for` 是**单行**、且带花括号 `{`。而 diag 补丁的锚点是**多行 for、无花括号**。
+
+**同一个函数，两个补丁看到的是两种不同写法** —— 这说明至少有一份与 Mesa 26.2.5 实际源码不符。**若 CI 报"匹配到 0 处"，我会把 Mesa 实际源码片段发你，不放宽校验。**
+
+**b) `operation->output_channels` 字段存在性**
+
+addition 分支用了 `operation->output_channels`。若 v7 的 `struct etna_operation` 没有这个字段，编译会报 `no member named 'output_channels'`。这个我本地无法验证（没有 Mesa 源码），**只能由 CI 编译结果说话**。
+
+### 6️⃣ 我收回并确认的地方
+
+- ✅ 收回「退化尺度导致崩溃」的判断（zp 只影响算术值，不导致越界）
+- ✅ 接受「上游 Mesa v7 缺陷，不是模型问题」
+- ✅ 同意不拆 `build-teflon-diag.sh`（避免 500 行漂移）
+
+**CI 出数我立刻报四样**（提交 sha / 三行日志原文 / `.so` sha256+字节数 / `.debug_*` 有无）。
+
+[2026-10-17 13:44] IDLE msg_14a1b7fac001aqk5zG2FSnV57Y succeeded
+

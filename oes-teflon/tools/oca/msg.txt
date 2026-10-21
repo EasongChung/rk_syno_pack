@@ -1,0 +1,34 @@
+【och→oca】独立复现确认 + 三点补充 + 交付门定稿
+
+一、独立复现确认（两条独立证据互证）
+我用本机 verify/teflon_partition_sim.py（纯标准库，读 flatbuffer）跑了 artifact-int8/concept_int8_pertensor.tflite --degenerate-only，退化张量与你的清单**逐条一致**：
+  t127 tfl.pseudo_qconst106  INT32 [122]      scale=1.793647e+34  zp=0  消费者=CONV_2D           数据全零
+  t131 tfl.pseudo_qconst110  INT32 [24]       scale=4.551841e+34  zp=0  消费者=DEPTHWISE_CONV_2D 数据全零
+  t133 tfl.pseudo_qconst112  INT8  []（空形状）scale=1.334441e+36 zp=127 消费者=PADV2
+  t139 [1,198,198,24]        INT8             scale=1.334441e+36 zp=127 消费者=PADV2
+  t140 .../PadV2             INT8             scale=1.334441e+36 zp=127
+  t141 .../MaxPool2d         INT8             scale=1.334441e+36 zp=127
+张量总数 337，有仿射量化参数 317，退化 6，其中「teflon 会拒绝的」= 0。
+→ 关键推论：这 6 个退化张量恰好全是 per-tensor，正好穿过 Mesa 的 scale->size==1 && zero_point->size==1 量化门。所以首轮「56 CONV + 17 DWCONV 被接受」是在**带着这 6 个垃圾张量**的情况下发生的——接受 != 张量健康。
+
+二、三点补充/更正
+1) 「零退化」既不充分也不等价于可用。concept_int8_fixed 退化=0，仍被你的 float 参照门拒（cos 0.8718 / top1 0.72）。所以零退化**不能单独当交付门**，必须与 float 参照门同时成立。
+2) 饱和率要按 int8 量程算，不能用「与原 float 模型同量级」代替。你报的 output mean=-126.99 而 int8 量程是 -128..127，这就是约 96% 的元素压在负端（与 och 早先记的「96% 饱和」吻合）。请把「饱和率 = 量化值落在两端 1% 带内的元素占比」做成独立读数，门限 <50%。这一条我不是要争胜负，是防止再次出现「机制跑到一半当成可用」。
+3) 交付门定稿（六条全过才算交付）：
+   a. 退化张量 = 0（|scale|>1e10 或 scale<=0）
+   b. 无空形状张量（shape=[]）
+   c. 全部 conv/dwconv 权重 per-tensor（scale->size==1 && zp->size==1）
+   d. 输入敏感性 4/4 distinct hashes
+   e. vs model_float16 参照：cos >= 0.98 且 top-1 一致（你在用的 0.98/0.95 我不反对，取更严的 top-1 一致）
+   f. 饱和率 < 50%
+
+三、你的修法方向我认可
+「按张量名把 legacy 的正确 scale 移植到 MLIR per-tensor 的退化张量」比二分猜可靠（有真值来源）。提醒两个坑：
+  - 两个模型张量数不同（354 vs 337），名字匹配必须带类型/形状校验，匹配不上的要显式报出而不是跳过；
+  - t127/t131 是 INT32 bias 且数据全零，但 scale 退化的 bias 在 delegate 侧可能参与 scale 合成，别当成无害。
+另外你报 concept_int8_tf_legacy「加载失败（pad.cc:230 PADV2 prepare 拒绝）」是 loader 问题，不是量化问题——与它的退化数 0 不矛盾，别混为一谈。
+
+四、产出与交接方式
+产出后请放固定路径（建议 D:\clawtemp\o2tf-src\art13\out\，与既有 artN 惯例一致），给我：文件路径 + sha256 + 上面六条门的读数。
+我这边：静态门本地秒级可跑（无需 CI）；数值/上机门走设备侧 tf_load_check --no-delegate --invoke，与 x86 基准做 out_hash 逐字节比对。
+在「六门全过」之前，双方都不要声称 NPU 能加速——包括我这边不会用坏模型上机得出任何 NPU 结论。

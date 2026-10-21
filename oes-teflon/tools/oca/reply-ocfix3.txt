@@ -1,0 +1,111 @@
+[2026-10-18 02:24] ASSISTANT msg_14cd336e3001U0cdExwT4kDG71 (space-bunny-free)
+  [tool:shell] {"command": "gh run watch 39089972056 --repo EasongChung/rk_syno_pack --exit-status --interval 25 2>&1 | Select-Object -Last 2; echo WATCH_DONE", "timeout": 3000000, "background": true}
+
+[2026-10-18 02:24] ASSISTANT msg_14cd34022001e4lVBmaDUu8lmv (space-bunny-free)
+## 给 och —— 已落地，CI `39089972056` 运行中
+
+### 1️⃣ 提交
+
+```
+37943bb7  (main)  清掉误提交的 __pycache__/*.pyc + 加 .gitignore
+7baf5683           clamp补丁（新增）/ 删除 remap 补丁 / strings 硬门 / AST 门
+```
+
+`git diff --cached --name-status` 里确认含 **`D oes-teflon/build-recipe/patch-etnaviv-outchannel-fix.py`** —— remap 版已从仓库删除。`BUILD-INFO.txt` 里写死了一条：
+
+```
+void=patch-etnaviv-outchannel-fix.py (remap version) was DELETED from the repo:
+      its 'core*kernels_per_core, drop * cores_used' remap was REFUTED by upstream
+      etnaviv_ml_nn_v8.c fill_weights() (:726 keeps * cores_used, :754 advances by
+      kernels_in_superblock); v7's real defect is the even DIV_ROUND_UP split
+void_sha256=f9bf1d51… (remap build, VOID)
+```
+
+**认你的三个错**：① `strings` 门物理上不可能成立（注释不是产物）——已改成编译期标记；② 重映射判断被 v8 否证；③ 默认 `MESA_TAG` 与锚点版本不一致的隐患已由 `mesa_tag_binary` 覆盖。
+
+**`f9bf1d51` 已按你要求落盘**（不是交付物，是对照数据点）：
+
+```
+D:\clawtemp\o2tf-src\libteflon-void-remap-f9bf1d51.so        11,975,792 B
+D:\clawtemp\o2tf-src\libteflon-void-remap-f9bf1d51.sha256   （首两行写明 VOID 原因）
+f9bf1d51156e372cd5cf76859f7c76808235fab052739ee39a32ea38a471e490   ← 本地实算，与 CI 一致
+```
+
+文件名与 `.sha256` 头两行都带 `VOID / DO NOT SHIP`，避免将来被误取。
+
+### 2️⃣ `strings` 硬门已按你要求落成
+
+```bash
+if ! strings -a "$SO" | grep -q 'och-patch-v7-outchannel-clamp'; then
+  echo "ERROR: 产物里找不到 … 编译期标记"
+  echo "       说明钳位补丁没有进入二进制 —— 上机仍会 SIGSEGV，这是必须拦的情况"
+  exit 1
+fi
+```
+
+我本机先验过这个标记**确实是字符串字面量**（不是注释），所以这道门能真正判定，不像上一轮那道永远红的。
+
+### 3️⃣ AST 未定义名检查**已接进 CI**（不再只留本机）
+
+新增 step `Static check - undefined names in python patchers`，扫 `oes-teflon/build-recipe/*.py` + `oes-teflon/tools/*.py`。本机实跑：**8 个文件全过**（含新 clamp 补丁）。
+
+理由按你说的记在 step 注释里：两次都栽在**门的错误分支**上（我的 `args_fn_name_placeholder`、你的 `FORMULA_LITERAL`），`py_compile` 都通过 —— **语法合法 ≠ 名字存在**。
+
+### 4️⃣ 你的第 7 点我照做了：**逐字落地，不手工改**
+
+两个文件都按你给的原文落地，我只在 workflow 里改（那是我维护的）。本机校验：`sh -n` ✅ / `py_compile` ✅ / 3g 段只改了一处 `PATCHER6` 指向 + 注释 ✅。
+
+### 5️⃣ ⚠️ **你交付的 rev7 里有一处自相矛盾，我按协议逐字落地了，但必须提**
+
+**头部 `TEFLON_OCFIX` 那段说明仍在描述已作废的重映射**：
+
+```
+#   TEFLON_OCFIX=1       修正 write_core_interleaved() 的 out_channel 映射
+#                         （core*kernels_per_core + 前序 superblock 累计偏移 + kernel，
+#                          去掉多余的 * cores_used），并加越界钳位护栏。
+```
+
+只有 3g 注释改成了「只钳位，不改公式」。**头部是大多数人第一个读的段落**，现在它说的是被你自己否证的方案 —— 下一个人读完头部会以为「映射被改了」，正好是你担心的那种误用。
+
+**建议改成**（一行摘要式，和 3g 注释一致）：
+
+```
+#   TEFLON_OCFIX=1       只在 write_core_interleaved() 尾部加 out_channel 越界钳位，
+#                         **原式逐字保留**（上游 v8 fill_weights() 证明原式有意：
+#                         :726 保留 * cores_used、:754 按 kernels_in_superblock 推进；
+#                         v8 用 :729-731 的余数分配消除幽灵槽，v7 缺的正是这个）。
+#                         根因由真机 [och-wc] 证实：136 组合 0 反例复现公式，
+#                         且出现 out_channel >= output_channels（123 vs 122）→ SIGSEGV。
+#                         锚点由 tools/gen-ocfix-patch.py 逐字生成，自带精确计数门。
+#                         ⚠️ 仍需四级判据第 ④ 级（逐字节比对）才算「能用」。
+```
+
+**要我改就说一声**，一个 commit 的事。
+
+### 6️⃣ 一处我还没把握、需要 CI 回答的技术点
+
+clamp 补丁把 `__attribute__((used)) static const char och_ocfix_marker[] = …` 放在**最内层循环体内、且在一条语句之后**（`unsigned out_channel = …` 之后）。C99 起合法，但 Mesa 那份源码是 C89 风格。
+
+- CI 用 gcc 13 默认 `gnu17` → **应该没问题**；
+- 但如果开了 `-Wdeclaration-after-statement` 或 `-std=c89`，会报错。
+
+**我本地无 gcc，无法验证** —— 这条只能由 CI 回答（构建步是硬门，报错就红）。
+
+### 7️⃣ 我这轮自己犯的 3 个错（不藏）
+
+| 错 | 性质 |
+|---|---|
+| `git add -A` 把 `__pycache__/*.pyc` 一起提交了 | 顺手操作没排除；已删 + 加 `.gitignore` |
+| 自检里 `'continue' not in seg` FAIL | 补丁**注释里**就写着「不用 continue」，我查错了对象（应查 `continue;` 语句）|
+| 自检里「花括号配平」FAIL | 又拿代码片段数括号 —— 与上一轮 workflow 那次同源，**第三次犯** |
+
+第 3 条我打算写进我的固定检查清单：**任何「配平/计数」类断言，必须先问「这段是完整单元吗」**。
+
+### 8️⃣ `TEFLON_OCFIX=2` 不做 —— 采纳你的判断重映射已被否证，钳位是唯一候选，二分问题自动消失。多一个模式只多一处能配错的地方。
+
+CI 出数立刻回四样：**提交 sha / `[3g/6]` 与 `[och-ocfix]` 两行原文 / `.so` sha256 + 字节数 / `strings` 双结果（`och-patch-v7-outchannel-clamp` **存在**、`[och-wc]` **不存在`）**。
+
+**新产物我不写「已修复」** —— 它是交付候选。
+
+[2026-10-18 02:24] IDLE msg_14cd365c0001nrJuCw1icHY23W succeeded
+

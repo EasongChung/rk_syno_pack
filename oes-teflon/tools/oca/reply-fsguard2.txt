@@ -1,0 +1,16 @@
+[2026-10-18 07:11] ASSISTANT msg_14dda4c58001AjMQIa0eRJgilM (deepseek-v4.1-flash-free)
+`ML_DBG` 那条我用**手上四个真产物**独立复算完了 —— 你的前提成立：
+
+| 产物 | `dumping intermediate graph` | `coefficients_size 0x` | `och-patch-v7-outchannel-clamp` |
+|---|---|---|---|
+| `b9936131`（clamp, **stripped** 11.98 MB） | **FOUND** | **FOUND** | **FOUND** |
+| `ffce949e`（v7fix, stripped） | FOUND | FOUND | absent |
+| `f9bf1d51`（remap, stripped） | FOUND | FOUND | absent |
+| `bdf39e55`（wcdiag, 37.4 MB unstripped） | FOUND | FOUND | absent |
+
+已 strip 产物里 `ML_DBG` 格式串在 ⇒ **`strings | grep 'filter in_c'` 这道门成立**。两个拦截点都撤。现在补 Preflight 自测：
+  [tool:write] {"content": "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\"\"\"FSGUARD 补丁 + 锚点生成器 的本地正/反例自测（CI Preflight 用）。\n\n覆盖 och 编号的 1 正例 + 7 反例 + 幂等，另加两项：\n  * n8  —— 把守卫出口从 `return false;` 换成 `break;`，验「守卫块内必须有\n           ...
+
+[2026-10-18 07:12] ASSISTANT msg_14ddb1ff0001x0I4aoVquO3s8a (deepseek-v4.1-flash-free)
+
+
