@@ -276,7 +276,6 @@ MODE_ENV = [
     # PERCHANNEL_DIAG 不在 base env 里，但 build-teflon.sh 默认 1 ⇒ 交付版必须显式关
     #   （否则产物里会带 [och-pcl] 的诊断打印）
     ("  TEFLON_PERCHANNEL_DIAG: '1'", "0"),
-    ("  TEFLON_MLWIDTH_PATCH: '0'", "1"),
 ]
 
 
@@ -339,7 +338,12 @@ def build(base: str, mode: str) -> str:
             "  # ★ per-channel 权重折叠后的域修复（报告 46）：\n"
             "  #   signed 分支多减 0x80 ⇒ 非对角权重 0→128 ⇒ 输出饱和到 255。\n"
             "  #   运行期由 TEFLON_PCDOMAIN 门控，不设 = 与上游逐字节一致。\n"
-            "  TEFLON_PCDOMAIN_PATCH: '1'\n")
+            "  TEFLON_PCDOMAIN_PATCH: '1'\n"
+            "  # ★ ML 自建资源 width0=0 的修复（报告 48）：Photos 主题识别模型的 abort 根因之一\n"
+            "  TEFLON_MLWIDTH_PATCH: '1'\n"
+            "  # ★ 通用 rank>4 守卫（报告 48）：该模型是 rank-5 折叠形态，\n"
+            "  #   delegate 接管 RESHAPE ⇒ 驱动丢 dims[0] ⇒ 尺寸错 ⇒ abort\n"
+            "  TEFLON_MLR5G_PATCH: '1'\n")
         sub("断言表 + 两条幻影补丁的应用证据", ASSERT_PERCHANNEL, ASSERT_PERCHANNEL_MORE)
         sub("负控制表：RODIAG 由「必须缺席」改为「必须存在」", NEG_RO, NEG_NO_RO)
         sub("workflow 名（与产物名对齐，避免 run 列表里和旧 diag 混淆）",

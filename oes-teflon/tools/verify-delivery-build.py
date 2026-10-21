@@ -50,7 +50,7 @@ DELIVERY_SWITCHES = {
     "TEFLON_ROUNDMODE_PATCH": "0", "TEFLON_NNDUMP": "0", "TEFLON_KPAT": "0",
     "TEFLON_FPARTIAL": "0", "TEFLON_R5GUARD": "0", "TEFLON_RODIAG": "0",
     "TEFLON_ALIASDIAG": "0", "TEFLON_CREATEDIAG": "0", "TEFLON_DIAG": "0",
-    "TEFLON_WCDIAG": "0", "TEFLON_MLWIDTH_PATCH": "1",
+    "TEFLON_WCDIAG": "0", "TEFLON_MLWIDTH_PATCH": "1", "TEFLON_MLR5G_PATCH": "1",
 }
 PHANTOMDIAG_SWITCHES = dict(DELIVERY_SWITCHES, **{
     "TEFLON_PERCHANNEL_DIAG": "1", "TEFLON_PHANTOM_CLAMP": "1",
@@ -118,6 +118,9 @@ def main(argv):
                                               ["--v7", ml_v7, "--diag", sw["TEFLON_PERCHANNEL_DIAG"]])))
         if sw["TEFLON_PCDOMAIN_PATCH"] == "1":
             steps.append(("perchannel-domain", lambda: apply_patch("patch-etnaviv-perchannel-domain.py", ml_nn)))
+        if sw.get("TEFLON_MLR5G_PATCH") == "1":
+            steps.append(("ml-rank5-guard",
+                          lambda: apply_patch("patch-etnaviv-ml-rank5-guard.py", ml)))
         if sw.get("TEFLON_MLWIDTH_PATCH") == "1":
             steps.append(("ml-resource-width",
                           lambda: apply_patch("patch-etnaviv-ml-resource-width.py", ml)))
@@ -177,7 +180,7 @@ def main(argv):
                 "[och-odetrans]", "TEFLON_ODETRANS",
                 "[och-pcdomain]", "TEFLON_PCDOMAIN",
                 "och-patch-v7-phantom-gate", "[och-rofix]",
-                "och-patch-ml-resource-width"]
+                "och-patch-ml-resource-width", "och-patch-ml-rank5-guard"]
         for pat in must:
             present = pat in src_all
             print("  [%s] %s %s" % ("ok" if present else "BAD", pat,

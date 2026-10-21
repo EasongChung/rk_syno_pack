@@ -84,7 +84,6 @@ env:
   TEFLON_FSGUARD: '1'
   TEFLON_ROFIX: '1'
   TEFLON_PERCHANNEL: '1'
-  TEFLON_MLWIDTH_PATCH: ${{ inputs.mode == 'delivery' && '1' || '0' }}
   TEFLON_PERCHANNEL_DIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_NNDUMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_KPAT: ${{ inputs.mode == 'delivery' && '0' || '1' }}
@@ -107,6 +106,11 @@ env:
   #   signed 分支多减 0x80 ⇒ 非对角权重 0→128 ⇒ 输出饱和到 255。
   #   运行期由 TEFLON_PCDOMAIN 门控，不设 = 与上游逐字节一致。
   TEFLON_PCDOMAIN_PATCH: ${{ inputs.mode == 'delivery' && '1' || '1' }}
+  # ★ ML 自建资源 width0=0 的修复（报告 48）：Photos 主题识别模型的 abort 根因之一
+  TEFLON_MLWIDTH_PATCH: '1'
+  # ★ 通用 rank>4 守卫（报告 48）：该模型是 rank-5 折叠形态，
+  #   delegate 接管 RESHAPE ⇒ 驱动丢 dims[0] ⇒ 尺寸错 ⇒ abort
+  TEFLON_MLR5G_PATCH: '1'
   TEFLON_ALIASDIAG: '0'
   TEFLON_CREATEDIAG: '0'
   TEFLON_DIAG: '0'

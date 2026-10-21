@@ -1123,6 +1123,38 @@ else
 	echo "==> [3k7/6] ML 自建资源 width 修复：默认关闭（设 TEFLON_MLWIDTH_PATCH=1 启用）"
 fi
 
+# ── 3k8. 【修复】通用 rank>4 守卫（任何算子都不接管 rank>4 激活）─────────────
+# 现象：Synology Photos 主题识别模型（rank-5 折叠形态）推理期 abort：
+#        pipe_buffer_map_range: Assertion `offset + length <= buffer->width0' failed.
+# 根因：delegate 接管了 RESHAPE（tfl_device.c 支持 kTfLiteBuiltinReshape），
+#        而 ML 契约没有「维度个数」字段 ⇒ 驱动算 size 时丢掉 rank-5 的 dims[0]
+#        （真实 610,000 被算成 305,000）⇒ 资源/尺寸错 ⇒ abort。
+#        已有的 R5GUARD 抓不到，因为它只挂在 CONVOLUTION 分支上。
+# 修法：在 etna_ml_operation_supported() 入口做**通用**检查（input/output 全部遍历）。
+#       命中 ⇒ 不接管（回落 CPU）。不改任何数值。
+#
+#   构建：TEFLON_MLR5G_PATCH=1
+#
+if [ "${TEFLON_MLR5G_PATCH:-0}" = "1" ]; then
+	echo "==> [3k8/6] 打【修复】通用 rank>4 守卫"
+	PATCHER_R5G="$SCRIPT_DIR/patch-etnaviv-ml-rank5-guard.py"
+	MLR5G="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_R5G" ]; then
+		echo "ERROR: 设了 TEFLON_MLR5G_PATCH=1 却缺 $PATCHER_R5G"
+		exit 1
+	fi
+	if [ ! -f "$MLR5G" ]; then
+		echo "ERROR: 找不到 $MLR5G"
+		exit 1
+	fi
+	python3 "$PATCHER_R5G" "$MLR5G" || {
+		echo "ERROR: 通用 rank>4 守卫补丁应用失败 —— 不要跳过校验。"
+		exit 1
+	}
+else
+	echo "==> [3k8/6] 通用 rank>4 守卫：默认关闭（设 TEFLON_MLR5G_PATCH=1 启用）"
+fi
+
 # ── 3m2. 【修复】per-channel（per-axis）权重折叠后的域错误 ────────────────
 # 背景（报告 46，真机实测）：
 #   权重 scale **不均匀**的 int8 模型（C=248）上 NPU 输出**全 255 饱和**，
