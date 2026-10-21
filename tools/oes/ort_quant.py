@@ -289,13 +289,22 @@ def stage_qdq_to_tflite(qdq_path, out_path):
          os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       'run_onnx2tf.py'),
          '-i', qdq_path, '-o', out_path + '.qd',
-         '--non_verbose', '-kt', 'inputs_0'],
+         '--non_verbose', '-kat'],
         capture_output=True, text=True)
     print(r.stdout[-1500:], flush=True)
     print(r.stderr[-1500:], file=sys.stderr, flush=True)
     import glob as gb
     outs = gb.glob(os.path.join(out_path + '.qd', '*.tflite'))
-    assert outs, 'qdq->tflite produced nothing'
+    if not outs:
+        # ★ 失败诊断（run 39208774472 就是死在这里，报错只说 "produced nothing"）：
+        #   把 onnx2tf 的关键报错行打出来，便于一眼看出是**布局**问题还是别的。
+        err = (r.stderr or '') + (r.stdout or '')
+        keys = ['ERROR:', 'use the -kt or -kat option', 'input_onnx_file_path',
+                'onnx_op_name']
+        for ln in err.splitlines():
+            if any(k in ln for k in keys):
+                print('  ORTQ-DIAG: %s' % ln.strip()[:160], flush=True)
+        raise AssertionError('qdq->tflite produced nothing (see ORTQ-DIAG above)')
     cand = sorted(outs, key=os.path.getsize, reverse=True)[0]
     check_tflite_int8(cand, 'qdq-tflite')
     import shutil
