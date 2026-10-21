@@ -1078,6 +1078,7 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	if ! grep -qF 'och-patch-perchannel-layout' "$MLPNN"; then
 		printf '\n/* och patch: compile-time marker */\n__attribute__((used)) static const char och_pcl_marker[] = "och-patch-perchannel-layout";\n' >> "$MLPNN"
 	fi
+
 	# 数值自测：把下降路径镜像成 Python 逐元素比对（不依赖编译、不依赖设备）。
 	if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" ]; then
 		python3 "$SCRIPT_DIR/../tools/selftest-perchannel-layout-math.py" \
@@ -1091,6 +1092,42 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	fi
 	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
 	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"
+
+# ── 3m2. 【修复】per-channel（per-axis）权重折叠后的域错误 ────────────────
+# 背景（报告 46，真机实测）：
+#   权重 scale **不均匀**的 int8 模型（C=248）上 NPU 输出**全 255 饱和**，
+#   而 CPU 正常。根因：requantize_weights() 的 signed 分支用 int8_t 截断
+#   折叠后的 uint8 域值，**又减了一次 0x80**；而 per-channel 路径的
+#   coef_zero_point = zp_new（本例 0，**不是 128**）⇒ 硬件按 `字节 − 0` 解释
+#   ⇒ 非对角权重 0 → 128、248 项各带 +128 ⇒ 巨额正累加 ⇒ 饱和。
+#   离线复算（verify/perchannel-prediction.py）与设备输出**逐字节 100% 吻合**。
+#
+#   构建：TEFLON_PCDOMAIN_PATCH=1 ；运行：TEFLON_PCDOMAIN=1（不设 = 上游行为）
+#
+# ★ 必须排在 **perchannel-layout 补丁之后**（3m 段）：那个补丁整函数重写了
+#   requantize_weights（map_in[oc][src_ic][w][h] / map_out[oc][ic][w][h]），
+#   本补丁的锚点是它的**输出形态** ⇒ 顺序反了会锚点失配（run 39565432373 就这么挂的）。
+#
+# ⚠️ 这是**改行为**的修复，默认关闭。交付前需另行决策（产物语义变更）。
+if [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ]; then
+	echo "==> [3m2/6] 打【修复】per-channel 权重折叠后的域错误"
+	PATCHER_PCD="$SCRIPT_DIR/patch-etnaviv-perchannel-domain.py"
+	MLPCD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER_PCD" ]; then
+		echo "ERROR: 设了 TEFLON_PCDOMAIN_PATCH=1 却缺 $PATCHER_PCD"
+		exit 1
+	fi
+	if [ ! -f "$MLPCD" ]; then
+		echo "ERROR: 找不到 $MLPCD"
+		exit 1
+	fi
+	python3 "$PATCHER_PCD" "$MLPCD" || {
+		echo "ERROR: per-channel 域修复补丁应用失败 —— 不要跳过校验。"
+		exit 1
+	}
+else
+	echo "==> [3m2/6] per-channel 域修复：默认关闭（设 TEFLON_PCDOMAIN_PATCH=1 启用）"
+fi
 
 	# ---------------------------------------------------------------- #
 	# 3n. R5GUARD —— rank-5 激活 guard（och 报告 11）
@@ -1369,38 +1406,6 @@ if [ "${TEFLON_ROUNDMODE_PATCH:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3k5/6] 舍入探针：默认关闭（设 TEFLON_ROUNDMODE_PATCH=1 启用）"
-fi
-
-# ── 3k6. 【修复】per-channel（per-axis）权重折叠后的域错误 ─────────────────
-# 背景（报告 46，真机实测）：
-#   权重 scale **不均匀**的 int8 模型（C=248）上 NPU 输出**全 255 饱和**，
-#   而 CPU 正常。根因：requantize_weights() 的 signed 分支用 int8_t 截断
-#   折叠后的 uint8 域值，**又减了一次 0x80**；而 per-channel 路径的
-#   coef_zero_point = zp_new（本例 0，**不是 128**）⇒ 硬件按 `字节 − 0` 解释
-#   ⇒ 非对角权重 0 → 128、248 项各带 +128 ⇒ 巨额正累加 ⇒ 饱和。
-#   离线复算（verify/perchannel-prediction.py）与设备输出**逐字节 100% 吻合**。
-#
-#   构建：TEFLON_PCDOMAIN_PATCH=1 ；运行：TEFLON_PCDOMAIN=1（不设 = 上游行为）
-#
-# ⚠️ 这是**改行为**的修复，默认关闭。交付前需另行决策（产物语义变更）。
-if [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ]; then
-	echo "==> [3k6/6] 打【修复】per-channel 权重折叠后的域错误"
-	PATCHER_PCD="$SCRIPT_DIR/patch-etnaviv-perchannel-domain.py"
-	MLPCD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
-	if [ ! -f "$PATCHER_PCD" ]; then
-		echo "ERROR: 设了 TEFLON_PCDOMAIN_PATCH=1 却缺 $PATCHER_PCD"
-		exit 1
-	fi
-	if [ ! -f "$MLPCD" ]; then
-		echo "ERROR: 找不到 $MLPCD"
-		exit 1
-	fi
-	python3 "$PATCHER_PCD" "$MLPCD" || {
-		echo "ERROR: per-channel 域修复补丁应用失败 —— 不要跳过校验。"
-		exit 1
-	}
-else
-	echo "==> [3k6/6] per-channel 域修复：默认关闭（设 TEFLON_PCDOMAIN_PATCH=1 启用）"
 fi
 
 # ---------------------------------------------------------------- #

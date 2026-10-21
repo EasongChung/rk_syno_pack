@@ -77,56 +77,63 @@ signed 分支与 unsigned 分支**统一到 uint8 域**：
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
 MARKER = "och patch: per-channel weight domain (signed branch)"
 
 ANCHOR = """               if (operation->weight_signed) {
-                  int8_t val = map_in[oc][w][h][ic];
+                  int8_t val = map_in[oc][src_ic][w][h];
                   double dequantized = weight_tensor->scales[oc] * (val - weight_tensor->zero_points[oc]);
                   int8_t requantized = round(dequantized / operation->weight_scale);
-                  map_out[oc][w][h][ic] = requantized + operation->weight_zero_point - 0x80;
+                  map_out[oc][ic][w][h] = requantized + operation->weight_zero_point - 0x80;
                } else {
 """
 
 NEW = """               if (operation->weight_signed) {
-                  int8_t val = map_in[oc][w][h][ic];
+                  int8_t val = map_in[oc][src_ic][w][h];
                   double dequantized = weight_tensor->scales[oc] * (val - weight_tensor->zero_points[oc]);
                   /* och patch: per-channel weight domain (signed branch)
                    *
                    * 上游把折叠后的权重写成了 **int8 域**的值：
-                   *   int8_t requantized = round(...);        ← 截断到 [-128,127]
-                   *   map_out[...] = requantized + zp - 0x80;  ← 又减了一次 0x80
+                   *   int8_t requantized = round(...);        <- 截断到 [-128,127]
+                   *   map_out[...] = requantized + zp - 0x80;  <- 又减了一次 0x80
                    * 而折叠后的量本来就在 **uint8 域**（calc_quant_params 把 [min,max]
                    * 映射到 [0,255]），且 per-channel 路径的 coef_zero_point 是
-                   * zp_new（本例 0，**不是 128**）⇒ 硬件按 `字节 − 0` 解释。
+                   * zp_new（本例 0，**不是 128**）=> 硬件按 `字节 - 0` 解释。
                    *
-                   * 后果（真机实测，报告 46）：非对角权重 0 → 128、对角 170 → 42
-                   * ⇒ 248 项各带 +128 ⇒ 巨额正累加 ⇒ 输出饱和到 255。
+                   * 后果（真机实测，报告 46）：非对角权重 0 -> 128、对角 170 -> 42
+                   * => 248 项各带 +128 => 巨额正累加 => 输出饱和到 255。
                    *
                    * 这里统一到 uint8 域：中间量用 int32（不截断），并夹到 [0,255]。
-                   * 硬件算 `字节 − coef_zp(=zp_new)` ⇒ requantized ⇒ 真实权重
-                   * = scale_new · requantized ⇒ 与折叠前的 per-channel 权重一致。
+                   * 硬件算 `字节 - coef_zp(=zp_new)` => requantized => 真实权重
+                   * = scale_new * requantized => 与折叠前的 per-channel 权重一致。
                    *
                    * 运行期门控：TEFLON_PCDOMAIN=1 才生效。
+                   *
+                   * ★ 锚点是 **perchannel-layout 补丁之后**的形态
+                   *   （map_in[oc][src_ic][w][h] / map_out[oc][ic][w][h]）——
+                   *   那个补丁整函数重写了 requantize_weights，所以本补丁**必须排在它后面**
+                   *   （build-teflon.sh 的 3m2 段）。自测也按这个顺序跑。
                    */
                   int32_t och_requant = (int32_t)round(dequantized / operation->weight_scale);
                   int32_t och_qu = och_requant + operation->weight_zero_point;
                   if (getenv("TEFLON_PCDOMAIN") != NULL) {
-                     map_out[oc][w][h][ic] = (uint8_t)CLAMP(och_qu, 0, 255);
+                     map_out[oc][ic][w][h] = (uint8_t)CLAMP(och_qu, 0, 255);
                   } else {
-                     map_out[oc][w][h][ic] = (uint8_t)(int8_t)((int8_t)och_requant +
-                                                               operation->weight_zero_point - 0x80);
+                     map_out[oc][ic][w][h] = (uint8_t)((int8_t)och_requant +
+                                                          operation->weight_zero_point - 0x80);
                   }
-#if defined(__GNUC__) || defined(__clang__)
+                  #if defined(__GNUC__) || defined(__clang__)
                   /* 编译期标记：只有 __attribute__((used)) 的对象才留在 .rodata，
                    * 于是 `strings libteflon.so | grep [och-pcdomain]` 能真正判出
                    * 「这个 .so 里有没有本补丁」。 */
                   __attribute__((used)) static const char och_pcdomain_marker[] =
                      "[och-pcdomain]";
                   (void)och_pcdomain_marker;
-#endif
+                  #endif
+                  map_out[oc][ic][w][h] = requantized + operation->weight_zero_point - 0x80;
                } else {
 """
 
@@ -151,16 +158,37 @@ def apply(path):
 
 def selftest(mesa_src):
     ok = True
-    real = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn.c")
-    if not os.path.isfile(real):
-        print("  [SKIP] 找不到真实源码 %s" % real)
+    real_nn = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn.c")
+    real_v7 = os.path.join(mesa_src, "src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c")
+    if not os.path.isfile(real_nn):
+        print("  [SKIP] 找不到真实源码 %s" % real_nn)
         return True
 
     tmpdir = tempfile.mkdtemp(prefix="och-pcdomain-")
     try:
         dst = os.path.join(tmpdir, "etnaviv_ml_nn.c")
-        shutil.copyfile(real, dst)
-        raw = io.open(real, encoding="utf-8").read()
+        shutil.copyfile(real_nn, dst)
+        raw = io.open(real_nn, encoding="utf-8").read()
+
+        # ---- 前置：先打 perchannel-layout 补丁（build 里的真实顺序）----
+        layout = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "patch-etnaviv-perchannel-layout.py")
+        if os.path.isfile(layout) and os.path.isfile(real_v7):
+            v7 = os.path.join(tmpdir, "etnaviv_ml_nn_v7.c")
+            shutil.copyfile(real_v7, v7)
+            r = subprocess.run([sys.executable, layout, dst, "--v7", v7, "--diag", "1"],
+                               capture_output=True, text=True)
+            print("  [%s] 前置：perchannel-layout 补丁应用成功"
+                  % ("ok" if r.returncode == 0 else "BAD"))
+            if r.returncode != 0:
+                print("        %s" % (r.stderr or "")[:200])
+                return False
+        else:
+            print("  [WARN] 找不到 perchannel-layout 补丁或 v7 源文件 —— "
+                  "只测本补丁的锚点唯一性（不测组合）")
+
+        # ★ 基线快照：**在**打本补丁**之前**取（否则后面的 diff 没有可比对象）
+        laid = io.open(dst, encoding="utf-8").read()
 
         if apply(dst) != 0:
             print("  [BAD] 正控制：应用到真实源码失败")
@@ -184,10 +212,10 @@ def selftest(mesa_src):
         print("  [%s] 负控制 1：重复应用被拒" % ("ok" if cond else "BAD"))
         ok = ok and cond
 
-        # 负控制 2：锚点缺失必须报错
+        # 负控制 2：锚点缺失必须报错（在「布局补丁之后」的文本上构造）
         dst2 = os.path.join(tmpdir, "nn_nomod.c")
-        broken = raw.replace(ANCHOR, "", 1)
-        if broken == raw:
+        broken = laid.replace(ANCHOR, "", 1)
+        if broken == laid:
             print("  [BAD] 负控制 2：无法构造锚点缺失样本")
             ok = False
         else:
@@ -197,14 +225,13 @@ def selftest(mesa_src):
                   % ("ok" if cond else "BAD"))
             ok = ok and cond
 
-        # 负控制 3：改动**必须只发生在锚点那一处**（本补丁本来就要改那两行）
+        # 负控制 3：改动**必须只发生在锚点那一处**
         import difflib
-        a = raw.splitlines()
+        a = laid.splitlines()
         b = out.splitlines()
         sm = difflib.SequenceMatcher(None, a, b)
         hunks = [op for op in sm.get_opcodes() if op[0] != "equal"]
         anchor_start = None
-        # 用**唯一**的那行定位（`if (operation->weight_signed) {` 在文件里出现多次）
         for i, l in enumerate(a):
             if l.strip() == "int8_t requantized = round(dequantized / operation->weight_scale);":
                 anchor_start = i
@@ -214,7 +241,7 @@ def selftest(mesa_src):
         ok = ok and cond
         if hunks:
             tag, i1, i2, j1, j2 = hunks[0]
-            print("        改动位置: 原文件行 %d..%d → 新文件行 %d..%d" % (i1, i2, j1, j2))
+            print("        改动位置: 布局补丁后文本行 %d..%d → 新文本行 %d..%d" % (i1, i2, j1, j2))
             cond = (anchor_start is not None and abs(i1 - anchor_start) <= 2)
             print("  [%s] 负控制 3b：改动块紧邻锚点（锚点行 %s）"
                   % ("ok" if cond else "BAD", anchor_start))
