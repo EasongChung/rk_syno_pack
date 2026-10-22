@@ -873,7 +873,7 @@ jobs:
       #   「构建成功」证明不了这一点 —— 补丁器即使打歪了（少了某处替换）也能编过，
       #   而症状要到设备上才表现为 SIGSEGV 或静默错误。
       #   这里是 build-teflon.sh 里锚点复核之外的第二道：直接读**打完补丁的**源文件。
-      - name: Assert per-channel layout patch actually applied (source-level)
+      - name: Assert per-channel patch actually applied (source-level: layout 或 fold-early)
         run: |
           set -eu
           SRC="$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv"
@@ -892,6 +892,32 @@ jobs:
               echo "OK:   $4（$n）"
             fi
           }
+          if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+            # ── fold-early 形态（报告 55 方案 A）──────────────────────────
+            # 与 layout 形态**互斥**：两边各有正控制，并且都断言对方的标记缺席。
+            # 折叠提前后 requantize_weights 被整函数重写 ⇒ 旧的 `real_in/out_dim`
+            # 断言必然为 0；若维持原断言，等于「用旧形态的尺子量新形态」。
+            echo "== fold-early 形态断言 =="
+            chk 3 'och_fold_channel('       "$NN" 'helper och_fold_channel（定义 1 + 调用 2）'
+            chk 1 'och patch: per-channel 折叠提前' "$NN" '折叠块前移标记'
+            chk 1 'int32_t och_requant'     "$NN" '域修复（PCDOMAIN）已并入 fold-early'
+            chk 1 'getenv("TEFLON_PCDOMAIN")' "$NN" '域修复带运行期门（=0 可与上游逐字节对照）'
+            chk 1 '[och-pcdomain]'          "$NN" '域修复编译期标记'
+            chk 1 'weights[i] = requantized + operation->weight_zero_point;' "$NN" 'unsigned 分支逐字未变'
+            chk 1 'nn_core_version >= 8 && poperation->conv.depthwise' "$NN" 'v8 收口保留（v7 不再写 in_c=1）'
+            chk 0 'och-patch-perchannel-layout' "$NN" 'layout 补丁**未**同时存在（互斥）'
+            chk 0 'uint8_t (*weights)[real_in]' "$NN" '旧布局读侧不存在'
+            chk 0 'uint8_t (*map_out)[out_dim]' "$NN" '旧布局写侧不存在'
+            # 顺序断言：折叠块必须在 pointwise_to_2x2 之前（否则又回到「先变换后折叠」）
+            a=$(grep -n 'per-channel 折叠提前（fold-early）' "$NN" | head -1 | cut -d: -f1)
+            b=$(grep -n 'pointwise_to_2x2(subgraph' "$NN" | head -1 | cut -d: -f1)
+            if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then
+              echo "OK:   折叠块在 pointwise_to_2x2 之前（行 $a < $b）"
+            else
+              echo "FAIL: 折叠块位置不对（折叠=$a，pointwise_to_2x2=$b）"
+              ok=0
+            fi
+          else
           chk 1 'uint8_t (*weights)[real_in]'        "$NN" 'calc_quantization 读侧 real_in'
           chk 1 'uint8_t (*map_in)[real_in]'         "$NN" 'requantize_weights 读侧 real_in'
           chk 1 'uint8_t (*map_out)[out_dim]'        "$NN" 'requantize_weights 写侧 out_dim'
@@ -900,21 +926,30 @@ jobs:
           # ★ 诊断打印的数量随 TEFLON_PERCHANNEL_DIAG 变（交付模式 diag=0 ⇒ 一处都不该有）
           if [ "${TEFLON_PERCHANNEL_DIAG:-1}" = "1" ]; then exp_pcl=2; else exp_pcl=0; fi
           chk "$exp_pcl" '[och-pcl] SEL'              "$V7" 'v7 两处选路都插了诊断（数量随 diag 开关）'
-          [ "$ok" = 1 ] || { echo "ERROR: 布局补丁未完整落地"; exit 1; }
+          fi
+          [ "$ok" = 1 ] || { echo "ERROR: per-channel 补丁未完整落地"; exit 1; }
           # 取证：把改后的三个函数原样带走，供 review 与设备侧对撞
           {
             echo "=== calc_quantization / requantize_weights / 写回（etnaviv_ml_nn.c）==="
             sed -n '/^calc_quantization(/,/^}/p' "$NN"
             sed -n '/^requantize_weights(/,/^}/p' "$NN"
-            grep -n -A4 'och patch: v7 也要写回' "$NN"
+            grep -n -A4 'och patch: v7 也要写回' "$NN" || echo "  (fold-early 形态：没有 v7 写回补丁)"
             echo
             echo "=== create_coeffs_v7 选路（etnaviv_ml_nn_v7.c）==="
             grep -n -B2 -A10 'och-pcl\] SEL' "$V7" || echo "  (diag 关闭：v7 里没有 [och-pcl] SEL)"
             echo
-            echo "=== 本轮可证伪预测（设备上机时应逐条对上；不符即证伪报告 21）==="
-            echo "CQ-OUT dw=1 visited=2196   （不是 535824）"
-            echo "RW-OUT dw=1 new_size=2196 （不是 535824）"
-            echo "SEL    dw=1 input_channels=1 -> write_core_sequential"
+            if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+              echo "=== 本轮可证伪预测（fold-early；不符即证伪报告 55）==="
+              echo "折叠发生在 pointwise/expand/strided/transpose **之前**"
+              echo "RW-OUT new_size == 原始 TFLite 权重字节数（不再缩到 1/C）"
+              echo "depthwise 的 input_channels 全程 = C（v7 不再写 1）"
+              echo "写路径：out_c % 8 == 0 才干净；否则幻影通道预期（报告 55 §10）"
+            else
+              echo "=== 本轮可证伪预测（设备上机时应逐条对上；不符即证伪报告 21）==="
+              echo "CQ-OUT dw=1 visited=2196   （不是 535824）"
+              echo "RW-OUT dw=1 new_size=2196 （不是 535824）"
+              echo "SEL    dw=1 input_channels=1 -> write_core_sequential"
+            fi
           } > "$RUNNER_TEMP/pcl-evidence.txt"
           cat "$RUNNER_TEMP/pcl-evidence.txt"
 
@@ -1366,9 +1401,14 @@ jobs:
           #   1) pcl-evidence.txt  —— 打完补丁的三个函数原文 + 本轮可证伪预测
           #   2) selftest-*.log    —— 自测输出（och 第三节第 2 条）
           #      自测输出默认落在日志尾部，同样会被截断，所以必须走产物。
-          for f in "$RUNNER_TEMP/pcl-evidence.txt" \
-                   "$RUNNER_TEMP/teflon-build/selftest-perchannel-layout.log" \
-                   "$RUNNER_TEMP/teflon-build/selftest-perchannel-layout-math.log"; do
+          # ★ 证据清单按补丁形态分流：fold-early 模式下只产出 foldearly 自测日志，
+          #   若仍按 layout 清单要文件 ⇒ 会以「证据缺失」为由误判失败（run 39754283314 之后修）。
+          if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+            EVIDENCE_FILES="$RUNNER_TEMP/pcl-evidence.txt $RUNNER_TEMP/teflon-build/selftest-perchannel-foldearly.log"
+          else
+            EVIDENCE_FILES="$RUNNER_TEMP/pcl-evidence.txt $RUNNER_TEMP/teflon-build/selftest-perchannel-layout.log $RUNNER_TEMP/teflon-build/selftest-perchannel-layout-math.log"
+          fi
+          for f in $EVIDENCE_FILES; do
             if [ -f "$f" ]; then
               cp "$f" artifact/
             else
