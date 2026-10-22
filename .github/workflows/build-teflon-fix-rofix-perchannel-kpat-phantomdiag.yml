@@ -873,7 +873,7 @@ jobs:
       #   「构建成功」证明不了这一点 —— 补丁器即使打歪了（少了某处替换）也能编过，
       #   而症状要到设备上才表现为 SIGSEGV 或静默错误。
       #   这里是 build-teflon.sh 里锚点复核之外的第二道：直接读**打完补丁的**源文件。
-      - name: Assert per-channel patch actually applied (source-level: layout 或 fold-early)
+      - name: Assert per-channel patch actually applied (source-level，layout 或 fold-early)
         run: |
           set -eu
           SRC="$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv"
