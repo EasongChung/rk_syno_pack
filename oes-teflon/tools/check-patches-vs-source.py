@@ -76,6 +76,8 @@ PATCHES = {
                      "gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"),
     "fsguard":      ("patch-etnaviv-filter-shape-guard.py",
                      "gallium/drivers/etnaviv/etnaviv_ml.c"),
+    "padgate":      ("patch-etnaviv-padding-gate.py",
+                     "gallium/drivers/etnaviv/etnaviv_ml.c"),
     "rofix":        ("patch-etnaviv-readout-offset-fix.py",
                      "gallium/drivers/etnaviv/etnaviv_ml.c"),
     "perchannel":   ("patch-etnaviv-perchannel-quant.py",
@@ -115,6 +117,7 @@ BUILD_ORDER = [
     "wcdiag",          # 3f  TEFLON_WCDIAG
     "ocfix",           # 3g  TEFLON_OCFIX
     "fsguard",         # 3h  TEFLON_FSGUARD
+    "padgate",         # 3h3 TEFLON_PADDING_GATE（报告 56）
     "rodiag",          # 3i  TEFLON_RODIAG    （与 ROFIX 互斥）
     "rofix",           # 3j  TEFLON_ROFIX
     "aliasdiag",       # 3k  TEFLON_ALIASDIAG
@@ -125,7 +128,7 @@ BUILD_ORDER = [
 # 各组合都是**真实构建里跑过的开关组合**（按 BUILD_ORDER 过滤后应用）
 SETS = {
     # 交付候选轮：四处修复 + per-channel，无任何取证打印
-    "fix": ["npu-detect", "v7-biasfix", "ocfix", "fsguard", "rofix", "perchannel"],
+    "fix": ["npu-detect", "v7-biasfix", "ocfix", "fsguard", "padgate", "rofix", "perchannel"],
     # 取证轮：FIX_V7+OCFIX+FSGUARD+ROFIX+ALIASDIAG+CREATEDIAG（run 39146418954 那一组）
     "diag": ["npu-detect", "v7-biasfix", "ocfix", "fsguard", "rofix",
              "aliasdiag", "creatediag"],
@@ -134,7 +137,7 @@ SETS = {
     "convonly": ["npu-detect", "conv-only"],
     # 「能同时开」的最大限度组合（去掉两个互斥方各自的一个）
     "maximal": ["npu-detect", "conv-only", "v7-biasfix", "wcdiag", "ocfix", "fsguard",
-                "rofix", "aliasdiag", "creatediag", "perchannel"],
+                "padgate", "rofix", "aliasdiag", "creatediag", "perchannel"],
 }
 
 # 用来证明「补丁文本真的插进去了」的最小长度，短的常量（如 "1"）没有判别力。

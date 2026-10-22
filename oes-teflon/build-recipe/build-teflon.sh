@@ -103,6 +103,18 @@
 #                         锚点由 tools/gen-fsguard-patch.py 从真实源码逐字生成。
 #                         预期：不崩 + 接管数下降 + 第 ④ 级逐字节比对应通过。
 #
+#   TEFLON_PADDING_GATE=1 **不接管**「stride>1 的 depthwise 且 padding_top/left>0」的卷积。
+#                         根因（报告 56）：v7 上 stride>1 的 depthwise 走
+#                         ETNA_NN_POOLING_FIRST_PIXEL，而 operation->padding_same 只在
+#                         strided_to_normal()（非 pooling 路径）里被消费 ⇒ 硬件按 pad_top=0
+#                         采样；TFLite SAME 在「奇数边长 + k=3 + s=2」时要求 pad_top=1
+#                         ⇒ 输出整体偏 1 个输入像素（脉冲栅格 + 离线复算双重确认）。
+#                         真机 concept 模型 201 op 里 op#6/#9/#151 属于此类。
+#                         偶数边长（pad_top=0，如 MobileNetV1 224→112）不受影响。
+#                         运行期：TEFLON_PADGATE=0 可关（对照/负控制）。
+#                         补丁器：build-recipe/patch-etnaviv-padding-gate.py
+#                         ⚠️ 默认关闭。不设时本步整段跳过，构建流程与产物完全不变。
+#
 #   TEFLON_PERCHANNEL=1 **放开 weight/bias 的 per-channel（per-axis）量化接管**。
 #   TEFLON_NNDUMP=1        【诊断】NN core 描述符**逐字节** dump（create_nn_config 收尾）。
 #   TEFLON_KPAT=1          【诊断】NN core kernel_pattern **运行期强制开关**
@@ -726,6 +738,37 @@ if [ "${TEFLON_PHANTOM_GATE:-0}" = "1" ]; then
 	}
 else
 	echo "==> [3h2/6] 幻影通道形状门控：默认关闭（设 TEFLON_PHANTOM_GATE=1 启用）"
+fi
+
+# ── 3h3. 【修复】pooling-first-pixel padding 门控（报告 56）──────────────
+# 【为什么】v7 上 stride>1 的 depthwise 走 ETNA_NN_POOLING_FIRST_PIXEL
+#   （etnaviv_ml_nn.c:1141），而 operation->padding_same 只在 strided_to_normal()
+#   （:476）里被消费，pooling 路径不调用它 ⇒ 硬件按 pad_top=0 采样。
+#   TFLite SAME 在「奇数边长 + k=3 + s=2」时要求 pad_top=1 ⇒ 输出整体偏 1 输入像素。
+#   证据：脉冲栅格（CPU 1 像素 vs NPU 2×2）+ 离线复算
+#         （pad_top=0 vs 真机 99.64% / pad_top=1 vs CPU 100%）；报告 56。
+# 【判据】depthwise ∧ (stride_x>1 ∨ stride_y>1) ∧ (padding_top>0 ∨ padding_left>0)
+#   ⇒ 不接管，回落 CPU。偶数边长与 1×1 卷积不受影响（MobileNetV1 回归不变）。
+# 用法：TEFLON_PADDING_GATE=1 ./build-teflon.sh
+if [ "${TEFLON_PADDING_GATE:-0}" = "1" ]; then
+	echo "==> [3h3/6] 打【修复】pooling padding 门控（stride>1 且 pad_top/left>0 的 depthwise ⇒ 回落 CPU）"
+	PATCHER7P="$SCRIPT_DIR/patch-etnaviv-padding-gate.py"
+	MLPP="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER7P" ]; then
+		echo "ERROR: 设了 TEFLON_PADDING_GATE=1 却缺 $PATCHER7P"
+		exit 1
+	fi
+	if [ ! -f "$MLPP" ]; then
+		echo "ERROR: 找不到 $MLPP"
+		exit 1
+	fi
+	python3 "$PATCHER7P" "$MLPP" || {
+		echo "ERROR: padding 门控补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未门控**的 .so，偏 1 像素的加速会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h3/6] pooling padding 门控：默认关闭（设 TEFLON_PADDING_GATE=1 启用）"
 fi
 
 # ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────

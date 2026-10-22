@@ -99,6 +99,10 @@ env:
   #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）
   TEFLON_PHANTOM_CLAMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_PHANTOM_GATE: ${{ inputs.mode == 'delivery' && '1' || '1' }}
+  # ★ 报告 56：stride>1 的 depthwise 在 v7 上走 POOLING_FIRST_PIXEL，
+  #   该路径不消费 padding_top/left ⇒ pad_top=1 的层会整体偏 1 像素。
+  #   这些层不接管（回落 CPU）。运行期 TEFLON_PADGATE=0 可关（对照）。
+  TEFLON_PADDING_GATE: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。
@@ -881,7 +885,7 @@ jobs:
         run: |
           set -euxo pipefail
           chmod +x oes-teflon/build-recipe/build-teflon.sh
-          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0} TEFLON_RODIAG=${TEFLON_RODIAG:-0}"
+          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0} TEFLON_PADDING_GATE=${TEFLON_PADDING_GATE:-0} TEFLON_RODIAG=${TEFLON_RODIAG:-0}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-fix.log"
 
@@ -895,7 +899,8 @@ jobs:
           SRC="$RUNNER_TEMP/teflon-build/mesa/src/gallium/drivers/etnaviv"
           NN="$SRC/etnaviv_ml_nn.c"
           V7="$SRC/etnaviv_ml_nn_v7.c"
-          for f in "$NN" "$V7"; do
+          ML="$SRC/etnaviv_ml.c"
+          for f in "$NN" "$V7" "$ML"; do
             [ -f "$f" ] || { echo "ERROR: 找不到 $f"; exit 1; }
           done
           ok=1
@@ -908,6 +913,32 @@ jobs:
               echo "OK:   $4（$n）"
             fi
           }
+          # ★★ 报告 56：padding 门控（两种 per-channel 形态都必须有）
+          #   守卫必须在 depthwise ∧ stride>1 ∧ padding_top/left>0 时**显式** return false，
+          #   且块内不得出现 supported = true（否则 fail-open ⇒ 漏放行）。
+          chk 1 'och-patch-v7-padding-gate' "$ML" 'padding 门控编译期标记（报告 56）'
+          chk 1 'getenv("TEFLON_PADGATE")'  "$ML" 'padding 门控运行期开关（=0 可关）'
+          # ⚠️ 判据必须带前导 `(`：`poperation->conv.padding_top > 0`（第 139 行）
+          #    是另一处代码的子串，用裸 `operation->conv.padding_top > 0` 会数到 2。
+          chk 1 '(operation->conv.padding_top > 0 || operation->conv.padding_left > 0)' "$ML" '判据含 padding_top/left'
+          chk 1 '(operation->conv.stride_x > 1 || operation->conv.stride_y > 1)' "$ML" '判据含 stride>1'
+          pg_at=$(grep -n 'och patch: pooling-first-pixel padding 门控' "$ML" | head -1 | cut -d: -f1)
+          if [ -n "$pg_at" ]; then
+            pg_end=$(awk -v s="$pg_at" 'NR > s && /och-patch-v7-padding-gate/ {print NR; exit}' "$ML")
+            pg_blk=$(sed -n "${pg_at},${pg_end}p" "$ML")
+            echo "$pg_blk" | grep -qF 'return false;' \
+              && echo "OK:   守卫块内有显式 return false" \
+              || { echo "FAIL: 守卫块内没有 return false（会 fail-open）"; ok=0; }
+            if echo "$pg_blk" | grep -qF 'supported = true;'; then
+              echo "FAIL: 守卫块内出现 supported = true（会 fail-open）"
+              ok=0
+            else
+              echo "OK:   守卫块内没有 supported = true"
+            fi
+          else
+            echo "FAIL: 找不到 padding 门控注释块"
+            ok=0
+          fi
           if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
             # ── fold-early 形态（报告 55 方案 A）──────────────────────────
             # 与 layout 形态**互斥**：两边各有正控制，并且都断言对方的标记缺席。
@@ -1096,6 +1127,7 @@ jobs:
           # ★★ B 段正控制：两条幻影补丁的编译期标记 + RODIAG 取证打印**必须**都在。
           for pat in 'och-patch-v7-phantom-clamp' \
                      'och-patch-v7-phantom-gate' \
+                     'och-patch-v7-padding-gate' \
                      '[och-ro]' \
                      '[och-ro]   head=' \
                      '[och-ro]   sample ' \
