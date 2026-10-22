@@ -151,13 +151,20 @@ _DW_DENSE = """   /* och patch: dense-depthwise（fold-early）
 
 
 def body(dense: bool) -> str:
-    """渲染 calculate_bias_correction 的新实现。"""
+    """渲染 calculate_bias_correction 的新实现。
+
+    ★ 本函数**不做 % 格式化**（只做占位符替换）⇒ 模板里的 `%%` 必须显式还原成 `%`，
+      否则 C 侧会得到字面量 `%%d` + 多余实参（真机 CI 实测 -Werror=format-extra-args）。
+    """
     text = NEW.replace("@MARKER@", MARKER)
     text = text.replace("@DW_COMMENT@@DW_BRANCH@", _DW_DENSE if dense else _DW_UPSTREAM)
     text = text.replace("@DENSE@", "1" if dense else "0")
+    text = text.replace("%%", "%")
     if "@" in text:
         raise SystemExit("ERROR: body() 有未替换的占位符：%r"
                          % [ln for ln in text.splitlines() if "@" in ln][:2])
+    if "%%" in text:
+        raise SystemExit("ERROR: body() 里残留 %% 转义（本函数不走 % 格式化）")
     return text
 
 

@@ -312,7 +312,23 @@ jobs:
               r2 = subprocess.run([sys.executable, P, p], capture_output=True,
                                   text=True, encoding='utf-8', errors='replace')
               assert r2.returncode == 1, 're-apply not rejected'
-              print('PREFLIGHT v7-biasfix OK')
+
+              # ★ dense 形态（fold-early，报告 56）：去掉 v8 的 in_c=1 特判
+              p2 = os.path.join(tmp, 'v7_dense.c')
+              open(p2, 'w', encoding='utf-8').write(FUNC)
+              r3 = subprocess.run([sys.executable, P, p2, '--dense-depthwise'],
+                                  capture_output=True, text=True, encoding='utf-8', errors='replace')
+              assert r3.returncode == 0, (r3.stdout + r3.stderr)[-400:]
+              b2 = open(p2, encoding='utf-8').read()
+              assert 'if (operation->depthwise)' not in b2, 'dense mode kept in_c=1 special case'
+              assert 'input_channels = operation->input_channels;' in b2, 'dense bound lost'
+              assert 'dense_depthwise=1' in b2, 'missing dense log field'
+              assert b != b2, 'mode switch is a no-op'
+
+              # ★ 回归（CI run 39764385698 编译失败）：模板渲染不得残留 %% 转义
+              for txt, tag in ((b, 'layout'), (b2, 'dense')):
+                  assert '%%' not in txt, '%s: stray double-percent breaks -Werror=format' % tag
+              print('PREFLIGHT v7-biasfix OK (layout + dense)')
           finally:
               shutil.rmtree(tmp, ignore_errors=True)
           PY
