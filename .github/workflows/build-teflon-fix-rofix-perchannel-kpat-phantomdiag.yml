@@ -903,6 +903,17 @@ jobs:
             chk 1 'int32_t och_requant'     "$NN" '域修复（PCDOMAIN）已并入 fold-early'
             chk 1 'getenv("TEFLON_PCDOMAIN")' "$NN" '域修复带运行期门（=0 可与上游逐字节对照）'
             chk 1 '[och-pcdomain]'          "$NN" '域修复编译期标记'
+            # ★ 报告 56：折叠域（无符号）与填充点域（weight_signed）必须成对，
+            #   否则 expand_depthwise 的背景权重被硬件解释成 -128（真机全 -128 饱和）。
+            chk 1 'och patch: 折叠已把权重缓冲区改成**无符号域**' "$NN" '域标志随折叠域清位（报告 56）'
+            chk 1 'dense_depthwise=1'       "$V7" '偏置补偿覆盖稠密 W*H*C（报告 56）'
+            n_wsel=$(grep -cF 'operation->weight_signed = false;' "$NN" || true)
+            if [ "$n_wsel" -ge 2 ]; then
+              echo "OK:   清位代码存在（$n_wsel 处 = upstream addition + fold-early）"
+            else
+              echo "FAIL: 清位代码缺失（$n_wsel < 2）"
+              ok=0
+            fi
             chk 1 'weights[i] = requantized + operation->weight_zero_point;' "$NN" 'unsigned 分支逐字未变'
             chk 1 'nn_core_version >= 8 && poperation->conv.depthwise' "$NN" 'v8 收口保留（v7 不再写 in_c=1）'
             chk 0 'och-patch-perchannel-layout' "$NN" 'layout 补丁**未**同时存在（互斥）'

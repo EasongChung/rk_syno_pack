@@ -631,10 +631,20 @@ if [ "${TEFLON_FIX_V7:-0}" = "1" ]; then
 		echo "ERROR: 找不到 $ML7B"
 		exit 1
 	fi
-	python3 "$PATCHER4" "$ML7B" || {
-		echo "ERROR: 修复补丁应用失败 —— 不要跳过（上游若已修请直接升级 Mesa）"
-		exit 1
-	}
+	# ★ fold-early 路线：depthwise 权重被 expand_depthwise 摊成稠密 [oc][ic][w][h]，
+	#   偏置补偿的扫描窗口必须覆盖整块（v8 的 in_c=1 特判只适用于「每通道 W*H 个元素」）。
+	#   见 verify/reports/56：input_zero_point != 0 时该项缺失会让整层输出偏移/饱和。
+	if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+		python3 "$PATCHER4" "$ML7B" --dense-depthwise || {
+			echo "ERROR: 修复补丁应用失败 —— 不要跳过（上游若已修请直接升级 Mesa）"
+			exit 1
+		}
+	else
+		python3 "$PATCHER4" "$ML7B" || {
+			echo "ERROR: 修复补丁应用失败 —— 不要跳过（上游若已修请直接升级 Mesa）"
+			exit 1
+		}
+	fi
 else
 	echo "==> [3e/6] v7 修复补丁：默认关闭（设 TEFLON_FIX_V7=1 启用）"
 fi

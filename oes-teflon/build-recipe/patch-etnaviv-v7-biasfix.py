@@ -82,6 +82,16 @@ calculate_bias_correction(uint8_t *weights, const struct etna_operation *operati
 
 # 与 v8（etnaviv_ml_nn_v8.c:164-191）逻辑逐条对齐；打印放在修复之前，
 # 这样日志里「修复前的越界倍数」与「修复后的长度」同时可见，一次上机取证闭环。
+#
+# ★ 两种形态（`--dense-depthwise` 选择）：
+#   · 默认（layout 路线）：depthwise ⇒ input_channels = 1，与 v8 一致。
+#     该特判成立的前提是「每个输出通道的窗口只有 W*H 个元素」。
+#   · dense（fold-early 路线）：expand_depthwise 已把每输出通道摊成**稠密**的
+#     W*H*C ⇒ 扫描窗口必须覆盖整块。否则只覆盖 ic=0 那一块，
+#     偏置补偿整整少掉 (C-1) 个输入通道的贡献；input_zero_point != 0 时
+#     每通道少掉 zp_in·Σw 量级的常数 ⇒ 输出整体偏移甚至饱和。
+#     （input zp = -128 时 input_zero_point = 0 ⇒ 该项恒为 0，
+#      所以该缺陷只在 zp_in != -128 的模型上显形，见报告 56。）
 NEW = """static uint32_t
 calculate_bias_correction(uint8_t *weights, const struct etna_operation *operation)
 {
@@ -91,15 +101,11 @@ calculate_bias_correction(uint8_t *weights, const struct etna_operation *operati
    unsigned och_bound;
    int32_t correction = 0;
 
-   /* %s */
+   /* @MARKER@ */
    och_buggy_bound = operation->weight_width * operation->weight_height *
                       operation->input_channels;
 
-   /* 与 v8（etnaviv_ml_nn_v8.c:164-191）逐条对齐 */
-   if (operation->depthwise)
-      input_channels = 1;
-   else if (operation->addition)
-      input_channels = 2 * operation->output_channels;
+@DW_COMMENT@@DW_BRANCH@      input_channels = 2 * operation->output_channels;
    else
       input_channels = operation->input_channels;
 
@@ -108,6 +114,7 @@ calculate_bias_correction(uint8_t *weights, const struct etna_operation *operati
    /* 取证打印：修复前的 buggy_bound 与修复后的 fixed_bound 同时可见 */
    fprintf(stderr,
            "[och-fix] calc_bias_correction depthwise=%%d addition=%%d in_c=%%u w=%%u h=%%u "
+           "dense_depthwise=@DENSE@ "
            "| buggy_bound=%%u fixed_bound=%%u wt_size=%%u wt=%%p\\n",
            operation->depthwise ? 1 : 0, operation->addition ? 1 : 0,
            operation->input_channels, operation->weight_width, operation->weight_height,
@@ -125,10 +132,41 @@ calculate_bias_correction(uint8_t *weights, const struct etna_operation *operati
 }
 """
 
+# ── 两种分支形态 ──────────────────────────────────────────────────────────
+# 默认（layout 路线）：与 v8 逐条对齐，depthwise ⇒ in_c = 1。
+_DW_UPSTREAM = """   /* 与 v8（etnaviv_ml_nn_v8.c:164-191）逐条对齐 */
+   if (operation->depthwise)
+      input_channels = 1;
+   else if (operation->addition)
+"""
+
+# dense（fold-early 路线）：expand_depthwise 已摊成稠密 [oc][ic][w][h]（in_c = C）。
+_DW_DENSE = """   /* och patch: dense-depthwise（fold-early）
+    * expand_depthwise 已把每输出通道摊成稠密的 W*H*C（input_channels = C）。
+    * v8 的 `depthwise => in_c=1` 特判只在「每通道仅 W*H 个元素」的排布下成立，
+    * 在这里只覆盖 ic=0 那一块 ⇒ 偏置补偿少掉 (C-1) 个通道的贡献。
+    * 按**构建形态**选择，不做运行期猜测（两条路线的权重排布不同）。 */
+   if (operation->addition)
+"""
+
+
+def body(dense: bool) -> str:
+    """渲染 calculate_bias_correction 的新实现。"""
+    text = NEW.replace("@MARKER@", MARKER)
+    text = text.replace("@DW_COMMENT@@DW_BRANCH@", _DW_DENSE if dense else _DW_UPSTREAM)
+    text = text.replace("@DENSE@", "1" if dense else "0")
+    if "@" in text:
+        raise SystemExit("ERROR: body() 有未替换的占位符：%r"
+                         % [ln for ln in text.splitlines() if "@" in ln][:2])
+    return text
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
+    ap.add_argument("--dense-depthwise", action="store_true",
+                    help="fold-early 形态：depthwise 权重已是 expansion 后的稠密 "
+                         "[oc][ic][w][h] ⇒ 偏置补偿扫描整块（不套 v8 的 in_c=1 特判）")
     args = ap.parse_args()
 
     with open(args.path, "r", encoding="utf-8") as f:
@@ -147,21 +185,34 @@ def main() -> int:
             "       不要跳过校验强行构建（会静默产出未修复的 .so，崩溃会照旧）。\n")
         return 1
 
-    src = src.replace(OLD, NEW % MARKER, 1)
+    src = src.replace(OLD, body(args.dense_depthwise), 1)
 
-    # 自检：修复逻辑与标记都在，原函数体确实被换掉。
-    if MARKER not in src or "if (operation->depthwise)" not in src:
-        sys.stderr.write("ERROR: 打完补丁后自检失败\n")
+    # 自检：修复逻辑与标记都在，原函数体确实被换掉；分支形态与请求一致。
+    has_dw_special = "if (operation->depthwise)\n      input_channels = 1;" in src
+    if MARKER not in src:
+        sys.stderr.write("ERROR: 打完补丁后自检失败（缺标记）\n")
+        return 1
+    if args.dense_depthwise == has_dw_special:
+        sys.stderr.write(
+            "ERROR: 打完补丁后自检失败：dense_depthwise=%d 但 depthwise 特判%s\n"
+            % (1 if args.dense_depthwise else 0, "仍在" if has_dw_special else "缺失"))
         return 1
     if "operation->weight_width * operation->height" in src:  # 不该出现的拼写
         sys.stderr.write("ERROR: 补丁内容异常\n")
+        return 1
+    if ("dense_depthwise=%d" % (1 if args.dense_depthwise else 0)) not in src:
+        sys.stderr.write("ERROR: 打完补丁后自检失败（日志字段 dense_depthwise 不符）\n")
         return 1
 
     with open(args.path, "w", encoding="utf-8") as f:
         f.write(src)
 
     print(f"  [och-fix] 已修复 v7 calculate_bias_correction: {args.path}")
-    print("  [och-fix] depthwise/addition 特判已按 v8 对齐；日志会打印 buggy_bound/fixed_bound")
+    if args.dense_depthwise:
+        print("  [och-fix] 形态=dense（fold-early）：扫描整块 W*H*C，无 in_c=1 特判")
+    else:
+        print("  [och-fix] 形态=layout：depthwise/addition 特判已按 v8 对齐")
+    print("  [och-fix] 日志会打印 buggy_bound/fixed_bound 与 dense_depthwise")
     return 0
 
 

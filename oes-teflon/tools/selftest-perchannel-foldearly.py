@@ -216,6 +216,41 @@ def part_b():
     # 反作弊：若 expand 返回的尺寸不是 C·k²·C，上面的 I7 断言就可能是空转
     chk(any(expanded[i] == bg for i in range(len(expanded))), "I7 反作弊：确实存在背景元素（非全对角）")
 
+    # ── I8：域一致性（报告 56 的真机根因）────────────────────────────────────
+    # 硬件按 `w_eff = 字节 - coef_zero_point`（coef_zero_point = zp_new）解释每个字节，
+    # 所以「零权重」的正确字节**就是 zp_new 本身**。expand_depthwise 的 signed 分支
+    # 写成 zp-128（有符号域）⇒ 每个背景权重的 w_eff = ±128。
+    zp = nzp2
+    bg_fixed = expand_mirror(folded, C, k2, C, zp, False)
+    bg_buggy = expand_mirror(folded, C, k2, C, zp, True)
+    fixed_off = set()
+    buggy_off = set()
+    for channel in range(C):
+        base = channel * k2 * k2 * C
+        for i in range(k2 * k2 * C):
+            if i % C == channel:
+                continue  # 对角：两种形态相同
+            fixed_off.add(bg_fixed[base + i] - zp)
+            buggy_off.add(bg_buggy[base + i] - zp)
+    chk(fixed_off == {0}, "I8 修复后：背景字节 - zp_new = 0（真正零权重）",
+        "得到 %s" % sorted(fixed_off))
+    chk(buggy_off in ({-128}, {128}, {-128, 128}),
+        "I8 复现缺陷：有符号域背景 - zp_new = ±128", "得到 %s" % sorted(buggy_off))
+
+    # 量级判据：背景项在累加器里是**常量符号**，且量级远大于真实信号 ⇒ 必然饱和。
+    n_bg = C * k2 * k2 * C - C * k2 * k2          # 207·C... 见下（对角共 C·k²）
+    n_bg_per_channel = k2 * k2 * C - k2 * k2      # 每通道 216-9
+    worst_bg = 128 * n_bg_per_channel             # 每通道背景项的最小量级（输入字节 ≥1）
+    max_diag = (k2 * k2) * 255                    # 每通道对角项可能的最大量级
+    chk(worst_bg > 5 * max_diag,
+        "I8 量级：背景项 %d ≥ 对角最大 %d 的 5 倍 ⇒ 输出符号由背景决定（与输入无关）"
+        % (worst_bg, max_diag),
+        "比值 %.1f" % (worst_bg / max_diag))
+    # 反作弊：如果背景项量级不比信号大，上面的「必然饱和」推论就是空的
+    chk(n_bg_per_channel == 207 and worst_bg == 26496,
+        "I8 反作弊：算例确实是 C=24/k=3（207 个背景、26496 量级）",
+        "n_bg=%d worst=%d" % (n_bg_per_channel, worst_bg))
+
 
 # ── A. 结构控制 ───────────────────────────────────────────────────────────────
 
@@ -276,6 +311,29 @@ def part_a(src_root):
     us_up, us_pc = _fn(up), _fn(pc)
     chk("weights[i] = requantized + operation->weight_zero_point;" in us_pc,
         "反作弊：unsigned 分支在 --pcdomain 下逐字未变")
+
+    # ── 域标志：必须跟着折叠域走（报告 56 的真机根因）────────────────────────
+    def _lower_conv(t):
+        i = t.index("etna_ml_lower_convolution(struct etna_ml_subgraph")
+        return t[i:t.index("\n}\n", i) + 3]
+
+    sc_pc, sc_up = _lower_conv(pc), _lower_conv(up)
+    chk(sc_pc.count("operation->weight_signed = false;") == 1,
+        "正控制：--pcdomain 下恰好 1 处 weight_signed = false",
+        "得到 %d 处" % sc_pc.count("operation->weight_signed = false;"))
+    chk(sc_pc.index("requantize_bias(subgraph") < sc_pc.index("operation->weight_signed = false;"),
+        "正控制：清位排在折叠之后（否则 calc_quantization 会按无符号域反量化）")
+    chk("operation->weight_signed = false;" not in sc_up,
+        "负控制：不带 --pcdomain 时不清位（有符号域折叠必须保留标志）")
+    chk(pc.count("operation->weight_signed") > up.count("operation->weight_signed"),
+        "反作弊：清位确实新增在 fold-early 块里（不是别处顺手写的）")
+    # 作用域是 etna_ml_lower_convolution：折叠函数 requantize_weights 不在其中，
+    # 所以这里只应看到「清位」那一处（=1），不带开关时一处都没有（=0）。
+    chk(sc_pc.count('getenv("TEFLON_PCDOMAIN")') == 1 and
+        sc_up.count('getenv("TEFLON_PCDOMAIN")') == 0,
+        "正控制：清位挂在运行期门上（=0 时保持标志 ⇒ 与上游逐字节一致）",
+        "pc=%d up=%d" % (sc_pc.count('getenv("TEFLON_PCDOMAIN")'),
+                          sc_up.count('getenv("TEFLON_PCDOMAIN")')))
 
     rc2, out2 = run([work])
     chk(rc2 != 0, "负控制①：同一文件再打一次必须 fail-closed", "rc=%d" % rc2)

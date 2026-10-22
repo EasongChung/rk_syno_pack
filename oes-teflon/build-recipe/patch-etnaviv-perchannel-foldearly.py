@@ -210,8 +210,41 @@ NEW_EARLY_BLOCK = r'''
       operation->weight_zero_point = zero_point;
       requantize_weights(subgraph, poperation, operation);
       requantize_bias(subgraph, poperation, operation);
-   }
+@SIGNED_CLEAR@   }
 '''
+
+# ★ 域标志必须跟着**缓冲区实际域**走（2026-10-22 真机定位，报告 56）
+#   下游所有「零权重字节」的填充点都用 weight_signed 二选一：
+#       weight_signed ? (zp - 128)      ← 有符号域
+#                     :  zp            ← 无符号域
+#   （expand_depthwise / pointwise_to_2x2 / reshape 各一处，见 nn.c:308/345/488）
+#   PCDOMAIN 已把折叠结果改成**无符号域**（byte = requant + zp，coef_zero_point = zp），
+#   却没人清 weight_signed ⇒ expand_depthwise 仍按有符号域填背景 zp−128，
+#   硬件按 `字节 − coef_zero_point` 解释成 **−128** ⇒ 每个输出通道 207 个背景权重
+#   各贡献 −128·输入 ⇒ 巨额负累加 ⇒ 真机实测单层 depthwise 输出 100% 饱和在 −128。
+#   （与 input zp 无关：zp0 变体、PCDOMAIN=0 变体同样饱和 —— 三次上机互证。）
+#   清位手法与 etna_ml_lower_addition 的既有做法一致（nn.c:738 也是 weight_signed = false）。
+_SIGNED_CLEAR = r'''
+      /* och patch: 折叠已把权重缓冲区改成**无符号域**（byte = requant + zp_new），
+       * 下游的零字节填充点（expand_depthwise / pointwise_to_2x2 / reshape）都用
+       * weight_signed 决定用 `zp - 128` 还是 `zp` ⇒ 必须同步清位，
+       * 否则 depthwise 的背景权重会被硬件解释成 -128（真机实测：全 -128 饱和）。
+       * 与 etna_ml_lower_addition 的既有做法一致（nn.c:738）。
+       * ★ 挂在同一个运行期门上：TEFLON_PCDOMAIN=0 ⇒ 折叠回到有符号域，
+       *   标志必须保持原样，才能维持「=0 与上游逐字节一致」这条已声明性质。 */
+      const char *och_pd_dom = getenv("TEFLON_PCDOMAIN");
+      if (och_pd_dom == NULL || och_pd_dom[0] != '0')
+         operation->weight_signed = false;
+'''
+
+
+def early_block(pcdomain):
+    """返回插在 bias 拷贝之后的 fold-early 块。
+
+    `pcdomain=False` 时**逐字**等于修复前的形态（有符号域折叠 ⇒ 填充点也必须有符号），
+    这是负控制/对照构建所必需的：域标志与折叠域必须成对，不能只改一半。
+    """
+    return NEW_EARLY_BLOCK.replace("@SIGNED_CLEAR@", _SIGNED_CLEAR if pcdomain else "")
 
 NEW_LATE_BLOCK = r'''   /* och patch: fold-early —— 折叠已在上面的「权重/bias 拷贝之后」完成，
     * 这里只保留 v8 硬件原生 depthwise 的语义收口（v7 无 depthwise 模式，不需要）。
@@ -400,7 +433,7 @@ def main(argv):
     b0b, b1b = find_block(out, LATE_START)
     moved = out[b0b:b1b]
     out = out[:b0b] + NEW_LATE_BLOCK + out[b1b:]
-    out = out.replace(ANCHOR_INSERT, ANCHOR_INSERT + NEW_EARLY_BLOCK, 1)
+    out = out.replace(ANCHOR_INSERT, ANCHOR_INSERT + early_block(args.pcdomain), 1)
 
     # 5) 二进制标记
     if MARKER not in out:
@@ -439,6 +472,20 @@ def main(argv):
                 errs.append("折叠块没有排在 %s 之前" % nm)
     if scope.count("nn_core_version >= 8 && poperation->conv.depthwise") != 1:
         errs.append("v8 的 input_channels 收口丢了（应恰好 1 处）")
+
+    # ── 域标志与折叠域必须成对（报告 56）────────────────────────────────────
+    n_clear = scope.count("operation->weight_signed = false;")
+    if args.pcdomain:
+        if n_clear != 1:
+            errs.append("--pcdomain 下 weight_signed = false 出现 %d 次（要求 1）" % n_clear)
+        elif not (scope.index("requantize_bias(subgraph") <
+                  scope.index("operation->weight_signed = false;")):
+            errs.append("weight_signed 的清位必须在折叠（requantize_bias）之后，"
+                        "否则 calc_quantization 会按无符号域反量化")
+    elif n_clear != 0:
+        errs.append("不带 --pcdomain 时不得清 weight_signed（有符号域折叠需要它）")
+    if "@SIGNED_CLEAR@" in chk:
+        errs.append("模板占位符 @SIGNED_CLEAR@ 未被替换")
     # 防重复折叠：函数内三处调用各只能出现 1 次
     for call in ("calc_quantization(subgraph", "requantize_weights(subgraph", "requantize_bias(subgraph"):
         c = scope.count(call)
@@ -455,6 +502,9 @@ def main(argv):
     print("  [foldearly] requantize_weights: 原地折叠，尺寸不变（不再 malloc/free/改 size）")
     print("  [foldearly] 折叠块前移        : 到 pointwise/expand/strided/transpose 之前")
     print("  [foldearly] v8 收口保留       : input_channels = 1 仅 v8")
+    print("  [foldearly] 域标志            : %s"
+          % ("weight_signed = false（折叠已是无符号域 ⇒ 填充点同步）"
+             if args.pcdomain else "保持上游（有符号域，与折叠域一致）"))
     print("  [foldearly] 标记              : %s" % MARKER)
     return 0
 
