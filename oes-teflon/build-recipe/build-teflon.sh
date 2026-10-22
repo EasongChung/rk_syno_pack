@@ -967,6 +967,12 @@ fi
 #
 # 用法：TEFLON_FIX_V7=1 TEFLON_OCFIX=1 TEFLON_FSGUARD=1 TEFLON_ROFIX=1 \
 #       TEFLON_PERCHANNEL=1
+if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ] && [ "${TEFLON_PERCHANNEL:-0}" != "1" ]; then
+	echo "ERROR: TEFLON_PERCHANNEL_FOLDEARLY=1 但 TEFLON_PERCHANNEL=0"
+	echo "       fold-early 修的是「per-channel 被准入之后」的下降路径；"
+	echo "       门没开就没有可修的对象，产物会与不加任何补丁一致 ⇒ 拒绝构建。"
+	exit 1
+fi
 if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	echo "==> [3m/6] 打【修复】per-channel 量化门（只放开 weight/bias）"
 	PATCHER13="$SCRIPT_DIR/patch-etnaviv-perchannel-quant.py"
@@ -1027,6 +1033,60 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 			exit 1
 		fi
 	done
+	# ── 3m-2a. 【替代方案】per-channel **折叠提前**（fold-early，报告 55 方案 A）──
+	#
+	# 与 3m-2b 的布局补丁**互斥**：两者都整函数重写 calc_quantization /
+	# requantize_weights，且对 depthwise 的 input_channels 处置相反
+	# （layout 补丁压成 1；fold-early 保持 C）。
+	# 显式用 TEFLON_PERCHANNEL_FOLDEARLY=1 选择；默认仍走 3m-2b ⇒ 现有交付件不变。
+	#
+	# 【为什么 fold-early 更对】（报告 55，已过 OCA 评审）
+	#   v7 没有 depthwise 模式（expand_depthwise 注释：hardware doesn't support those），
+	#   MobileNetV1 的 depthwise 能到 99.70% 走的是**稠密 C×C 展开**。
+	#   把 in_c 压成 1 让 C 个输出共享同一输入通道 ⇒ 语义塌陷。
+	#   折叠提前后深度方向保持 C、写入器回 interleaved、缓冲尺寸恒等于原始尺寸的派生量
+	#   ⇒ 「缩容后仍按 C 读」的越界**结构性消失**（不是靠钳位）。
+	if [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+		echo "==> [3m/6] per-channel 折叠提前（fold-early，方案 A）"
+		PATCHER15="$SCRIPT_DIR/patch-etnaviv-perchannel-foldearly.py"
+		if [ ! -f "$PATCHER15" ]; then
+			echo "ERROR: 设了 TEFLON_PERCHANNEL_FOLDEARLY=1 却缺 $PATCHER15"
+			exit 1
+		fi
+		# ★ 打补丁**之前**核对（此时失配即为真失配）：三个 body md5 钉死 + 插入锚点唯一。
+		python3 "$PATCHER15" "$MLPNN" --verify || {
+			echo "ERROR: fold-early 的上游基准失配（源码与报告中钉死的 md5 不同）"
+			echo "       请重读 verify/reports/55 的假设，更新补丁与 md5 后重跑。"
+			exit 1
+		}
+		# 结构与数值自测（正控制 19 项 + 负控制/反作弊），**必须排在打补丁之前**：
+		# 它内部会 --verify 未打补丁的原文，打完就必然失配。
+		if [ -f "$SCRIPT_DIR/../tools/selftest-perchannel-foldearly.py" ]; then
+			python3 "$SCRIPT_DIR/../tools/selftest-perchannel-foldearly.py" \
+				--src-root "$(cd "$(dirname "$MLPNN")" && pwd)" \
+				> "$BUILD_DIR_ABS/selftest-perchannel-foldearly.log" 2>&1
+			_rc=$?
+			cat "$BUILD_DIR_ABS/selftest-perchannel-foldearly.log"
+			if [ "$_rc" -ne 0 ]; then
+				echo "ERROR: fold-early 补丁自测未通过（rc=$_rc）"
+				exit 1
+			fi
+		fi
+		python3 "$PATCHER15" "$MLPNN" || {
+			echo "ERROR: fold-early 补丁应用失败 —— 不要跳过校验"
+			echo "       （会静默产出仍按旧顺序折叠的 .so，depthwise 语义照旧塌陷）。"
+			exit 1
+		}
+		if ! grep -qF 'och-patch-perchannel-foldearly' "$MLPNN"; then
+			printf '\n/* och patch: compile-time marker */\n__attribute__((used)) static const char och_fe_marker[] = "och-patch-perchannel-foldearly";\n' >> "$MLPNN"
+		fi
+		# 互斥证明：另一个补丁的标记必须缺席
+		if grep -qF 'och-patch-perchannel-layout' "$MLPNN"; then
+			echo "ERROR: fold-early 与 layout 两个补丁同时出现在源码里（互斥被破坏）"
+			exit 1
+		fi
+		echo "==> [3m/6] fold-early：折叠前移 + 原地折叠（尺寸不变）+ depthwise 保持 in_c=C"
+	else
 	# ★ 一切「核对未打补丁的原文」的检查都必须排在打补丁**之前**。
 	#   打完补丁后 calc_quantization / requantize_weights 已被整函数替换，
 	#   再去核对「OLD_* 是否命中原始文本」必然失配 ——
@@ -1092,6 +1152,7 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 	fi
 	echo "==> [3m/6] 布局契约修复：calc_quantization + requantize_weights + v7 写回"
 	echo "==> [3m/6] 诊断打印：TEFLON_PERCHANNEL_DIAG=${TEFLON_PERCHANNEL_DIAG:-1}（0=无诊断候选）"
+	fi
 
 # ── 3k7. 【修复】ML 层自建资源的 width0=0（Synology Photos 主题识别模型的 abort）──
 # 现象：photos 的 concept 模型（FC 输出 rank-2）在推理期 abort：

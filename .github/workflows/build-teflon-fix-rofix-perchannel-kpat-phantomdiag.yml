@@ -75,6 +75,10 @@ on:
         description: 'phantomdiag（取证产物：诊断全开、带 DWARF）| delivery（交付产物：修复默认开、诊断全关、strip）'
         required: false
         default: 'phantomdiag'
+      foldearly:
+        description: 'foldearly（报告 55 方案 A：折叠前移+原地+保持 in_c=C；与 layout 补丁互斥）'
+        required: false
+        default: '0'
 
 env:
   MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
@@ -84,6 +88,10 @@ env:
   TEFLON_FSGUARD: '1'
   TEFLON_ROFIX: '1'
   TEFLON_PERCHANNEL: '1'
+  # ★ 报告 55 方案 A：折叠前移 + 原地 + 删 depthwise 的 in_c=1 写回。
+  #   与 patch-etnaviv-perchannel-layout.py **互斥**（build-teflon.sh 里 fail-closed）。
+  #   默认 '0' ⇒ 产物与既往交付件同一补丁集合（可复现对照）。
+  TEFLON_PERCHANNEL_FOLDEARLY: ${{ inputs.foldearly || '0' }}
   TEFLON_PERCHANNEL_DIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_NNDUMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   TEFLON_KPAT: ${{ inputs.mode == 'delivery' && '0' || '1' }}
@@ -120,7 +128,7 @@ env:
 
 jobs:
   build:
-    name: build libteflon.so (mode=${{ inputs.mode || 'phantomdiag' }})
+    name: build libteflon.so (mode=${{ inputs.mode || 'phantomdiag' }}, foldearly=${{ inputs.foldearly || '0' }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
