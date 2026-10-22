@@ -917,7 +917,9 @@ jobs:
             chk 3 'och_fold_channel('       "$NN" 'helper och_fold_channel（定义 1 + 调用 2）'
             chk 1 'och patch: per-channel 折叠提前' "$NN" '折叠块前移标记'
             chk 1 'int32_t och_requant'     "$NN" '域修复（PCDOMAIN）已并入 fold-early'
-            chk 1 'getenv("TEFLON_PCDOMAIN")' "$NN" '域修复带运行期门（=0 可与上游逐字节对照）'
+            # ★ 报告 56：运行期门现在覆盖**两个**站点 —— 折叠域（requantize_weights）
+            #   与域标志清位（lower_convolution）必须同步开/关，否则会混域。
+            chk 2 'getenv("TEFLON_PCDOMAIN")' "$NN" '域修复与清位共用同一个运行期门（2 处）'
             chk 1 '[och-pcdomain]'          "$NN" '域修复编译期标记'
             # ★ 报告 56：折叠域（无符号）与填充点域（weight_signed）必须成对，
             #   否则 expand_depthwise 的背景权重被硬件解释成 -128（真机全 -128 饱和）。
