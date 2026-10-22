@@ -70,6 +70,8 @@ PATCHES = {
                      "etnaviv/drm/etnaviv_gpu.c"),
     "conv-only":    ("patch-teflon-conv-only.py",
                      "gallium/frontends/teflon/tfl_device.c"),
+    "ctx-reuse":    ("patch-teflon-context-reuse.py",
+                     "gallium/frontends/teflon/tfl_device.c"),
     "v7-biasfix":   ("patch-etnaviv-v7-biasfix.py",
                      "gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"),
     "ocfix":        ("patch-etnaviv-outchannel-clamp.py",
@@ -112,6 +114,7 @@ EXCLUSIVE = [
 BUILD_ORDER = [
     "npu-detect",      # 3b
     "conv-only",       # 3c
+    "ctx-reuse",       # 3d（报告 60：pipe_context 跨分区复用，消除每分区固定开销）
     "diag-bias",       # 3d  TEFLON_DIAG      （与 FIX_V7 互斥）
     "v7-biasfix",      # 3e  TEFLON_FIX_V7
     "wcdiag",          # 3f  TEFLON_WCDIAG
@@ -135,9 +138,12 @@ SETS = {
     "wcdiag": ["npu-detect", "v7-biasfix", "wcdiag", "ocfix", "fsguard"],
     "rodiag": ["npu-detect", "v7-biasfix", "ocfix", "fsguard", "rodiag"],
     "convonly": ["npu-detect", "conv-only"],
+    # 交付候选轮 + context 复用（报告 60：消除每分区 create+destroy 的固定开销）
+    "ctxreuse": ["npu-detect", "conv-only", "ctx-reuse", "v7-biasfix", "ocfix",
+                 "fsguard", "padgate", "rofix", "perchannel"],
     # 「能同时开」的最大限度组合（去掉两个互斥方各自的一个）
-    "maximal": ["npu-detect", "conv-only", "v7-biasfix", "wcdiag", "ocfix", "fsguard",
-                "padgate", "rofix", "aliasdiag", "creatediag", "perchannel"],
+    "maximal": ["npu-detect", "conv-only", "ctx-reuse", "v7-biasfix", "wcdiag", "ocfix",
+                "fsguard", "padgate", "rofix", "aliasdiag", "creatediag", "perchannel"],
 }
 
 # 用来证明「补丁文本真的插进去了」的最小长度，短的常量（如 "1"）没有判别力。

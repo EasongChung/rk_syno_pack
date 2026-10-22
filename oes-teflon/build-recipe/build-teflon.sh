@@ -456,6 +456,31 @@ else
 fi
 
 # ---------------------------------------------------------------- #
+# 3d: pipe_context 跨分区复用（报告 60）
+#     每个被接管的算子（= 每个 delegate 分区）原本每次推理都
+#     create + destroy 一个 pipe_context；etna_context_create 会建
+#     默认上传器 staging 缓冲 + 命令流 + 哈希表 ⇒ 单分区固定开销
+#     6–31 ms（本项目历史实测）⇒ 14 个分区 ≈ 280 ms。
+#     这个补丁**不改任何数值结果**，只改资源生命周期 ⇒ 恒生效，
+#     不做成环境变量开关（交付件要求：不设任何环境变量即最优）。
+# ---------------------------------------------------------------- #
+echo "==> [3d/6] 打「pipe_context 跨分区复用」补丁"
+PATCHER3="$SCRIPT_DIR/patch-teflon-context-reuse.py"
+if [ -f "$PATCHER3" ]; then
+	if python3 "$PATCHER3" mesa/src/gallium/frontends/teflon/tfl_device.c; then
+		echo "    pipe_context 跨分区复用已就绪"
+	else
+		# 非致命（与 3c 同理）：别的 Mesa 版本结构可能不同 ⇒ 不让整个构建假失败。
+		# ★ 但**交付构建必须带上它**（不带 ⇒ 每分区固定开销 ⇒ 整图慢 2.4×），
+		#   硬门在 CI 的 `check-patches-vs-source --set maximal`（已含 ctx-reuse）。
+		echo "    ！！警告：本 Mesa 版本结构不同，context 复用补丁【未应用】"
+		echo "    ！！这会让 NPU 路径慢约 2.4×（每分区 create+destroy 的固定开销）"
+	fi
+else
+	echo "    ！！警告：缺 $PATCHER3，跳过（context 复用不可用）"
+fi
+
+# ---------------------------------------------------------------- #
 # 3d. 【诊断专用】calculate_bias_correction 越界取证补丁
 # ---------------------------------------------------------------- #
 # 崩溃定位：PrepareDelegate 阶段 SIGSEGV，故障地址落在
