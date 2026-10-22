@@ -27,12 +27,18 @@ v7 上 `stride>1` 的 depthwise 一律走 `ETNA_NN_POOLING_FIRST_PIXEL`
 
 ## 判据为什么是「depthwise ∧ stride>1 ∧ padding_top/left>0」
 
-* 只有 depthwise 会走 `calc_pooling_first_pixel()` 的**无条件** `return true`
-  （`etnaviv_ml_nn.c:504`）；非 depthwise 的 stride-2 卷积在 v7 上返回 false
-  ⇒ 走 `strided_to_normal()`，padding 被正确处理 ⇒ **不需要门控**。
+* 在 v7（`nn_core_version < 8`）上，走 pooling 路径的只有两类
+  （`etnaviv_ml_nn.c:497` `calc_pooling_first_pixel()`）：
+  **depthwise**（`stride_x > 1` 时无条件 `return true`）与
+  **pointwise**（1×1，`stride_x > 1` 且 v7 无条件 `return true`）。
+  1×1 的 `pad_top/left` 恒为 0（SAME 下 `(out−1)·s + 1 ≤ in`）⇒ 只有 depthwise 需要门控。
+  非 pointwise 的非 depthwise 卷积返回 false ⇒ 走 `strided_to_normal()`，padding 被正确处理。
 * 1×1 卷积的 `pad_top/left` 恒为 0 ⇒ 不会被误伤。
 * 偶数边长的 stride-2 depthwise（如官方 MobileNetV1 的 224→112）`pad_top=0`
   ⇒ **不受影响**，已交付的回归不变。
+* ⚠️ 本门有一处**保守**（会多挡）：`input_width ∈ (2, 8)` 的 depthwise 会被上游清掉
+  pooling 标志（`etnaviv_ml_nn.c:608`）⇒ 其实安全，但本门照挡。
+  concept 模型（最小 13×13）与 MobileNetV1 都没有这种形状。
 
 ## 运行期门（交付语义）
 
