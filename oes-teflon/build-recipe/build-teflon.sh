@@ -1072,7 +1072,16 @@ if [ "${TEFLON_PERCHANNEL:-0}" = "1" ]; then
 				exit 1
 			fi
 		fi
-		python3 "$PATCHER15" "$MLPNN" || {
+		# ★ fold-early 整函数重写了 requantize_weights ⇒ 3m2 的 PCDOMAIN 锚点
+		#   在它上面必然失配（run 39754283314 实测）。因此**域修复并入本补丁**，
+		#   由 --pcdomain 选择；语义与 patch-etnaviv-perchannel-domain.py 的 NEW
+		#   逐项相同（int32 中间量 / CLAMP / 同一运行期门 / 同一标记字符串）。
+		FE_PCDOMAIN=""
+		if [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ]; then
+			FE_PCDOMAIN="--pcdomain"
+			echo "  [foldearly] 域修复并入：--pcdomain（等价于 3m2 PCDOMAIN，语义不变）"
+		fi
+		python3 "$PATCHER15" "$MLPNN" $FE_PCDOMAIN || {
 			echo "ERROR: fold-early 补丁应用失败 —— 不要跳过校验"
 			echo "       （会静默产出仍按旧顺序折叠的 .so，depthwise 语义照旧塌陷）。"
 			exit 1
@@ -1232,7 +1241,16 @@ fi
 #   本补丁的锚点是它的**输出形态** ⇒ 顺序反了会锚点失配（run 39565432373 就这么挂的）。
 #
 # ⚠️ 这是**改行为**的修复，默认关闭。交付前需另行决策（产物语义变更）。
-if [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ]; then
+if [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ] && [ "${TEFLON_PERCHANNEL_FOLDEARLY:-0}" = "1" ]; then
+	# fold-early 已把**同一语义**并入自己的 requantize_weights（--pcdomain）。
+	# 这里再打一遍既会锚点失配，也会造成「两处实现漂移」隐患 ⇒ 明确跳过并自证。
+	if ! grep -qF '[och-pcdomain]' "$MLPNN"; then
+		echo "ERROR: 走了 fold-early + PCDOMAIN，但源码里没有 [och-pcdomain] 标记"
+		echo "       ⇒ 域修复没并进去，产物会整片饱和。拒绝继续。"
+		exit 1
+	fi
+	echo "==> [3m2/6] per-channel 域修复：已并入 fold-early（--pcdomain），跳过独立补丁"
+elif [ "${TEFLON_PCDOMAIN_PATCH:-0}" = "1" ]; then
 	echo "==> [3m2/6] 打【修复】per-channel 权重折叠后的域错误"
 	PATCHER_PCD="$SCRIPT_DIR/patch-etnaviv-perchannel-domain.py"
 	MLPCD="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"

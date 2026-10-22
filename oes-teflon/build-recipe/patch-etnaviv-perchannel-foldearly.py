@@ -111,7 +111,43 @@ NEW_CALC_Q_BODY = r'''{
    calc_quant_params(min, max, out_scale, out_zero_point);
 }'''
 
-NEW_REQ_W_BODY = r'''{
+# ── requantize_weights 的新实现：signed 分支有**两种形态** ────────────────────
+# ★ 为什么必须在这里再实现一遍域修复：
+#   fold-early 整函数重写了 requantize_weights，而 `patch-etnaviv-perchannel-domain.py`
+#    （3m2，PCDOMAIN）的锚点是 **layout 补丁之后**的形态
+#   （`map_out[oc][ic][w][h]` 那几行）⇒ 在 fold-early 上必然锚点失配（run 39754283314 实测）。
+#   因此把**同一语义**搬进本地实现，由构建期 `--pcdomain` 选择：
+#   语义与 patch-etnaviv-perchannel-domain.py 的 NEW **逐项相同**
+#   （int32 中间量、CLAMP 到 [0,255]、同一个运行期门 `TEFLON_PCDOMAIN`、
+#    同一个编译期标记字符串 `[och-pcdomain]`）。改这里必须同步改那边。
+_SIGNED_UPSTREAM = r'''         int8_t val = ((int8_t *)weights)[i];
+         double dequantized = weight_tensor->scales[c] * (val - weight_tensor->zero_points[c]);
+         int8_t requantized = round(dequantized / operation->weight_scale);
+         weights[i] = requantized + operation->weight_zero_point - 0x80;'''
+
+_SIGNED_PCDOMAIN = r'''         int8_t val = ((int8_t *)weights)[i];
+         double dequantized = weight_tensor->scales[c] * (val - weight_tensor->zero_points[c]);
+         /* och patch: per-channel weight domain (signed branch)
+          * 上游把 uint8 域的折叠结果先截断成 int8、再减 0x80 ⇒ 真机整片饱和（报告 46）。
+          * 这里统一到 uint8 域：中间量 int32（不截断），夹到 [0,255]；
+          * 硬件的 coef_zero_point = zp_new ⇒ 还原出真实权重。
+          * 与 patch-etnaviv-perchannel-domain.py 的 NEW 语义逐项相同。*/
+         int32_t och_requant = (int32_t)round(dequantized / operation->weight_scale);
+         int32_t och_qu = och_requant + operation->weight_zero_point;
+         const char *och_pd = getenv("TEFLON_PCDOMAIN");
+         if (och_pd == NULL || och_pd[0] != '0') {
+            weights[i] = (uint8_t)CLAMP(och_qu, 0, 255);
+         } else {
+            weights[i] = (uint8_t)((int8_t)och_requant +
+                                   operation->weight_zero_point - 0x80);
+         }
+         #if defined(__GNUC__) || defined(__clang__)
+         __attribute__((used)) static const char och_pcdomain_marker[] =
+            "[och-pcdomain]";
+         (void)och_pcdomain_marker;
+         #endif'''
+
+NEW_REQ_W_TEMPLATE = r'''{
    const struct pipe_tensor *weight_tensor = poperation->conv.weight_tensor;
    uint8_t *weights = operation->weight_tensor;
    const bool depthwise = poperation->conv.depthwise;
@@ -127,10 +163,7 @@ NEW_REQ_W_BODY = r'''{
    for (unsigned i = 0; i < n; i++) {
       unsigned c = och_fold_channel(operation, i, depthwise);
       if (operation->weight_signed) {
-         int8_t val = ((int8_t *)weights)[i];
-         double dequantized = weight_tensor->scales[c] * (val - weight_tensor->zero_points[c]);
-         int8_t requantized = round(dequantized / operation->weight_scale);
-         weights[i] = requantized + operation->weight_zero_point - 0x80;
+@SIGNED@
       } else {
          uint8_t val = weights[i];
          double dequantized = weight_tensor->scales[c] * (val - weight_tensor->zero_points[c]);
@@ -139,6 +172,17 @@ NEW_REQ_W_BODY = r'''{
       }
    }
 }'''
+
+
+def req_w_body(pcdomain):
+    """返回 requantize_weights 的新函数体。
+
+    `pcdomain=True` ⇒ 折叠后的权重按 **uint8 域**写出（PCDOMAIN 语义，交付默认）；
+    `pcdomain=False` ⇒ 与上游逐字相同的 int8 域公式（负控制/对照构建用）。
+    """
+    return NEW_REQ_W_TEMPLATE.replace("@SIGNED@",
+                                       _SIGNED_PCDOMAIN if pcdomain else _SIGNED_UPSTREAM)
+
 
 NEW_EARLY_BLOCK = r'''
    /* ═══ och patch: per-channel 折叠提前（fold-early）══════════════════════════
@@ -293,6 +337,9 @@ def main(argv):
                     help="只核对锚点/函数 md5 是否与钉死值一致，不写文件")
     ap.add_argument("--allow-md5-drift", action="store_true",
                     help="仅供调试：跳过 md5 钉死（CI 禁用）")
+    ap.add_argument("--pcdomain", action="store_true",
+                    help="折叠后的权重复刻 PCDOMAIN 的 uint8 域修复"
+                         "（交付构建：与 TEFLON_PCDOMAIN_PATCH=1 同步）")
     args = ap.parse_args(argv[1:])
 
     text = open(args.src, encoding="utf-8").read()
@@ -347,7 +394,7 @@ def main(argv):
     s_req3, e_req3 = find_func_span(out, "requantize_weights")
     span = out[s_req3:e_req3]
     sig_end3 = span.index("{")
-    out = out[:s_req3 + sig_end3] + NEW_REQ_W_BODY + out[e_req3:]
+    out = out[:s_req3 + sig_end3] + req_w_body(args.pcdomain) + out[e_req3:]
 
     # 4) 折叠块前移
     b0b, b1b = find_block(out, LATE_START)
