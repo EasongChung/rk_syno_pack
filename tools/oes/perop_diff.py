@@ -221,6 +221,140 @@ def cosine(a, b):
     return float(np.dot(fa, fb) / (na * nb))
 
 
+def _diag_channels(ra, qa, shape):
+    """逐通道 affine（a, b）最小二乘拟合，看「按通道的线性尺度/偏移」能解释多少误差。
+
+    返回 (中位 a, 中位 b, 中位残差相对能量, 残差>0.5 的通道数, 通道数)。
+    残差按**去均值后**的能量归一，否则「纯直流差」会被算成拟合成功。
+    """
+    if len(shape) < 2 or shape[-1] < 1:
+        return None
+    c = int(shape[-1])
+    if c > 4096 or ra.size % c:
+        return None
+    A = ra.reshape(-1, c)
+    B = qa.reshape(-1, c)
+    aa, bb, rr = [], [], []
+    for i in range(c):
+        y, x = A[:, i], B[:, i]
+        ym, xm = y.mean(), x.mean()
+        yc, xc = y - ym, x - xm
+        den = float(np.dot(xc, xc))
+        a = float(np.dot(xc, yc) / den) if den > 1e-20 else 0.0
+        res = yc - a * xc
+        ny = float(np.linalg.norm(yc))
+        rr.append(float(np.linalg.norm(res) / ny) if ny > 1e-20 else 0.0)
+        aa.append(a)
+        bb.append(float(ym - a * xm))
+    return (float(np.median(aa)), float(np.median(bb)),
+            float(np.median(rr)), int(sum(1 for v in rr if v > 0.5)), c)
+
+
+def diag_tensor(ra, qa, qstats=None):
+    """对**一个已配对张量**做 5 项判别诊断，把「cos 低」拆成互斥的几种机制。
+
+    ① Pearson（去均值 cos）—— 显著高于 cos ⇒ 差异主要在**直流**（尺度/zp）
+    ② 逐通道 affine 残差 —— 残差中位仍大 ⇒ 不是按通道的线性尺度问题
+    ③ 1 像素平移搜索（8 邻域）—— 某偏移显著抬升 cos ⇒ **空间错位**
+       符号约定：shift=(dy,dx) 表示「把**量化侧**平移 (dy,dx) 后与 ref 最吻合」，
+       即 dy=-1 ⇔ 量化侧原本相对 ref **向下**偏了 1 像素。别把符号读反。
+    ④ 量化步长 / 信号 std —— 偏大 ⇒ 激活量化过粗（重尾把区间撑开）
+    ⑤ 去重值占比 —— 偏小 ⇒ 大量元素被量化成同一个值
+
+    为什么每项都单独 try：诊断是**附属品**，任何一项炸掉都不能顶掉主结果
+    （本仓规矩：检查器自己会错；宁可少一项读数，也不能让整组对照失败）。
+    """
+    d = {}
+    try:
+        ra = np.asarray(ra, dtype=np.float64)
+        qa = np.asarray(qa, dtype=np.float64).reshape(ra.shape)
+    except Exception:
+        return d
+    if ra.size == 0:
+        return d
+    d['n'] = int(ra.size)
+    try:
+        d['cos'] = cosine(ra.ravel(), qa.ravel())
+    except Exception:
+        return d
+    try:
+        a0, b0 = ra - ra.mean(), qa - qa.mean()
+        na, nb = float(np.linalg.norm(a0)), float(np.linalg.norm(b0))
+        d['pearson'] = (float(np.dot(a0.ravel(), b0.ravel()) / (na * nb))
+                        if na > 0 and nb > 0 else 0.0)
+        d['mean_ref'] = float(ra.mean())
+        d['mean_qnt'] = float(qa.mean())
+    except Exception:
+        pass
+    try:
+        r = _diag_channels(ra, qa, ra.shape)
+        if r:
+            d['affine_a'], d['affine_b'] = r[0], r[1]
+            d['affine_res_med'], d['affine_bad_ch'], d['ch'] = r[2], r[3], r[4]
+    except Exception:
+        pass
+    try:
+        if ra.ndim == 4 and ra.shape[1] > 2 and ra.shape[2] > 2 and ra.shape[3] <= 2048:
+            A4, B4 = ra[0], qa[0]
+            H, W = A4.shape[0], A4.shape[1]
+            best = (0, 0, d['cos'])
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    y0, y1 = max(0, dy), min(H, H + dy)
+                    x0, x1 = max(0, dx), min(W, W + dx)
+                    if y1 - y0 < 2 or x1 - x0 < 2:
+                        continue
+                    ca = A4[y0:y1, x0:x1, :].ravel()
+                    cb = B4[y0 - dy:y1 - dy, x0 - dx:x1 - dx, :].ravel()
+                    c = cosine(ca, cb)
+                    if c > best[2]:
+                        best = (dy, dx, c)
+            d['shift'] = [int(best[0]), int(best[1])]
+            d['shift_cos'] = float(best[2])
+    except Exception:
+        pass
+    try:
+        std = float(ra.std())
+        scale = float((qstats or {}).get('scale') or 0.0)
+        if std > 1e-20 and scale > 0:
+            d['step_over_std'] = scale / std
+        flat = qa.ravel()
+        samp = flat[::max(1, flat.size // 200000)]
+        d['uniq_ratio'] = float(np.unique(samp).size) / float(samp.size)
+    except Exception:
+        pass
+    return d
+
+
+def print_diag(tag, name, d):
+    """把 diag_tensor 的结果打印成人能直接判读的一段。"""
+    if not d or 'cos' not in d:
+        print('   [%s] %s —— 诊断不可用（已跳过）' % (tag, name[-56:]))
+        return
+    print('   [%s] %s' % (tag, name[-56:]))
+    if 'pearson' in d:
+        print('        cos=%.6f  Pearson(去均值)=%.6f  差=%+.4f（差大 ⇒ 直流/尺度为主）'
+              % (d['cos'], d['pearson'], d['pearson'] - d['cos']))
+        print('        均值 ref=%+.4f qnt=%+.4f  DC 偏移=%+.4f'
+              % (d['mean_ref'], d['mean_qnt'], d['mean_qnt'] - d['mean_ref']))
+    else:
+        print('        cos=%.6f' % d['cos'])
+    if 'affine_a' in d:
+        print('        逐通道仿射: 中位 a=%+.4f b=%+.4f 残差中位=%.3f 残差>0.5 的通道 %d/%d'
+              % (d['affine_a'], d['affine_b'], d['affine_res_med'],
+                 d['affine_bad_ch'], d['ch']))
+    if 'shift' in d:
+        print('        平移搜索: 把 qnt 平移 (dy,dx)=(%d,%d) 后 cos=%.6f'
+              '（原位 %.6f，提升 %+.4f）'
+              % (d['shift'][0], d['shift'][1], d['shift_cos'], d['cos'],
+                 d['shift_cos'] - d['cos']))
+    if 'step_over_std' in d:
+        print('        量化步长/信号std=%.4f  去重值占比=%.4f'
+              % (d['step_over_std'], d.get('uniq_ratio', float('nan'))))
+
+
 def candidate_names(name):
     """张量名可能被工具链融合成 'A;B;C'（onnx2tf 把 conv+add+relu 拼在一起）。
 
@@ -494,6 +628,9 @@ def main(argv=None):
     ap.add_argument('--stats-rows', type=int, default=12,
                     help='打印前 N 个激活的原始统计（scale/zp/frac_at_zp）')
     ap.add_argument('--top', type=int, default=20)
+    ap.add_argument('--diag-extra', type=int, default=0,
+                    help='对最差 N 与最好 N 个张量各做一次判别诊断'
+                         '（Pearson / 逐通道仿射 / 1px 平移 / 步长比）；0=关闭')
     ap.add_argument('--list-tensors', action='store_true')
     args = ap.parse_args(argv)
 
@@ -630,6 +767,37 @@ def main(argv=None):
               % (r['name'][:46], r['cos'], r['rel_max'],
                  '✗' if r['bad'] else '✓'))
 
+    # 判别诊断：把「cos 低」拆成互斥机制。最差 N 是判决对象，「最好 N」是负控制；
+    # float16 正控制组跑同一段代码 ⇒ 它的读数若不一致，说明诊断器自己有 bug。
+    diag_out = []
+    if args.diag_extra > 0 and rows:
+        k = args.diag_extra
+        picks = [('最差', r) for r in rows[:k]] + [('最好', r) for r in rows[-k:]]
+        print('\n=== 判别诊断（最差 %d + 最好 %d）' % (k, k))
+        for tag, r in picks:
+            name, qname = r['name'], r['quant_name']
+            if name not in ref_t or qname not in qnt_t:
+                continue
+            ra, qa = ref_t[name], qnt_t[qname]
+            if ra.shape != qa.shape:
+                print('   [%s] %s —— 形状不一致，跳过诊断' % (tag, name[-56:]))
+                continue
+            try:
+                ra = np.asarray(ra, dtype=np.float64)
+                qa = np.asarray(qa, dtype=np.float64)
+                m = (np.abs(ra) > 1e30) | (np.abs(qa) > 1e30)
+                if np.count_nonzero(m):
+                    ra, qa = ra[~m], qa[~m]
+                d = diag_tensor(ra, qa, r.get('qnt_stats'))
+            except Exception as e:   # 诊断炸了绝不许影响主结果
+                print('   [%s] %s —— 诊断异常已跳过: %r' % (tag, name[-56:], e))
+                d = {}
+            print_diag(tag, name, d)
+            if d:
+                diag_out.append(dict(d, tag=tag, name=name, quant_name=qname))
+        print('   读数指引: Pearson≫cos ⇒ 直流/尺度为主；最佳平移≠(0,0) 且提升大 ⇒ 空间错位；')
+        print('             逐通道仿射后残差中位仍大 ⇒ 非线性/结构错；步长/std 大 ⇒ 激活量化过粗')
+
     out_scale, out_zp = q_out['quantization']
     print('\n=== 图输出: scale=%.8g zero_point=%d dtype=%s'
           % (out_scale, out_zp, q_out['dtype']))
@@ -648,6 +816,7 @@ def main(argv=None):
                 'low_coverage': low,
                 'cos_min': args.cos_min, 'rel_max_threshold': args.rel_max,
                 'first_bad': first_bad, 'bad_count': bad_n, 'rows': rows,
+                'diag': diag_out,
             }, f, indent=1)
         print('=== json -> %s' % args.json)
 

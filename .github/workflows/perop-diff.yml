@@ -118,18 +118,24 @@ jobs:
           run() {
             tag="$1"
             q="$2"
+            diag="${3:-0}"
+            extra=""
+            [ "$diag" -gt 0 ] && extra="--diag-extra $diag"
             echo "################ $tag ################"
-            python tools/oes/perop_diff.py --ref "$REF" --quant "art/out/$q" --image "$IMG" --json "out/perop_$tag.json" 2>&1 | tee "out/perop_$tag.txt"
+            python tools/oes/perop_diff.py --ref "$REF" --quant "art/out/$q" --image "$IMG" --json "out/perop_$tag.json" $extra 2>&1 | tee "out/perop_$tag.txt"
             e=$?
             echo "EXIT_$tag=$e" >> out/exits.txt
             [ "$e" -eq 0 ] || rc=1
           }
-          run ctrl_float16 baseline_float_concept_split_padsafe_float16.tflite
-          run art13 concept_int8_art13.tflite
+          # 第 3 个参数 = 诊断个数。三组带诊断：
+          #   ctrl_float16 是新诊断的**正控制**（cos≈1、Pearson≈1、平移(0,0)、a≈1 才可信）
+          #   art13 / art14 是判决对象（art14 的 op#8 是当前最差点）
+          run ctrl_float16 baseline_float_concept_split_padsafe_float16.tflite 3
+          run art13 concept_int8_art13.tflite 6
           run int8_fixed concept_int8_fixed.tflite
           run int8_pertensor concept_int8_pertensor.tflite
           # 判决组：只改了 2 个 bias 的数值，其余与 art13 逐字节相同
-          run art14 concept_int8_art14.tflite
+          run art14 concept_int8_art14.tflite 8
           echo "=== exits ==="
           cat out/exits.txt || true
           exit "$rc"
