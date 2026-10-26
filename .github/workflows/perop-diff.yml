@@ -83,7 +83,28 @@ jobs:
           python -m py_compile tools/oes/perop_diff.py
           echo "py_compile OK"
 
-      # 四组对照跑在一个 step 里：任一组失败也要把其余组跑完，
+      # 先造 art14：把 art13 里被量化成 0 的 2 个 bias 按浮点真值重算回来。
+      # 这是对「0.0162 是转换缺陷」这一根因判定的**判决实验**（报告 66 §14–§15）。
+      - name: Build art14 (bias fix)
+        run: |
+          set +e -uo pipefail
+          python -m py_compile tools/oes/fix_zero_bias.py || exit 1
+          python tools/oes/fix_zero_bias.py \
+            --quant art/out/concept_int8_art13.tflite \
+            --float art/out/baseline_float_concept_split_padsafe_float32.tflite \
+            --out art/out/concept_int8_art14.tflite 2>&1 | tee out/fix_bias.txt
+          echo "EXIT_fix_bias=$?" >> out/exits.txt
+          # 正控制（幂等性）：对已经修好的 art14 再跑一次，必须 0 改动
+          python tools/oes/fix_zero_bias.py \
+            --quant art/out/concept_int8_art14.tflite \
+            --float art/out/baseline_float_concept_split_padsafe_float32.tflite \
+            --dry-run 2>&1 | tee out/fix_bias_ctrl.txt
+          echo "EXIT_fix_ctrl=$?" >> out/exits.txt
+          md5sum art/out/concept_int8_art13.tflite art/out/concept_int8_art14.tflite 2>/dev/null | tee out/art_md5.txt
+          cp art/out/concept_int8_art14.tflite out/ 2>/dev/null || true
+          exit 0
+
+      # 五组对照跑在一个 step 里：任一组失败也要把其余组跑完，
       # 否则「第一组红了就啥都没有」。退出码逐组记录，末尾统一裁决。
       - name: perop diff (正控制 + 判决组 + 佐证组)
         run: |
@@ -106,6 +127,8 @@ jobs:
           run art13 concept_int8_art13.tflite
           run int8_fixed concept_int8_fixed.tflite
           run int8_pertensor concept_int8_pertensor.tflite
+          # 判决组：只改了 2 个 bias 的数值，其余与 art13 逐字节相同
+          run art14 concept_int8_art14.tflite
           echo "=== exits ==="
           cat out/exits.txt || true
           exit "$rc"
@@ -137,3 +160,6 @@ jobs:
             out/perop_*.txt
             out/perop_*.json
             out/exits.txt
+            out/fix_bias.txt
+            out/fix_bias_ctrl.txt
+            out/art_md5.txt
