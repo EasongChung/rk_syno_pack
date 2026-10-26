@@ -28,6 +28,8 @@ on:
     paths:
       - tools/oes/perop_diff.py
       - tools/oes/fix_zero_bias.py
+      - tools/oes/fix_grouped_dw.py
+      - tools/pad-to-8.py
       - .github/workflows/perop-diff.yml
 
 permissions:
@@ -105,6 +107,25 @@ jobs:
           cp art/out/concept_int8_art14.tflite out/ 2>/dev/null || true
           exit 0
 
+      # 阶段二模型：造 art15（归正 op#58/153 深度卷积 + 全图卷积通道补齐 8 的倍数）
+      - name: Build art15 (grouped DW fix + pad-to-8)
+        run: |
+          set +e -uo pipefail
+          python -m py_compile tools/oes/fix_grouped_dw.py tools/pad-to-8.py || exit 1
+          # 1. 深度卷积结构归正
+          python tools/oes/fix_grouped_dw.py \
+            art/out/concept_int8_art14.tflite \
+            art/out/concept_int8_art15_dw.tflite 2>&1 | tee out/fix_dw.txt
+          echo "EXIT_fix_dw=$?" >> out/exits.txt
+          # 2. 全网卷积通道对齐 8 的倍数
+          python tools/pad-to-8.py \
+            art/out/concept_int8_art15_dw.tflite \
+            art/out/concept_int8_art15.tflite 2>&1 | tee out/pad_to_8.txt
+          echo "EXIT_pad_to_8=$?" >> out/exits.txt
+          md5sum art/out/concept_int8_art15.tflite 2>/dev/null | tee -a out/art_md5.txt
+          cp art/out/concept_int8_art15.tflite out/ 2>/dev/null || true
+          exit 0
+
       # 五组对照跑在一个 step 里：任一组失败也要把其余组跑完，
       # 否则「第一组红了就啥都没有」。退出码逐组记录，末尾统一裁决。
       - name: perop diff (正控制 + 判决组 + 佐证组)
@@ -136,6 +157,8 @@ jobs:
           run int8_pertensor concept_int8_pertensor.tflite
           # 判决组：只改了 2 个 bias 的数值，其余与 art13 逐字节相同
           run art14 concept_int8_art14.tflite 8
+          # 阶段二模型：DW 归正 + 100% 卷积通道整除 8
+          run art15 concept_int8_art15.tflite 8
           echo "=== exits ==="
           cat out/exits.txt || true
           exit "$rc"
