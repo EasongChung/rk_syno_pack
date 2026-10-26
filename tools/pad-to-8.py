@@ -54,12 +54,17 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
+for p in [os.path.join(REPO_ROOT, "oes-teflon", "tools"), os.path.join(REPO_ROOT, "tools"), HERE]:
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
 import tflite_fold_rank5_to_4d as fold  # noqa: E402
 import importlib.util  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location(
-    "sim_write_core_index", os.path.join(HERE, "sim-write-core-index.py"))
+_sim_file = os.path.join(HERE, "sim-write-core-index.py")
+if not os.path.exists(_sim_file):
+    _sim_file = os.path.join(REPO_ROOT, "oes-teflon", "tools", "sim-write-core-index.py")
+_spec = importlib.util.spec_from_file_location("sim_write_core_index", _sim_file)
 sim = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sim)
 

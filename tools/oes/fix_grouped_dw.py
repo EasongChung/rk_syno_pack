@@ -21,7 +21,10 @@ import sys
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, ".."))
+REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+for p in [os.path.join(REPO_ROOT, "oes-teflon", "tools"), os.path.join(REPO_ROOT, "tools"), HERE]:
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
 import tflite_fold_rank5_to_4d as fold
 
 def fix_model(src_path, dst_path):
