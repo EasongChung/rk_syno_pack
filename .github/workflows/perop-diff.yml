@@ -27,6 +27,7 @@ on:
   push:
     paths:
       - tools/oes/perop_diff.py
+      - tools/oes/fix_zero_bias.py
       - .github/workflows/perop-diff.yml
 
 permissions:
