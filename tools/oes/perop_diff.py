@@ -247,12 +247,29 @@ def compare(ref, qnt, names, cos_min, rel_max):
             continue
         qname, _ = m
         ra, qa = ref[name], qnt[qname]
-        c = cosine(ra, qa)
-        denom = float(np.max(np.abs(ra))) + 1e-12
-        rel = float(np.max(np.abs(ra - qa))) / denom
+
+        # 哨兵剔除（2026-10-26 实测必要性）：
+        # 这个模型的部分张量带有未初始化的 ±FLT_MAX 哨兵（float16 里是 ±65504）。
+        # 一个 3.4e38 的元素就能把 cos 压成 0、把 rel 撑成 1.0，
+        # 从而把「两边其实完全一致」误判成「全崩」——正控制组就踩了这个坑。
+        # 规则：|值| > 1e30 的元素在两侧同时剔除，并记录被剔除个数。
+        triple = np.abs(ra) > 1e30
+        if qa.size == ra.size:
+            triple = triple | (np.abs(qa.reshape(ra.shape)) > 1e30)
+        masked = int(np.count_nonzero(triple))
+        if masked:
+            keep = ~triple
+            ra_c, qa_c = ra[keep], qa.reshape(ra.shape)[keep]
+        else:
+            ra_c, qa_c = ra, qa
+
+        c = cosine(ra_c, qa_c)
+        denom = float(np.max(np.abs(ra_c))) + 1e-12 if ra_c.size else 1e-12
+        rel = float(np.max(np.abs(ra_c - qa_c))) / denom if ra_c.size else 0.0
         bad = (c < cos_min) or (rel > rel_max)
         rows.append({'name': name, 'quant_name': qname, 'cos': c,
-                     'rel_max': rel, 'bad': bad, 'shape': list(ra.shape)})
+                     'rel_max': rel, 'bad': bad, 'masked': masked,
+                     'shape': list(ra.shape)})
         if bad and first_bad is None:
             first_bad = rows[-1]
     rows.sort(key=lambda r: (not r['bad'], r['cos'], -r['rel_max']))
@@ -355,13 +372,13 @@ def main(argv=None):
         print('\n=== 无失配：全部 %d 个激活张量都在阈值内' % len(rows))
 
     by_name = {r['name']: r for r in rows}
-    print('\n=== 前 12 个可比激活（按 ref 激活顺序，看从第几步开始崩）')
-    for name in matched_names[:12]:
+    print('\n=== 前 20 个可比激活（按 ref 激活顺序，看从第几步开始崩）')
+    for name in matched_names[:20]:
         rr = by_name.get(name)
         if rr is None:
             continue
-        print('   %-46s cos=%-10.6f rel=%-8.4f %s'
-              % (name[:46], rr['cos'], rr['rel_max'],
+        print('   %-44s cos=%-10.6f rel=%-8.4f masked=%-4d %s'
+              % (name[:44], rr['cos'], rr['rel_max'], rr.get('masked', 0),
                  '✗' if rr['bad'] else '✓'))
 
     print('\n=== 最差 %d 个激活张量（✗ = 超阈值 cos<%.4f 或 rel>%.3f）'
