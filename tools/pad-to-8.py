@@ -256,17 +256,26 @@ def build_track(mdl, ops, T):
             in_info = tr.info.get(op["inputs"][0])
             if in_info and beg and end:
                 ax, cnt, tgt = in_info
-                nb, ne = list(beg), list(end)
-                if ax is not None and ax < len(nb):
-                    ne[ax] = min(ne[ax], cnt) if cnt else ne[ax]
-                    nb[ax] = min(nb[ax], cnt) if cnt else nb[ax]
                 ocnt = (end[ax] - beg[ax]) if (ax is not None and ax < len(end)) else cnt
-                half = tgt // 2 if tgt else ocnt
-                for o in outs:
-                    tr.info[o] = (ax, ocnt, half)
-                if nb != list(beg) or ne != list(end):
-                    tr.rewrites.append((op["inputs"][1], list(beg), nb, "STRIDED_SLICE begin 常量"))
-                    tr.rewrites.append((op["inputs"][2], list(end), ne, "STRIDED_SLICE end 常量"))
+                nb, ne = list(beg), list(end)
+                if ax is not None and ax < len(nb) and tgt and cnt and tgt != cnt:
+                    half = tgt // 2
+                    if beg[ax] == 0:
+                        nb[ax] = 0
+                        ne[ax] = half
+                    else:
+                        nb[ax] = half
+                        ne[ax] = tgt
+                    for o in outs:
+                        tr.info[o] = (ax, ocnt, half)
+                    if nb != list(beg):
+                        tr.rewrites.append((op["inputs"][1], list(beg), nb, "STRIDED_SLICE begin 常量"))
+                    if ne != list(end):
+                        tr.rewrites.append((op["inputs"][2], list(end), ne, "STRIDED_SLICE end 常量"))
+                else:
+                    ocnt = (end[ax] - beg[ax]) if (ax is not None and ax < len(end)) else cnt
+                    for o in outs:
+                        tr.info[o] = (ax, ocnt, ocnt)
 
         elif b == 39 and outs and len(op["inputs"]) > 1:   # TRANSPOSE
             perm = const_i32(mdl, op["inputs"][1])
