@@ -191,11 +191,17 @@ def parse_graph(model_path):
         except Exception:
             op_types[i] = OPCODE_FALLBACK.get(code, 'OP_%d' % code)
 
+    def tshape(n):
+        t = sub.Tensors(n)
+        return tuple(t.Shape(j) for j in range(t.ShapeLength()))
+
     seq, activations = [], []
     for i in range(sub.OperatorsLength()):
         op = sub.Operators(i)
         outs = [names[op.Outputs(j)] for j in range(op.OutputsLength())]
-        seq.append((i, op_types.get(op.OpcodeIndex(), '?'), outs))
+        ins = [names[op.Inputs(j)] for j in range(op.InputsLength())]
+        seq.append((i, op_types.get(op.OpcodeIndex(), '?'), outs, ins,
+                    [tshape(op.Outputs(j)) for j in range(op.OutputsLength())]))
         activations.extend(outs)
     # 去重但保序
     seen, act = set(), []
@@ -253,58 +259,178 @@ def match_best(name, ref_t, qnt_t):
     return best
 
 
-def align(ref_act, qnt_act, ref_t, qnt_t, min_agree=0.95):
-    """给两份图的激活张量配对：优先逐位置对齐，但必须先通过锚点复核。
+def _op_family(op_type):
+    """把 PAD / PADV2 归一成同一族：padsafe 重写会把 PadV2 改成 Pad，
+    语义等价，不该因为 opcode 不同就配不上。"""
+    return 'PAD' if op_type in ('PAD', 'PADV2') else op_type
 
-    ## 为什么要位置对齐
 
-    同一张 ONNX 经同一套转换得到的两份模型，**算子顺序相同、激活数相同**
-    （实测都是 201）。但工具链给融合算子的自动编号不同：
-        ref 侧  model_32/tf.nn.relu/Relu;...;convolution
-        int8 侧 model_32/tf.nn.relu_2/Relu;...;convolution_2
-    按名字只能配上 143/201，剩下的 58 个恰好是「最后良好点」与「第一个崩溃点」
-    之间的那批 —— 也就是最要紧的那批。
+def align_struct(ref_seq, qnt_seq, ref_act, qnt_act):
+    """结构对齐：按「算子类型 + 输出形状 + 已匹配的输入」推进。
 
-    ## 为什么不能盲信位置对齐
+    ## 为什么不能用逐位置对齐（本轮踩到的坑，必须写下来）
 
-    一旦错位，就会凭空造出「假首失配」，比不测更糟。
-    所以先拿**同名张量当锚点**，统计它们在两侧的相对位置是否一致：
-      · 一致率 >= min_agree 且两侧激活数相同  -> 启用位置对齐（覆盖 100%）
-      · 否则                                  -> 回退按名匹配，并把原因打出来
+    逐位置对齐在 art13 上**通过了**我上一版的所有校验（143 个锚点一致率 100%、
+    offset=+0、两侧激活数都是 201），但结果里仍有 2 行形状对不上：
+        ref   [1, 99, 99, 122]  conv_1（stride 1 分支）
+        quant [1, 50, 50, 122]  conv_2（stride 2 分支）
+    原因是这两条并行分支在两张图里**发出顺序相反**。交换不改变下标，
+    所以「锚点一致率」这类只统计相对偏移的校验**结构上就看不见它**；
+    我上一版加的「同名锚点形状一致」自检更是空转（比的是同一个名字，
+    两边必然一致）。那两行 cos=0.000000 就是由此产生的假失配。
 
-    返回 (pairs, info)，pairs = [(ref_name, qnt_name), ...]。
+    ⇒ 判据：位置对齐只能证明「没有整体平移」，不能证明「没有交换」。
+
+    ## 本版做法
+
+    在两张图上同时推进拓扑序，给 ref 的每个算子找那个
+      · 算子类型相同（PAD/PADV2 归一）
+      · 输出形状序列完全相同
+      · 所有**激活输入**都已匹配到 qnt 侧对应张量
+    的 qnt 算子；唯一候选才接受，多个候选留到下一轮（等更多输入被匹配）。
+
+    独立校验：若某个 ref 张量名在 qnt 图里**也存在**，却被配到了别的张量，
+    记 conflict。conflict 必须为 0，否则对齐不可信。
+
+    返回 (pairs, info)。
     """
-    info = {'anchors': 0, 'agree': 0.0, 'mode': 'name', 'reason': ''}
+    info = {'mode': 'none', 'reason': '', 'pairs': 0, 'conflict': 0,
+            'name_agree': 0, 'op_matched': 0, 'op_total': 0, 'conflict_sample': [],
+            'by_order': 0}
+    if not ref_seq or not qnt_seq:
+        info['reason'] = '算子表不可用'
+        return [], info
 
-    qidx = {n: i for i, n in enumerate(qnt_act)}
-    anchors = [(i, qidx[n]) for i, n in enumerate(ref_act) if n in qidx]
-    info['anchors'] = len(anchors)
+    ref_act_set = set(ref_act)
+    qnt_act_set = set(qnt_act)
 
-    agree, offset = 0.0, None
-    if len(anchors) >= 20:
-        deltas = [j - i for i, j in anchors]
-        offset = max(set(deltas), key=deltas.count)
-        agree = deltas.count(offset) / float(len(deltas))
-    info['agree'] = agree
+    def sig(op):
+        return (_op_family(op[1]), tuple(op[4]))
 
-    if agree >= min_agree and len(ref_act) == len(qnt_act):
-        info['mode'] = 'position'
-        info['reason'] = ('锚点 %d 个，一致率 %.1f%%，offset=%+d，两侧激活数相同(%d)'
-                          % (len(anchors), agree * 100, offset, len(ref_act)))
-        return [(ref_act[i], qnt_act[i]) for i in range(len(ref_act))], info
+    by_sig = {}
+    for q in qnt_seq:
+        by_sig.setdefault(sig(q), []).append(q)
 
-    info['reason'] = ('锚点 %d 个，一致率 %.1f%%（阈值 %.0f%%），激活数 %d vs %d'
-                      % (len(anchors), agree * 100, min_agree * 100,
-                         len(ref_act), len(qnt_act)))
+    tmap, used, op_map = {}, set(), {}
+
+    # 种子：两张图的第一个算子都读模型输入（形状相同），直接配
+    r0, q0 = ref_seq[0], qnt_seq[0]
+    if sig(r0) == sig(q0) and len(r0[3]) == len(q0[3]):
+        for a, b in zip(r0[2], q0[2]):
+            tmap[a] = b
+        used.add(q0[0])
+        op_map[r0[0]] = q0[0]
+
+    for _ in range(80):
+        progress = False
+        for r in ref_seq:
+            if r[0] in op_map:
+                continue
+            # 只比**激活输入**子序列：常量输入的个数本来就会变
+            # （padsafe 把 PadV2(3 输入) 改写成 Pad(2 输入)，
+            #   卷积有无 bias 也是 3/2 之别），按位置逐一对齐会把这些
+            #   合法的元数差异当成「不是同一个算子」，实测把覆盖卡死在 2%。
+            r_ins = [n for n in r[3] if n in ref_act_set]
+            ok = []
+            for q in by_sig.get(sig(r), []):
+                if q[0] in used:
+                    continue
+                q_ins = [n for n in q[3] if n in qnt_act_set]
+                if len(q_ins) != len(r_ins):
+                    continue
+                if any(tmap.get(a) != b for a, b in zip(r_ins, q_ins)):
+                    continue
+                ok.append(q)
+            if len(ok) == 1:
+                q = ok[0]
+                for a, b in zip(r[2], q[2]):
+                    tmap[a] = b
+                used.add(q[0])
+                op_map[r[0]] = q[0]
+                progress = True
+
+        if not progress:
+            # 第二层：**同签名组内按发出顺序配**。
+            # 到这一步剩下的都是「真歧义」—— 例如 6 个完全同形状的
+            # STRIDED_SLICE 且输入是同一个张量，局部信息永远分不开。
+            # 组内顺序配对是确定性的（不用数据、不看 cos），
+            # 但它是一种**假设**，所以单独计数并在日志里披露。
+            groups = {}
+            for r in ref_seq:
+                if r[0] in op_map:
+                    continue
+                groups.setdefault(sig(r), []).append(r)
+            for s, rs in groups.items():
+                free = [q for q in by_sig.get(s, []) if q[0] not in used]
+                if len(free) != len(rs):
+                    continue
+                for r, q in zip(rs, free):
+                    r_ins = [n for n in r[3] if n in ref_act_set]
+                    q_ins = [n for n in q[3] if n in qnt_act_set]
+                    if len(r_ins) != len(q_ins):
+                        continue
+                    if any(tmap.get(a) != b for a, b in zip(r_ins, q_ins)):
+                        continue
+                    for a, b in zip(r[2], q[2]):
+                        tmap[a] = b
+                    used.add(q[0])
+                    op_map[r[0]] = q[0]
+                    info['by_order'] += 1
+                    progress = True
+
+        if not progress:
+            break
+
+    qnt_by_idx = {q[0]: q for q in qnt_seq}
     pairs = []
-    for n in ref_act:
-        m = match_best(n, ref_t, qnt_t)
-        if m is not None:
-            pairs.append((n, m[0]))
+    for r in ref_seq:
+        q = qnt_by_idx.get(op_map.get(r[0]))
+        if q is None:
+            continue
+        for a, b in zip(r[2], q[2]):
+            pairs.append((a, b))
+
+    conflict = [p for p in pairs if p[0] in qnt_act_set and p[0] != p[1]]
+    info.update({
+        'mode': 'struct',
+        'pairs': len(pairs),
+        'conflict': len(conflict),
+        'conflict_sample': [c[0] for c in conflict[:5]],
+        'name_agree': sum(1 for p in pairs if p[0] == p[1]),
+        'op_matched': len(op_map),
+        'op_total': len(ref_seq),
+    })
+    info['reason'] = ('结构对齐 %d/%d 算子；配对 %d 个激活；同名一致 %d；'
+                      '组内顺序配 %d（假设项）；'
+                      '★ 同名冲突 %d（必须为 0，否则对齐不可信）'
+                      % (len(op_map), len(ref_seq), len(pairs),
+                         info['name_agree'], info['by_order'], len(conflict)))
     return pairs, info
 
 
-def compare(ref, qnt, pairs, cos_min, rel_max):
+def align(ref_act, qnt_act, ref_t, qnt_t, ref_seq=None, qnt_seq=None,
+          min_cover=0.90):
+    """对齐入口：结构对齐优先；不达标则回退按名匹配（并说明原因）。"""
+    pairs, sinfo = align_struct(ref_seq, qnt_seq, ref_act, qnt_act)
+    cover = len(pairs) / float(len(ref_act)) if ref_act else 0.0
+    sinfo['cover'] = cover
+    if sinfo['mode'] == 'struct' and sinfo['conflict'] == 0 and cover >= min_cover:
+        return pairs, sinfo
+
+    why = ('结构对齐不达标（同名冲突 %d，覆盖 %.1f%% < %.0f%%）⇒ 回退按名匹配'
+           % (sinfo['conflict'], cover * 100, min_cover * 100))
+    fb = []
+    for n in ref_act:
+        m = match_best(n, ref_t, qnt_t)
+        if m is not None:
+            fb.append((n, m[0]))
+    return fb, {'mode': 'name', 'reason': why, 'struct': sinfo,
+                'pairs': len(fb), 'conflict': sinfo['conflict'],
+                'cover': len(fb) / float(len(ref_act)) if ref_act else 0.0}
+
+
+def compare(ref, qnt, pairs, cos_min, rel_max, ref_st=None, qnt_st=None):
+    ref_st, qnt_st = ref_st or {}, qnt_st or {}
     rows, first_bad = [], None
     for name, qname in pairs:
         if name not in ref or qname not in qnt:
@@ -316,7 +442,9 @@ def compare(ref, qnt, pairs, cos_min, rel_max):
         if ra.shape != qa.shape:
             rows.append({'name': name, 'quant_name': qname, 'cos': 0.0,
                          'rel_max': 1.0, 'bad': True, 'masked': 0,
-                         'shape_mismatch': True, 'shape': list(ra.shape)})
+                         'shape_mismatch': True, 'shape': list(ra.shape),
+                         'ref_stats': ref_st.get(name),
+                         'qnt_stats': qnt_st.get(qname)})
             if first_bad is None:
                 first_bad = rows[-1]
             continue
@@ -342,7 +470,9 @@ def compare(ref, qnt, pairs, cos_min, rel_max):
         bad = (c < cos_min) or (rel > rel_max)
         rows.append({'name': name, 'quant_name': qname, 'cos': c,
                      'rel_max': rel, 'bad': bad, 'masked': masked,
-                     'shape': list(ra.shape)})
+                     'shape': list(ra.shape),
+                     'ref_stats': ref_st.get(name),
+                     'qnt_stats': qnt_st.get(qname)})
         if bad and first_bad is None:
             first_bad = rows[-1]
     rows.sort(key=lambda r: (not r['bad'], r['cos'], -r['rel_max']))
@@ -359,8 +489,10 @@ def main(argv=None):
     ap.add_argument('--rel-max', type=float, default=0.05)
     ap.add_argument('--min-match', type=float, default=0.80,
                     help='激活配对率下限，低于此值以退出码 3 告警')
-    ap.add_argument('--min-anchor-agree', type=float, default=0.95,
-                    help='启用逐位置对齐所需的锚点一致率下限')
+    ap.add_argument('--min-cover', type=float, default=0.90,
+                    help='结构对齐覆盖率达到此值才采用，否则回退按名匹配')
+    ap.add_argument('--stats-rows', type=int, default=12,
+                    help='打印前 N 个激活的原始统计（scale/zp/frac_at_zp）')
     ap.add_argument('--top', type=int, default=20)
     ap.add_argument('--list-tensors', action='store_true')
     args = ap.parse_args(argv)
@@ -375,8 +507,9 @@ def main(argv=None):
         if seq is None:
             print('schema 绑定不可用，无法解析', file=sys.stderr)
             return 2
-        for i, ty, outs in seq:
-            print('op#%-4d %-24s -> %s' % (i, ty, ', '.join(outs) or '(none)'))
+        for i, ty, outs, ins, shp in seq:
+            print('op#%-4d %-16s %-18s -> %s'
+                  % (i, ty, str(shp)[:18], ', '.join(outs)[-60:] or '(none)'))
         print('--- 激活张量 %d 个 ---' % len(act))
         return 0
 
@@ -391,7 +524,7 @@ def main(argv=None):
 
     ref_t, ref_st, ref_in, _ = run_model(args.ref, args.image)
     qnt_t, qnt_st, qnt_in, q_out = run_model(args.quant, args.image)
-    _, ref_act = parse_graph(args.ref)
+    ref_seq, ref_act = parse_graph(args.ref)
 
     # 输入口径必须先对齐，否则后面所有比较都是错的（两个模型期望的
     # 归一化不同是最常见的坑：一边要 [-1,1]，一边要 [0,1]）。
@@ -410,23 +543,23 @@ def main(argv=None):
           % (len(ref_t), len(qnt_t), len(ref_act), len(qnt_act)))
 
     pairs, ainfo = align(ref_act, qnt_act, ref_t, qnt_t,
-                         min_agree=args.min_anchor_agree)
+                         ref_seq=ref_seq, qnt_seq=qnt_seq,
+                         min_cover=args.min_cover)
     rate = len(pairs) / float(len(ref_act)) if ref_act else 0.0
     low = rate < args.min_match
     print('=== 对齐方式: %s（%s）' % (ainfo['mode'], ainfo['reason']))
     print('=== 激活覆盖率: %d/%d = %.1f%%'
           % (len(pairs), len(ref_act), rate * 100))
 
-    if ainfo['mode'] == 'position':
-        # 交叉验证：位置对齐下，那批同名锚点必须仍然存在且形状一致。
-        # 这一步是防止「位置对齐看起来成功、其实整体错了一位」。
-        bad_anchor = 0
-        for rn, qn in pairs:
-            if rn != qn:
-                continue
-            if rn in ref_t and rn in qnt_t and ref_t[rn].shape != qnt_t[rn].shape:
-                bad_anchor += 1
-        print('=== 位置对齐自检: 同名锚点形状不一致 %d 个（应为 0）' % bad_anchor)
+    mism = [p for p in pairs
+            if p[0] in ref_t and p[1] in qnt_t
+            and ref_t[p[0]].shape != qnt_t[p[1]].shape]
+    print('=== 对齐自检: 配上的张量里形状不一致 %d 个（应为 0；'
+          '上一版逐位置对齐在这里漏了 2 个）' % len(mism))
+    if mism:
+        for a, b in mism[:5]:
+            print('    ! %s  ref%s vs quant%s'
+                  % (a[-40:], list(ref_t[a].shape), list(qnt_t[b].shape)))
 
     if low:
         # 关键：**不因为覆盖率低就提前退出**。
@@ -437,14 +570,16 @@ def main(argv=None):
         miss = [n for n in ref_act if n not in dict(pairs)][:10]
         print('!! 未配对样例: %s' % miss, file=sys.stderr)
 
-    rows, first_bad = compare(ref_t, qnt_t, pairs, args.cos_min, args.rel_max)
+    rows, first_bad = compare(ref_t, qnt_t, pairs, args.cos_min, args.rel_max,
+                              ref_st=ref_st, qnt_st=qnt_st)
 
     owner = {}
-    for i, ty, outs in (qnt_seq or []):
+    for i, ty, outs, _ins, _shp in (qnt_seq or []):
         for o in outs:
             owner.setdefault(o, (i, ty))
     if first_bad:
-        i, ty = owner.get(first_bad['name'], (-1, '?'))
+        # 必须按**量化侧**张量名查生产者：ref 侧名字在 qnt 图里不存在。
+        i, ty = owner.get(first_bad['quant_name'], (-1, '?'))
         print('\n=== 首个失配: op#%d %s -> %s' % (i, ty, first_bad['name']))
         print('    cos=%.6f  rel_max=%.4f  shape=%s'
               % (first_bad['cos'], first_bad['rel_max'], first_bad['shape']))
@@ -466,6 +601,26 @@ def main(argv=None):
         print('   %-44s cos=%-10.6f rel=%-8.4f masked=%-4d %s'
               % (name[:44], rr['cos'], rr['rel_max'], rr.get('masked', 0),
                  '✗' if rr['bad'] else '✓'))
+
+    # 这一段是判「塌零」还是「量化精度」的直接证据：
+    #   frac_at_zp ≈ 1.0  -> 整片塌成 0（requant 乘数≈0 / scale 过大）
+    #   scale 比邻居大一个量级 -> 标定区间被离群值撑开
+    #   两边 min/max 都正常而 cos 低 -> 值域没错，是**内容**算错了
+    print('\n=== 前 %d 个激活的原始统计（ref 激活顺序）' % args.stats_rows)
+    for name, qname in pairs[:args.stats_rows]:
+        rr = by_name.get(name)
+        if rr is None:
+            continue
+        rs = rr.get('ref_stats') or {}
+        qs = rr.get('qnt_stats') or {}
+        print('   op#%-3s %-40s cos=%.6f %s'
+              % ('?', name[-40:], rr['cos'], '✗' if rr['bad'] else '✓'))
+        print('      ref: min=%11.5f max=%11.5f' % (rs.get('raw_min', 0.0),
+                                                    rs.get('raw_max', 0.0)))
+        print('      qnt: scale=%-12.7g zp=%-5d min=%-6.0f max=%-6.0f at_zp=%.4f'
+              % (qs.get('scale', 0.0), qs.get('zp', 0),
+                 qs.get('raw_min', 0.0), qs.get('raw_max', 0.0),
+                 qs.get('frac_at_zp', float('nan'))))
 
     print('\n=== 最差 %d 个激活张量（✗ = 超阈值 cos<%.4f 或 rel>%.3f）'
           % (args.top, args.cos_min, args.rel_max))
