@@ -109,7 +109,7 @@ def run_model(model_path, image_path):
     interp.set_tensor(in_det['index'], x)
     interp.invoke()
 
-    tensors = {}
+    tensors, stats = {}, {}
     for det in interp.get_tensor_details():
         idx, name = int(det['index']), det['name']
         try:
@@ -119,13 +119,27 @@ def run_model(model_path, image_path):
         arr = np.asarray(arr)
         scale, zero_point = det['quantization']
 
+        stats[name] = {
+            'dtype': str(arr.dtype),
+            'scale': float(scale) if scale is not None else 0.0,
+            'zp': int(zero_point) if zero_point is not None else 0,
+            'raw_min': float(np.min(arr)) if arr.size else 0.0,
+            'raw_max': float(np.max(arr)) if arr.size else 0.0,
+        }
+        if arr.dtype in (np.int8, np.uint8) and zero_point is not None:
+            # frac_at_zp：等于 zero_point 的元素占比。
+            # 若某张量 frac_at_zp ≈ 1.0，说明它**整片塌成 0** —— 这是判断
+            # 「requant 乘数≈0 / scale 过大」最直接的一个数。
+            stats[name]['frac_at_zp'] = float(
+                np.mean(arr == int(zero_point))) if arr.size else 0.0
+
         if arr.dtype in (np.int8, np.uint8) and scale and scale > 0:
             arr = (arr.astype(np.float32) - float(zero_point)) * float(scale)
         elif arr.dtype == np.float16:
             arr = arr.astype(np.float32)
         tensors[name] = arr
 
-    return tensors, in_det, out_det
+    return tensors, stats, in_det, out_det
 
 
 def parse_graph(model_path):
@@ -283,9 +297,16 @@ def main(argv=None):
     print('=== quant : %s' % args.quant)
     print('=== image : %s' % args.image)
 
-    ref_t, _, _ = run_model(args.ref, args.image)
-    qnt_t, _, q_out = run_model(args.quant, args.image)
+    ref_t, ref_st, ref_in, _ = run_model(args.ref, args.image)
+    qnt_t, qnt_st, qnt_in, q_out = run_model(args.quant, args.image)
     _, ref_act = parse_graph(args.ref)
+
+    # 输入口径必须先对齐，否则后面所有比较都是错的（两个模型期望的
+    # 归一化不同是最常见的坑：一边要 [-1,1]，一边要 [0,1]）。
+    print('=== 输入: ref dtype=%s shape=%s quant=%s'
+          % (ref_in['dtype'], list(ref_in['shape']), ref_in['quantization']))
+    print('=== 输入: qnt dtype=%s shape=%s quant=%s'
+          % (qnt_in['dtype'], list(qnt_in['shape']), qnt_in['quantization']))
     qnt_seq, qnt_act = parse_graph(args.quant)
 
     if ref_act is None or qnt_act is None:
@@ -324,8 +345,24 @@ def main(argv=None):
         print('\n=== 首个失配: op#%d %s -> %s' % (i, ty, first_bad['name']))
         print('    cos=%.6f  rel_max=%.4f  shape=%s'
               % (first_bad['cos'], first_bad['rel_max'], first_bad['shape']))
+        rn, qn = first_bad['name'], first_bad['quant_name']
+        print('    ref   统计: %s' % ref_st.get(rn))
+        print('    quant 统计: %s' % qnt_st.get(qn))
+        if qnt_st.get(qn, {}).get('frac_at_zp', 0) > 0.999:
+            print('    ★ quant 侧 frac_at_zp≈1.0 ⇒ 该张量整片塌成 0，'
+                  '不是精度损失，是 requant 乘数≈0 / scale 过大')
     else:
         print('\n=== 无失配：全部 %d 个激活张量都在阈值内' % len(rows))
+
+    by_name = {r['name']: r for r in rows}
+    print('\n=== 前 12 个可比激活（按 ref 激活顺序，看从第几步开始崩）')
+    for name in matched_names[:12]:
+        rr = by_name.get(name)
+        if rr is None:
+            continue
+        print('   %-46s cos=%-10.6f rel=%-8.4f %s'
+              % (name[:46], rr['cos'], rr['rel_max'],
+                 '✗' if rr['bad'] else '✓'))
 
     print('\n=== 最差 %d 个激活张量（✗ = 超阈值 cos<%.4f 或 rel>%.3f）'
           % (args.top, args.cos_min, args.rel_max))
