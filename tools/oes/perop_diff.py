@@ -234,14 +234,20 @@ def main(argv=None):
     print('=== tensors: ref=%d quant=%d' % (len(ref_t), len(qnt_t)))
 
     matched = sum(1 for n in qnt_t if n in ref_t)
-    rate = matched / float(len(qnt_t)) if qnt_t else 0.0
-    print('=== 配对率: %d/%d = %.1f%%' % (matched, len(qnt_t), rate * 100))
+
+    # 配对率的分母必须是**参照模型的张量数**，不是量化模型的。
+    # 反例（2026-10-26 实测）：正控制 float32 vs float16 时
+    #   ref=339 / quant=454 —— float16 模型多了 115 个 Dequantize 附加张量，
+    # 用 len(quant) 做分母会算出 74.4% 的假告警，而真实配对是 338/339 = 99.7%。
+    rate = matched / float(len(ref_t)) if ref_t else 0.0
+    print('=== 配对率: %d/%d = %.1f%%（分母=参照模型张量数；量化模型多出的附加张量不计）'
+          % (matched, len(ref_t), rate * 100))
 
     if rate < args.min_match:
         print('!! 配对率低于 %.0f%% ⇒ 结论不可信（张量命名不一致）'
               % (args.min_match * 100), file=sys.stderr)
-        miss = [n for n in list(qnt_t)[:10] if n not in ref_t]
-        print('!! 未配对样例: %s' % miss, file=sys.stderr)
+        miss = [n for n in ref_t if n not in qnt_t][:10]
+        print('!! 参照侧未配对样例: %s' % miss, file=sys.stderr)
         return 3
 
     rows, first_bad = compare(ref_t, qnt_t, args.cos_min, args.rel_max, args.top)

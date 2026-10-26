@@ -81,7 +81,9 @@ jobs:
       # 否则「第一组红了就啥都没有」。退出码逐组记录，末尾统一裁决。
       - name: perop diff (正控制 + 判决组 + 佐证组)
         run: |
-          set -uo pipefail
+          # GitHub 的 run 块默认用 `bash -e`，一旦某组非零退出整步立即中断
+          # （上一轮就因此只跑了正控制组）。这里显式关掉 -e，改由 rc 汇总裁决。
+          set +e -uo pipefail
           REF=art/out/baseline_float_concept_split_padsafe_float32.tflite
           IMG=eval/oes-eval-0000.jpg
           rc=0
