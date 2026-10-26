@@ -60,6 +60,19 @@ def fix_model(src_path, dst_path):
                 print(f"  发现结构性伪装深度卷积: op#{i} in={in_sh} weight={wsh} -> 修复为 DEPTHWISE_CONV_2D")
                 op["opcode_index"] = dw_code_idx
                 wt["shape"] = [1, kh, kw, c]
+                # 选项结构更正为 DepthwiseConv2DOptions
+                conv_opts = op.get("opts") or {}
+                op["opts_type"] = 2 # 2 = DepthwiseConv2DOptions
+                op["opts"] = {
+                    "__type__": "DepthwiseConv2DOptions",
+                    "Padding": conv_opts.get("Padding", 1),
+                    "StrideW": conv_opts.get("StrideW", 2),
+                    "StrideH": conv_opts.get("StrideH", 2),
+                    "DepthMultiplier": 1,
+                    "FusedActivationFunction": conv_opts.get("FusedActivationFunction", 0),
+                    "DilationWFactor": conv_opts.get("DilationWFactor", 1),
+                    "DilationHFactor": conv_opts.get("DilationHFactor", 1),
+                }
                 # 字节物理转置
                 b_idx = wt["buffer"]
                 raw_w = mdl["buffers"][b_idx]["data"]
