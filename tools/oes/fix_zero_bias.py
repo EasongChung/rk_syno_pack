@@ -160,11 +160,21 @@ def main(argv=None):
         seq, act, seen = [], [], set()
         for i in range(g.OperatorsLength()):
             op = g.Operators(i)
-            outs = [names[op.Outputs(j)] for j in range(op.OutputsLength())]
-            ins = [names[op.Inputs(j)] for j in range(op.InputsLength())]
+            # ★ 必须挡住 -1：TFLite 用 -1 表示「可选输入/输出缺省」。
+            # 第一版直接 names[op.Inputs(j)]，-1 会取到**最后一个**张量名
+            # （Python 负索引），把激活输入子序列搞乱 ⇒ 结构对齐覆盖 0%，
+            # 被工具自己的护栏拒掉（CI run 40283888816 实测）。
+            outs = [names[op.Outputs(j)] if op.Outputs(j) >= 0 else ''
+                    for j in range(op.OutputsLength())]
+            ins = [names[op.Inputs(j)] if op.Inputs(j) >= 0 else ''
+                   for j in range(op.InputsLength())]
             shp = []
             for j in range(op.OutputsLength()):
-                t = g.Tensors(op.Outputs(j))
+                oi = op.Outputs(j)
+                if oi < 0:
+                    shp.append(())
+                    continue
+                t = g.Tensors(oi)
                 shp.append(tuple(t.Shape(k) for k in range(t.ShapeLength())))
             seq.append((i, _builtin_name(fb, model, op.OpcodeIndex()), outs, ins, shp))
             for o in outs:
@@ -177,7 +187,9 @@ def main(argv=None):
     qseq, qact = seq_of(qm, qg)
     pairs, info = P.align_struct(fseq, qseq, fact, qact)
     print('=== 对齐: %s' % info['reason'])
-    cover = info.get('cover', 0.0)
+    # cover 必须自己算：align_struct 不带这个字段（那是 align() 的返回值），
+    # 直接取 info['cover'] 会恒为 0 而被护栏误拒（本地实测踩到）。
+    cover = len(pairs) / float(len(fact)) if fact else 0.0
     if info['conflict'] != 0 or cover < 0.9:
         print('!! 对齐不可信（同名冲突 %d，覆盖 %.1f%% < 90%%）⇒ 拒绝动手'
               % (info['conflict'], cover * 100), file=sys.stderr)
