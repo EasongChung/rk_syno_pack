@@ -1,0 +1,131 @@
+name: perop-diff (int8 首失配定位)
+
+# 独立轻任务：**不转换、不量化、不碰设备**。
+#
+# ## 它回答哪个问题
+# 报告 65 发现 int8 产物在**输出端**与浮点参照差 2.7 倍，但只比输出无法判定
+# 这是「量化本身的精度损失」还是「转换链路缺陷」。本 workflow 把两份模型都跑
+# 同一张图，取出全部中间张量按名字配对，逐算子比 cos，钉出**第一个失配点**：
+#   · 一步跳变  -> 转换缺陷（可修）
+#   · 一路缓降  -> 量化精度（要么改方案，要么放弃 per-tensor）
+#
+# ## 输入来源
+# 直接复用 run 39695215955 的 artifact "oes-int8-cleaned"（含 float32/float16
+# baseline 与全部 int8 产物）=> 不重跑昂贵的 TF 转换，也不重新量化。
+#
+# ## 关于图片
+# 用 fetch_photos.py 取 picsum 的 oes-eval-0000（seed 确定，与当时导出口径同一张）。
+# 注意：这**不是**本仓 verify/evidence 里那 30 张评测图 —— 评测图不上云（铁律 1）。
+#
+# ## 对照组设计（探针必须先自证有效）
+#   正控制 float32 vs float16  -> 应 cos = 1.0、零失配（证明工具本身有效）
+#   判决组 float32 vs art13    -> 判决对象
+#   佐证组 float32 vs fixed / pertensor -> 另两条路线的失配点
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - tools/oes/perop_diff.py
+      - .github/workflows/perop-diff.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  perop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          pip install --quiet "numpy==1.26.4" pillow
+          pip install --quiet "tensorflow-cpu==2.15.1"
+          python -c "import tensorflow as tf, numpy; print('tf', tf.__version__, 'numpy', numpy.__version__)"
+
+      - name: Fetch one deterministic image
+        run: |
+          set -euo pipefail
+          python tools/oes/fetch_photos.py --dest eval --prefix oes-eval --count 1 --min-ok 1
+          ls -la eval/
+
+      - name: Download prior INT8 artifact (run 39695215955)
+        uses: actions/download-artifact@v4
+        with:
+          name: oes-int8-cleaned
+          run-id: 39695215955
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: Verify artifact contents
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ls -la art/out/ || true
+          for f in baseline_float_concept_split_padsafe_float32.tflite baseline_float_concept_split_padsafe_float16.tflite concept_int8_art13.tflite concept_int8_fixed.tflite concept_int8_pertensor.tflite ; do
+            test -s "art/out/$f" || { echo "MISSING: art/out/$f"; exit 1; }
+          done
+
+      # 四组对照跑在一个 step 里：任一组失败也要把其余组跑完，
+      # 否则「第一组红了就啥都没有」。退出码逐组记录，末尾统一裁决。
+      - name: perop diff (正控制 + 判决组 + 佐证组)
+        run: |
+          set -uo pipefail
+          REF=art/out/baseline_float_concept_split_padsafe_float32.tflite
+          IMG=eval/oes-eval-0000.jpg
+          rc=0
+          run() {
+            tag="$1"
+            q="$2"
+            echo "################ $tag ################"
+            python tools/oes/perop_diff.py --ref "$REF" --quant "art/out/$q" --image "$IMG" --json "out/perop_$tag.json" 2>&1 | tee "out/perop_$tag.txt"
+            e=$?
+            echo "EXIT_$tag=$e" >> out/exits.txt
+            [ "$e" -eq 0 ] || rc=1
+          }
+          run ctrl_float16 baseline_float_concept_split_padsafe_float16.tflite
+          run art13 concept_int8_art13.tflite
+          run int8_fixed concept_int8_fixed.tflite
+          run int8_pertensor concept_int8_pertensor.tflite
+          echo "=== exits ==="
+          cat out/exits.txt || true
+          exit "$rc"
+
+      - name: Summarize first-bad per group
+        if: always()
+        run: |
+          set -uo pipefail
+          python - <<'PY'
+          import glob, json, os
+          for p in sorted(glob.glob('out/perop_*.json')):
+              d = json.load(open(p))
+              fb = d.get('first_bad')
+              tag = os.path.basename(p)[len('perop_'):-len('.json')]
+              if fb:
+                  print('%-14s match=%.1f%%  first_bad=%s cos=%.6f rel=%.4f'
+                        % (tag, d['match_rate'] * 100, fb['name'], fb['cos'], fb['rel_max']))
+              else:
+                  print('%-14s match=%.1f%%  no mismatch (all tensors within thresholds)'
+                        % (tag, d['match_rate'] * 100))
+          PY
+
+      - name: Upload perop reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perop-diff
+          path: |
+            out/perop_*.txt
+            out/perop_*.json
+            out/exits.txt
