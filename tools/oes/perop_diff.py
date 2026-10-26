@@ -52,6 +52,20 @@ import sys
 import numpy as np
 
 
+# TFLite builtin opcode -> 名字兜底表。
+# 取自本仓 verify/tflite_schema.py 的 BUILTIN_OPERATOR_NAMES（v2.13.0 完整枚举），
+# 已核对 34=PAD、60=PADV2（与 tools/oes/transplant_scales.py 的 CODE_PAD/CODE_PADV2 一致）。
+# 为什么需要兜底：TF 各版本里 schema_fb.BuiltinOperatorNames 的容器类型不一致
+# （dict / list），下标访问会抛异常，日志里就只剩 OP_34 这种不可读的编号。
+OPCODE_FALLBACK = {
+    0: 'ADD', 2: 'CONCATENATION', 3: 'CONV_2D', 4: 'DEPTHWISE_CONV_2D',
+    9: 'FULLY_CONNECTED', 17: 'MAX_POOL_2D', 18: 'MUL', 19: 'RELU',
+    20: 'RELU_N1_TO_1', 21: 'RELU6', 22: 'RESHAPE', 25: 'SOFTMAX',
+    34: 'PAD', 39: 'TRANSPOSE', 43: 'SQUEEZE', 53: 'CAST', 54: 'PRELU',
+    60: 'PADV2', 64: 'SELECT', 65: 'SLICE',
+}
+
+
 # --------------------------------------------------------------------------
 # 图片预处理：与 tools/oes/photos_dump.py 保持同一口径
 #   MEAN = 127.5, SCALE = 2/255  ⇒  归一化 = pixel/127.5 - 1.0
@@ -175,7 +189,7 @@ def parse_graph(model_path):
         try:
             op_types[i] = schema_fb.BuiltinOperatorNames[code]
         except Exception:
-            op_types[i] = 'OP_%d' % code
+            op_types[i] = OPCODE_FALLBACK.get(code, 'OP_%d' % code)
 
     seq, activations = [], []
     for i in range(sub.OperatorsLength()):
@@ -239,14 +253,73 @@ def match_best(name, ref_t, qnt_t):
     return best
 
 
-def compare(ref, qnt, names, cos_min, rel_max):
+def align(ref_act, qnt_act, ref_t, qnt_t, min_agree=0.95):
+    """给两份图的激活张量配对：优先逐位置对齐，但必须先通过锚点复核。
+
+    ## 为什么要位置对齐
+
+    同一张 ONNX 经同一套转换得到的两份模型，**算子顺序相同、激活数相同**
+    （实测都是 201）。但工具链给融合算子的自动编号不同：
+        ref 侧  model_32/tf.nn.relu/Relu;...;convolution
+        int8 侧 model_32/tf.nn.relu_2/Relu;...;convolution_2
+    按名字只能配上 143/201，剩下的 58 个恰好是「最后良好点」与「第一个崩溃点」
+    之间的那批 —— 也就是最要紧的那批。
+
+    ## 为什么不能盲信位置对齐
+
+    一旦错位，就会凭空造出「假首失配」，比不测更糟。
+    所以先拿**同名张量当锚点**，统计它们在两侧的相对位置是否一致：
+      · 一致率 >= min_agree 且两侧激活数相同  -> 启用位置对齐（覆盖 100%）
+      · 否则                                  -> 回退按名匹配，并把原因打出来
+
+    返回 (pairs, info)，pairs = [(ref_name, qnt_name), ...]。
+    """
+    info = {'anchors': 0, 'agree': 0.0, 'mode': 'name', 'reason': ''}
+
+    qidx = {n: i for i, n in enumerate(qnt_act)}
+    anchors = [(i, qidx[n]) for i, n in enumerate(ref_act) if n in qidx]
+    info['anchors'] = len(anchors)
+
+    agree, offset = 0.0, None
+    if len(anchors) >= 20:
+        deltas = [j - i for i, j in anchors]
+        offset = max(set(deltas), key=deltas.count)
+        agree = deltas.count(offset) / float(len(deltas))
+    info['agree'] = agree
+
+    if agree >= min_agree and len(ref_act) == len(qnt_act):
+        info['mode'] = 'position'
+        info['reason'] = ('锚点 %d 个，一致率 %.1f%%，offset=%+d，两侧激活数相同(%d)'
+                          % (len(anchors), agree * 100, offset, len(ref_act)))
+        return [(ref_act[i], qnt_act[i]) for i in range(len(ref_act))], info
+
+    info['reason'] = ('锚点 %d 个，一致率 %.1f%%（阈值 %.0f%%），激活数 %d vs %d'
+                      % (len(anchors), agree * 100, min_agree * 100,
+                         len(ref_act), len(qnt_act)))
+    pairs = []
+    for n in ref_act:
+        m = match_best(n, ref_t, qnt_t)
+        if m is not None:
+            pairs.append((n, m[0]))
+    return pairs, info
+
+
+def compare(ref, qnt, pairs, cos_min, rel_max):
     rows, first_bad = [], None
-    for name in names:
-        m = match_best(name, ref, qnt)
-        if m is None:
+    for name, qname in pairs:
+        if name not in ref or qname not in qnt:
             continue
-        qname, _ = m
         ra, qa = ref[name], qnt[qname]
+
+        # 形状必须一致。逐位置对齐下出现形状不一致，本身就是「对齐错了」的信号，
+        # 要让它出现在结果里，而不是抛异常整步崩掉（reshape 会 ValueError）。
+        if ra.shape != qa.shape:
+            rows.append({'name': name, 'quant_name': qname, 'cos': 0.0,
+                         'rel_max': 1.0, 'bad': True, 'masked': 0,
+                         'shape_mismatch': True, 'shape': list(ra.shape)})
+            if first_bad is None:
+                first_bad = rows[-1]
+            continue
 
         # 哨兵剔除（2026-10-26 实测必要性）：
         # 这个模型的部分张量带有未初始化的 ±FLT_MAX 哨兵（float16 里是 ±65504）。
@@ -286,6 +359,8 @@ def main(argv=None):
     ap.add_argument('--rel-max', type=float, default=0.05)
     ap.add_argument('--min-match', type=float, default=0.80,
                     help='激活配对率下限，低于此值以退出码 3 告警')
+    ap.add_argument('--min-anchor-agree', type=float, default=0.95,
+                    help='启用逐位置对齐所需的锚点一致率下限')
     ap.add_argument('--top', type=int, default=20)
     ap.add_argument('--list-tensors', action='store_true')
     args = ap.parse_args(argv)
@@ -334,13 +409,24 @@ def main(argv=None):
     print('=== tensors: ref=%d quant=%d ；激活: ref=%d quant=%d'
           % (len(ref_t), len(qnt_t), len(ref_act), len(qnt_act)))
 
-    # 覆盖率分母 = 参照模型的**激活**数（常量不参与，见文件头注释）。
-    # 匹配含融合名拆分：ref 侧 'A;B;C' 会去量化侧找 A / B / C 中 cos 最高的那个。
-    matched_names = [n for n in ref_act if match_best(n, ref_t, qnt_t) is not None]
-    rate = len(matched_names) / float(len(ref_act)) if ref_act else 0.0
+    pairs, ainfo = align(ref_act, qnt_act, ref_t, qnt_t,
+                         min_agree=args.min_anchor_agree)
+    rate = len(pairs) / float(len(ref_act)) if ref_act else 0.0
     low = rate < args.min_match
-    print('=== 激活覆盖率: %d/%d = %.1f%%（含融合名拆分匹配）'
-          % (len(matched_names), len(ref_act), rate * 100))
+    print('=== 对齐方式: %s（%s）' % (ainfo['mode'], ainfo['reason']))
+    print('=== 激活覆盖率: %d/%d = %.1f%%'
+          % (len(pairs), len(ref_act), rate * 100))
+
+    if ainfo['mode'] == 'position':
+        # 交叉验证：位置对齐下，那批同名锚点必须仍然存在且形状一致。
+        # 这一步是防止「位置对齐看起来成功、其实整体错了一位」。
+        bad_anchor = 0
+        for rn, qn in pairs:
+            if rn != qn:
+                continue
+            if rn in ref_t and rn in qnt_t and ref_t[rn].shape != qnt_t[rn].shape:
+                bad_anchor += 1
+        print('=== 位置对齐自检: 同名锚点形状不一致 %d 个（应为 0）' % bad_anchor)
 
     if low:
         # 关键：**不因为覆盖率低就提前退出**。
@@ -348,10 +434,10 @@ def main(argv=None):
         # 现在的规矩是：覆盖率低只降级「结论强度」，不影响「先把数据打出来」。
         print('!! 覆盖率低于 %.0f%% ⇒ 结论只能算**暂定**，但下面照常完整输出'
               % (args.min_match * 100), file=sys.stderr)
-        miss = [n for n in ref_act if match_best(n, ref_t, qnt_t) is None][:10]
+        miss = [n for n in ref_act if n not in dict(pairs)][:10]
         print('!! 未配对样例: %s' % miss, file=sys.stderr)
 
-    rows, first_bad = compare(ref_t, qnt_t, matched_names, args.cos_min, args.rel_max)
+    rows, first_bad = compare(ref_t, qnt_t, pairs, args.cos_min, args.rel_max)
 
     owner = {}
     for i, ty, outs in (qnt_seq or []):
@@ -373,7 +459,7 @@ def main(argv=None):
 
     by_name = {r['name']: r for r in rows}
     print('\n=== 前 20 个可比激活（按 ref 激活顺序，看从第几步开始崩）')
-    for name in matched_names[:20]:
+    for name in [rn for rn, _ in pairs][:20]:
         rr = by_name.get(name)
         if rr is None:
             continue
@@ -402,7 +488,8 @@ def main(argv=None):
                 'ref': args.ref, 'quant': args.quant, 'image': args.image,
                 'tensors_ref': len(ref_t), 'tensors_quant': len(qnt_t),
                 'activations_ref': len(ref_act), 'activations_quant': len(qnt_act),
-                'matched': len(matched_names), 'match_rate': rate,
+                'matched': len(pairs), 'match_rate': rate,
+                'align_mode': ainfo['mode'], 'align_info': ainfo,
                 'low_coverage': low,
                 'cos_min': args.cos_min, 'rel_max_threshold': args.rel_max,
                 'first_bad': first_bad, 'bad_count': bad_n, 'rows': rows,
