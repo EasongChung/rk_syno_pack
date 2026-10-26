@@ -105,7 +105,32 @@ def _builtin_name(fb, model, opcode_index):
     try:
         return fb.BuiltinOperatorNames[code]
     except Exception:
+        pass
+    # ★ 某些 TF 版本取不到 BuiltinOperatorNames，枚举名会退化成 OP_<code>，
+    # 于是 34=PAD 与 60=PADV2 不再同名、PAD 族归一失效 —— CI run 40284293275
+    # 就卡在 op#4（PADV2 vs PAD），覆盖只有 4/201。这里兜底到 perop_diff 的
+    # OPCODE_FALLBACK（该表已核实 34=PAD、60=PADV2）。
+    try:
+        import perop_diff as _P
+        return _P.OPCODE_FALLBACK.get(code, 'OP_%d' % code)
+    except Exception:
         return 'OP_%d' % code
+
+
+def _canon_name(n):
+    """把可能残留的数字名归一成枚举名（双保险，与 _builtin_name 独立）。
+
+    ★ 这里必须覆盖我们**会用到**的每一个类型：否则类型名退化成 OP_3 时，
+    下面那句 `fty in ('CONV_2D', ...)` 会静默匹配不到任何算子，
+    工具就报「无需修改」—— 这是**假绿**，比报错更糟（本地 C 场景实测）。
+    """
+    return {
+        'OP_3': 'CONV_2D',
+        'OP_4': 'DEPTHWISE_CONV_2D',
+        'OP_9': 'FULLY_CONNECTED',
+        'OP_34': 'PAD',
+        'OP_60': 'PADV2',
+    }.get(n, n)
 
 
 def _scale_of(t):
@@ -185,11 +210,21 @@ def main(argv=None):
 
     fseq, fact = seq_of(fm, fg)
     qseq, qact = seq_of(qm, qg)
+    # 双保险：即便名字仍退化成 OP_<code>，也先归一成枚举名再对齐
+    # （perop_diff._op_family 只认 'PAD'/'PADV2' 这两个字符串）。
+    fseq = [(a, _canon_name(b), c, d, e) for a, b, c, d, e in fseq]
+    qseq = [(a, _canon_name(b), c, d, e) for a, b, c, d, e in qseq]
     pairs, info = P.align_struct(fseq, qseq, fact, qact)
     print('=== 对齐: %s' % info['reason'])
     # cover 必须自己算：align_struct 不带这个字段（那是 align() 的返回值），
     # 直接取 info['cover'] 会恒为 0 而被护栏误拒（本地实测踩到）。
     cover = len(pairs) / float(len(fact)) if fact else 0.0
+    if cover < 0.9:
+        print('   诊断：前 4 个 ref 算子的（类型, 输出形状）')
+        for s in fseq[:4]:
+            same = [q for q in qseq if q[1] == s[1] and tuple(q[4]) == tuple(s[4])]
+            print('     ref#%-3d %-20s %-24s 同签名候选 %d'
+                  % (s[0], s[1], str(s[4])[:24], len(same)))
     if info['conflict'] != 0 or cover < 0.9:
         print('!! 对齐不可信（同名冲突 %d，覆盖 %.1f%% < 90%%）⇒ 拒绝动手'
               % (info['conflict'], cover * 100), file=sys.stderr)
@@ -204,15 +239,17 @@ def main(argv=None):
             qop_of[n] = s[0]
 
     patches, skipped = [], []
+    examined = 0
     for fname, qname in pairs:
         fi, qi = fop_of.get(fname), qop_of.get(qname)
         if fi is None or qi is None:
             continue
         fop, qop = fg.Operators(fi), qg.Operators(qi)
-        fty = _builtin_name(fb, fm, fop.OpcodeIndex())
-        qty = _builtin_name(fb, qm, qop.OpcodeIndex())
+        fty = _canon_name(_builtin_name(fb, fm, fop.OpcodeIndex()))
+        qty = _canon_name(_builtin_name(fb, qm, qop.OpcodeIndex()))
         if fty != qty or fty not in ('CONV_2D', 'DEPTHWISE_CONV_2D', 'FULLY_CONNECTED'):
             continue
+        examined += 1
         if fop.InputsLength() < 3 or qop.InputsLength() < 3:
             continue
         fbi, qbi = fop.Inputs(2), qop.Inputs(2)
@@ -255,7 +292,12 @@ def main(argv=None):
         for fi, nm, why in skipped:
             print('   ref#%-4d %-44s  %s' % (fi, nm[-44:], why))
 
-    print('=== 需要修 bias 的算子: %d 个' % len(patches))
+    if examined == 0:
+        print('!! 一个卷积/深度卷积都没检查到（类型名或对齐有问题）⇒ 拒绝，'
+              '不能把「没检查」当成「无需修改」', file=sys.stderr)
+        return 4
+    print('=== 检查了 %d 个卷积/深度卷积，其中需要修 bias 的: %d 个'
+          % (examined, len(patches)))
     for pb, count, new, fi, fty, fname, mx in patches:
         print('   ref#%-4d %-18s buffer=%-4d n=%-4d 浮点|b|max=%8.4f int32[0..2]=%s'
               % (fi, fty, pb, count, mx, new[:3]))
