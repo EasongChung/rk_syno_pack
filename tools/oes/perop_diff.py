@@ -187,20 +187,58 @@ def cosine(a, b):
     return float(np.dot(fa, fb) / (na * nb))
 
 
+def candidate_names(name):
+    """张量名可能被工具链融合成 'A;B;C'（onnx2tf 把 conv+add+relu 拼在一起）。
+
+    量化会把融合拆开，于是量化侧是简单名 A / B / C。这里给出全部候选，
+    由 match_best() 用数据（cos）而不是猜测来决定对应关系。
+    """
+    out = [name]
+    for part in name.split(';'):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
+
+
+def match_best(name, ref_t, qnt_t):
+    """给参照侧的一个激活找量化侧对应张量，取 cos 最高的候选。
+
+    为什么用「最高 cos」而不是「最后一个分量」：融合名的顺序没有文档保证，
+    猜错会产生大量**假失配**（把 conv 的输出错配成 relu 的输出）。
+    用数据选最优是保守做法 —— 它只会让失配更难被报出来，不会凭空造出失配。
+    这是本工具已知的**偏乐观**偏差，已在报告里注明。
+    """
+    ra = ref_t[name]
+    if not np.issubdtype(ra.dtype, np.floating):
+        return None
+    best = None
+    for c in candidate_names(name):
+        if c not in qnt_t:
+            continue
+        qa = qnt_t[c]
+        if qa.shape != ra.shape:
+            continue
+        v = cosine(ra, qa)
+        if best is None or v > best[1]:
+            best = (c, v)
+    return best
+
+
 def compare(ref, qnt, names, cos_min, rel_max):
     rows, first_bad = [], None
     for name in names:
-        ra, qa = ref[name], qnt[name]
-        if ra.shape != qa.shape:
+        m = match_best(name, ref, qnt)
+        if m is None:
             continue
-        if not np.issubdtype(ra.dtype, np.floating):
-            continue
+        qname, _ = m
+        ra, qa = ref[name], qnt[qname]
         c = cosine(ra, qa)
         denom = float(np.max(np.abs(ra))) + 1e-12
         rel = float(np.max(np.abs(ra - qa))) / denom
         bad = (c < cos_min) or (rel > rel_max)
-        rows.append({'name': name, 'cos': c, 'rel_max': rel, 'bad': bad,
-                     'shape': list(ra.shape)})
+        rows.append({'name': name, 'quant_name': qname, 'cos': c,
+                     'rel_max': rel, 'bad': bad, 'shape': list(ra.shape)})
         if bad and first_bad is None:
             first_bad = rows[-1]
     rows.sort(key=lambda r: (not r['bad'], r['cos'], -r['rel_max']))
@@ -258,19 +296,24 @@ def main(argv=None):
     print('=== tensors: ref=%d quant=%d ；激活: ref=%d quant=%d'
           % (len(ref_t), len(qnt_t), len(ref_act), len(qnt_act)))
 
-    # 配对率分母 = 参照模型的**激活**数（常量不参与，见文件头注释）
-    common = [n for n in ref_act if n in qnt_t]
-    rate = len(common) / float(len(ref_act)) if ref_act else 0.0
-    print('=== 激活配对率: %d/%d = %.1f%%' % (len(common), len(ref_act), rate * 100))
+    # 覆盖率分母 = 参照模型的**激活**数（常量不参与，见文件头注释）。
+    # 匹配含融合名拆分：ref 侧 'A;B;C' 会去量化侧找 A / B / C 中 cos 最高的那个。
+    matched_names = [n for n in ref_act if match_best(n, ref_t, qnt_t) is not None]
+    rate = len(matched_names) / float(len(ref_act)) if ref_act else 0.0
+    low = rate < args.min_match
+    print('=== 激活覆盖率: %d/%d = %.1f%%（含融合名拆分匹配）'
+          % (len(matched_names), len(ref_act), rate * 100))
 
-    if rate < args.min_match:
-        print('!! 激活配对率低于 %.0f%% ⇒ 结论不可信' % (args.min_match * 100),
-              file=sys.stderr)
-        miss = [n for n in ref_act if n not in qnt_t][:10]
+    if low:
+        # 关键：**不因为覆盖率低就提前退出**。
+        # run 40270810573 就是在这里 return 3，导致三组一条对照数据都没打印。
+        # 现在的规矩是：覆盖率低只降级「结论强度」，不影响「先把数据打出来」。
+        print('!! 覆盖率低于 %.0f%% ⇒ 结论只能算**暂定**，但下面照常完整输出'
+              % (args.min_match * 100), file=sys.stderr)
+        miss = [n for n in ref_act if match_best(n, ref_t, qnt_t) is None][:10]
         print('!! 未配对样例: %s' % miss, file=sys.stderr)
-        return 3
 
-    rows, first_bad = compare(ref_t, qnt_t, common, args.cos_min, args.rel_max)
+    rows, first_bad = compare(ref_t, qnt_t, matched_names, args.cos_min, args.rel_max)
 
     owner = {}
     for i, ty, outs in (qnt_seq or []):
@@ -305,13 +348,15 @@ def main(argv=None):
                 'ref': args.ref, 'quant': args.quant, 'image': args.image,
                 'tensors_ref': len(ref_t), 'tensors_quant': len(qnt_t),
                 'activations_ref': len(ref_act), 'activations_quant': len(qnt_act),
-                'matched': len(common), 'match_rate': rate,
+                'matched': len(matched_names), 'match_rate': rate,
+                'low_coverage': low,
                 'cos_min': args.cos_min, 'rel_max_threshold': args.rel_max,
                 'first_bad': first_bad, 'bad_count': bad_n, 'rows': rows,
             }, f, indent=1)
         print('=== json -> %s' % args.json)
 
-    return 0
+    # 覆盖率不足时以 3 退出（提示结论暂定），但**数据已经完整打印过了**
+    return 3 if low else 0
 
 
 if __name__ == '__main__':
