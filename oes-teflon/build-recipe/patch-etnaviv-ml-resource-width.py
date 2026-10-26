@@ -73,21 +73,15 @@ ANCHOR = ("   struct pipe_resource *res = pipe_buffer_create(pscreen, 0, "
 
 NEW = """   /* och patch: ML self-created resource width
     *
-    * Gallium 的 pipe_buffer_create(screen, width, usage, size) 把 **width 直接写进
-    * res->width0**，而 pipe_buffer_map_range 有两条断言：
-    *     assert(offset < buffer->width0);
-    *     assert(offset + length <= buffer->width0);
-    * ⇒ width 传 0 ⇒ 自建资源的 width0 = 0 ⇒ **任何** map_range 必然断言失败。
+    * Gallium 的 pipe_buffer_create(screen, bind, usage, size) 把 **size 直接写进
+    * res->width0**（u_inlines.h:455），而第 2 个参数是 bind（标志位），必须传 0。
+    * 历史补丁误将 size 当作 bind 传入，当 size >= 1MB 时（如 1.25MB 张量，第 20 位为 1），
+    * 会错误置位 PIPE_BIND_SHARED（1 << 20），导致 etnaviv_resource.c:429
+    * 的 assert(!(templat->bind & PIPE_BIND_SHARED)) 崩溃。
     *
-    * 真机（Synology Photos 主题识别模型，报告 48）：FC 输出的 rank-2 张量没有
-    * delegate 侧资源 ⇒ 走 etna_ml_create_tensor() ⇒ 自建资源 ⇒ 推理期 abort：
-    *     pipe_buffer_map_range: Assertion `offset + length <= buffer->width0' failed.
-    * （未打补丁的上游原版同样 abort ⇒ 与本仓其它改动无关。）
-    *
-    * 修法：width 就取 size —— width0 的语义是「可映射的字节范围」，
-    * 这是唯一自洽的取值。不改任何数值，只改资源几何。
+    * 故 bind 必须严格传 0。
     */
-   struct pipe_resource *res = pipe_buffer_create(pscreen, size, PIPE_USAGE_DEFAULT, size);
+   struct pipe_resource *res = pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size);
 #if defined(__GNUC__) || defined(__clang__)
    __attribute__((used)) static const char och_mlwidth_marker[] = "och-patch-ml-resource-width";
    (void)och_mlwidth_marker;
@@ -171,9 +165,9 @@ def selftest(mesa_src):
 
         for cond, desc in [
             (MARKER in out, "标记已写入"),
-            ("pipe_buffer_create(pscreen, size, PIPE_USAGE_DEFAULT, size)" in out,
-             "width 改成 size（width0 容得下映射范围）"),
-            (out.count("pipe_buffer_create(pscreen, size, PIPE_USAGE_DEFAULT, size)") == 1,
+            ("pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size)" in out,
+             "bind 设为 0（避免误置 PIPE_BIND_SHARED）"),
+            (out.count("pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size)") == 1,
              "只改这一处"),
             ("och-patch-ml-resource-width" in out, "C 代码自带产物可查的标记"),
         ]:
@@ -204,7 +198,7 @@ def selftest(mesa_src):
             ok = ok and cond
 
         # 负控制 3：只改这一处
-        cond = (out.count("pipe_buffer_create(pscreen, size, PIPE_USAGE_DEFAULT, size)") == 1
+        cond = (out.count("pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size)") == 1
                 and raw.count("pipe_buffer_create(pscreen, 0, PIPE_USAGE_DEFAULT, size);") == 1)
         print("  [%s] 负控制 3：原锚点只被替换了一次" % ("ok" if cond else "BAD"))
         ok = ok and cond
