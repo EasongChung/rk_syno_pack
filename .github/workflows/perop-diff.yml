@@ -77,6 +77,12 @@ jobs:
             test -s "art/out/$f" || { echo "MISSING: art/out/$f"; exit 1; }
           done
 
+      - name: Syntax check
+        run: |
+          set -euo pipefail
+          python -m py_compile tools/oes/perop_diff.py
+          echo "py_compile OK"
+
       # 四组对照跑在一个 step 里：任一组失败也要把其余组跑完，
       # 否则「第一组红了就啥都没有」。退出码逐组记录，末尾统一裁决。
       - name: perop diff (正控制 + 判决组 + 佐证组)

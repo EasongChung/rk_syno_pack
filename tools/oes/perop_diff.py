@@ -10,18 +10,21 @@ int8 产物在**输出端**与浮点参照差 2.7 倍（报告 65 §3）。只�
 本工具把两份模型都跑同一张图，取出**全部**张量
 (tf.lite.Interpreter 的 experimental_preserve_all_tensors=True)，
 按**张量名**配对，按量化模型的算子顺序逐层计算 cos / 相对误差，
-报出**第一个**跌破阈值的张量 —— 那一点就是失配源头，再看它后面是
-「一路缓慢劣化」（量化精度）还是「一步跳变」（转换缺陷）。
+报出**第一个**跌破阈值的张量。
 
-## 为什么按名字配对可行（以及何时不可行）
+## 只比「激活」，不比常量（2026-10-26 修正）
 
-两份模型由同一条 onnx2tf 链路生成，张量命名一致
-(arith.constant / arith.constant1 / ... / Const_N)。实测
-baseline_float_concept_split_padsafe_float16 与 concept_int8_art13 的前 8 个
-张量名与索引基本对齐。
+量化会重写常量张量：浮点图里的 @c arith.constant20 在 int8 图里可能被折叠、
+改名、或换成 INT32 的 scale/bias tensors。若把常量算进配对率分母，
+会得到 48% 的**假告警**（run 40269559679 实测 art13）。
 
-但工具**不假设**配对率一定是 100%：它会打印配对率，低于 --min-match
-(default 0.80) 时以非零退出码告警，避免「配对失败被当成模型正常」。
+⇒ 分母与比对集合一律限定为**算子输出张量**（= 激活）。
+
+## 为什么按名字配对可行
+
+两份模型由同一条 onnx2tf 链路生成，激活张量命名一致
+(Const_N / tf.nn.xxx_1/xxx 之类)。工具仍会打印配对率，
+低于 --min-match 时以退出码 3 告警，避免「配对失败被当成模型正常」。
 
 ## 用法
 
@@ -31,7 +34,7 @@ baseline_float_concept_split_padsafe_float16 与 concept_int8_art13 的前 8 个
     --image eval/oes-eval-0000.jpg \
     --json  out/perop_art13.json
 
-  # 只列张量名（不推理，不需要图片）
+  # 只列算子与激活名（不推理，不需要图片）
   python perop_diff.py --ref M.tflite --list-tensors
 
 ## 退出码
@@ -79,7 +82,7 @@ def quantize_input(x, detail):
 
 
 def run_model(model_path, image_path):
-    """跑一次推理，返回 (所有张量的 {名字: (数组, dtype)}, 输入详情, 输出详情)。
+    """跑一次推理，返回 (张量表, 输入详情, 输出详情)。
 
     experimental_preserve_all_tensors=True 是**必须**的：默认情况下 TFLite 会
     在算子执行后立即释放中间张量，get_tensor() 只能拿到输入/输出。
@@ -112,7 +115,6 @@ def run_model(model_path, image_path):
         try:
             arr = interp.get_tensor(idx)
         except Exception:
-            # 少数张量（如未初始化的可选输入）取不到，跳过但要计数
             continue
         arr = np.asarray(arr)
         scale, zero_point = det['quantization']
@@ -121,21 +123,25 @@ def run_model(model_path, image_path):
             arr = (arr.astype(np.float32) - float(zero_point)) * float(scale)
         elif arr.dtype == np.float16:
             arr = arr.astype(np.float32)
-        tensors[name] = (arr, det['dtype'])
+        tensors[name] = arr
 
-    return tensors, in_det, out_det, interp
+    return tensors, in_det, out_det
 
 
-def op_sequence(model_path):
-    """解析 flatbuffer，给出量化模型的算子顺序 [(op_index, type_name, [输出张量名])]。
+def parse_graph(model_path):
+    """解析 flatbuffer，返回 (算子序列, 激活名列表)。
 
-    用 TF 自带的 schema 绑定，不引第三方包。解析失败不致命 —— 退化为
-    「按张量索引顺序」输出。
+    算子序列 = [(op_index, op_type_name, [输出张量名])]
+    激活名     = 所有算子的输出张量名集合（**排除**常量：常量不是任何算子的输出）
+
+    注意：OperatorCodes 在 **Model** 上，不在 SubGraph 上
+    （run 40269559679 就是在这里崩的：SubGraph 没有 OperatorCodesLength）。
+    解析失败返回 (None, None)，不致命。
     """
     try:
         from tensorflow.lite.python import schema_py_generated as schema_fb
     except Exception:
-        return None
+        return None, None
 
     with open(model_path, 'rb') as f:
         buf = f.read()
@@ -144,21 +150,32 @@ def op_sequence(model_path):
 
     names = {}
     for i in range(sub.TensorsLength()):
-        t = sub.Tensors(i)
-        names[i] = t.Name().decode('utf-8', 'replace')
+        names[i] = sub.Tensors(i).Name().decode('utf-8', 'replace')
 
     op_types = {}
-    for i in range(sub.OperatorCodesLength()):
-        oc = sub.OperatorCodes(i)
+    for i in range(model.OperatorCodesLength()):
+        oc = model.OperatorCodes(i)
         code = max(oc.BuiltinCode(), oc.DeprecatedBuiltinCode())
-        op_types[i] = schema_fb.BuiltinOperatorNames.get(code, 'OP_%d' % code)
+        # BuiltinOperatorNames 在不同 TF 版本里可能是 dict 也可能是 list，
+        # 统一用下标 + 兜底，避免一次版本差异就整步崩掉。
+        try:
+            op_types[i] = schema_fb.BuiltinOperatorNames[code]
+        except Exception:
+            op_types[i] = 'OP_%d' % code
 
-    seq = []
+    seq, activations = [], []
     for i in range(sub.OperatorsLength()):
         op = sub.Operators(i)
         outs = [names[op.Outputs(j)] for j in range(op.OutputsLength())]
         seq.append((i, op_types.get(op.OpcodeIndex(), '?'), outs))
-    return seq
+        activations.extend(outs)
+    # 去重但保序
+    seen, act = set(), []
+    for n in activations:
+        if n not in seen:
+            seen.add(n)
+            act.append(n)
+    return seq, act
 
 
 def cosine(a, b):
@@ -170,12 +187,10 @@ def cosine(a, b):
     return float(np.dot(fa, fb) / (na * nb))
 
 
-def compare(ref, qnt, cos_min, rel_max, top_n):
+def compare(ref, qnt, names, cos_min, rel_max):
     rows, first_bad = [], None
-    for name, (qa, _) in qnt.items():
-        if name not in ref:
-            continue
-        ra = ref[name][0]
+    for name in names:
+        ra, qa = ref[name], qnt[name]
         if ra.shape != qa.shape:
             continue
         if not np.issubdtype(ra.dtype, np.floating):
@@ -196,12 +211,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='逐张量对照定位 int8 首失配点')
     ap.add_argument('--ref', required=True, help='浮点参照模型 .tflite')
     ap.add_argument('--quant', help='量化模型 .tflite')
-    ap.add_argument('--image', help='输入图（建议用 CI 里同一张 picsum 图）')
+    ap.add_argument('--image', help='输入图')
     ap.add_argument('--json', help='把结果写到这个 json')
     ap.add_argument('--cos-min', type=float, default=0.999)
     ap.add_argument('--rel-max', type=float, default=0.05)
     ap.add_argument('--min-match', type=float, default=0.80,
-                    help='配对率下限，低于此值以退出码 3 告警')
+                    help='激活配对率下限，低于此值以退出码 3 告警')
     ap.add_argument('--top', type=int, default=20)
     ap.add_argument('--list-tensors', action='store_true')
     args = ap.parse_args(argv)
@@ -212,12 +227,13 @@ def main(argv=None):
             return 2
 
     if args.list_tensors:
-        seq = op_sequence(args.ref)
+        seq, act = parse_graph(args.ref)
         if seq is None:
-            print('schema 绑定不可用，无法列算子', file=sys.stderr)
+            print('schema 绑定不可用，无法解析', file=sys.stderr)
             return 2
         for i, ty, outs in seq:
             print('op#%-4d %-24s -> %s' % (i, ty, ', '.join(outs) or '(none)'))
+        print('--- 激活张量 %d 个 ---' % len(act))
         return 0
 
     if not (args.quant and args.image):
@@ -229,33 +245,35 @@ def main(argv=None):
     print('=== quant : %s' % args.quant)
     print('=== image : %s' % args.image)
 
-    ref_t, _, _, _ = run_model(args.ref, args.image)
-    qnt_t, _, q_out, _ = run_model(args.quant, args.image)
-    print('=== tensors: ref=%d quant=%d' % (len(ref_t), len(qnt_t)))
+    ref_t, _, _ = run_model(args.ref, args.image)
+    qnt_t, _, q_out = run_model(args.quant, args.image)
+    _, ref_act = parse_graph(args.ref)
+    qnt_seq, qnt_act = parse_graph(args.quant)
 
-    matched = sum(1 for n in qnt_t if n in ref_t)
+    if ref_act is None or qnt_act is None:
+        print('!! 无法解析算子表，退化为按全部张量比对', file=sys.stderr)
+        ref_act = list(ref_t)
+        qnt_act = list(qnt_t)
 
-    # 配对率的分母必须是**参照模型的张量数**，不是量化模型的。
-    # 反例（2026-10-26 实测）：正控制 float32 vs float16 时
-    #   ref=339 / quant=454 —— float16 模型多了 115 个 Dequantize 附加张量，
-    # 用 len(quant) 做分母会算出 74.4% 的假告警，而真实配对是 338/339 = 99.7%。
-    rate = matched / float(len(ref_t)) if ref_t else 0.0
-    print('=== 配对率: %d/%d = %.1f%%（分母=参照模型张量数；量化模型多出的附加张量不计）'
-          % (matched, len(ref_t), rate * 100))
+    print('=== tensors: ref=%d quant=%d ；激活: ref=%d quant=%d'
+          % (len(ref_t), len(qnt_t), len(ref_act), len(qnt_act)))
+
+    # 配对率分母 = 参照模型的**激活**数（常量不参与，见文件头注释）
+    common = [n for n in ref_act if n in qnt_t]
+    rate = len(common) / float(len(ref_act)) if ref_act else 0.0
+    print('=== 激活配对率: %d/%d = %.1f%%' % (len(common), len(ref_act), rate * 100))
 
     if rate < args.min_match:
-        print('!! 配对率低于 %.0f%% ⇒ 结论不可信（张量命名不一致）'
-              % (args.min_match * 100), file=sys.stderr)
-        miss = [n for n in ref_t if n not in qnt_t][:10]
-        print('!! 参照侧未配对样例: %s' % miss, file=sys.stderr)
+        print('!! 激活配对率低于 %.0f%% ⇒ 结论不可信' % (args.min_match * 100),
+              file=sys.stderr)
+        miss = [n for n in ref_act if n not in qnt_t][:10]
+        print('!! 未配对样例: %s' % miss, file=sys.stderr)
         return 3
 
-    rows, first_bad = compare(ref_t, qnt_t, args.cos_min, args.rel_max, args.top)
+    rows, first_bad = compare(ref_t, qnt_t, common, args.cos_min, args.rel_max)
 
-    # 把算子类型挂到首失配张量上，便于直接对照模型结构
-    seq = op_sequence(args.quant) or []
     owner = {}
-    for i, ty, outs in seq:
+    for i, ty, outs in (qnt_seq or []):
         for o in outs:
             owner.setdefault(o, (i, ty))
     if first_bad:
@@ -263,17 +281,22 @@ def main(argv=None):
         print('\n=== 首个失配: op#%d %s -> %s' % (i, ty, first_bad['name']))
         print('    cos=%.6f  rel_max=%.4f  shape=%s'
               % (first_bad['cos'], first_bad['rel_max'], first_bad['shape']))
+    else:
+        print('\n=== 无失配：全部 %d 个激活张量都在阈值内' % len(rows))
 
-    print('\n=== 最差 %d 个张量（✗ = 超阈值）' % args.top)
-    print('   %-44s %-10s %-10s %s' % ('张量名', 'cos', 'rel_max', '判定'))
+    print('\n=== 最差 %d 个激活张量（✗ = 超阈值 cos<%.4f 或 rel>%.3f）'
+          % (args.top, args.cos_min, args.rel_max))
+    print('   %-46s %-10s %-10s %s' % ('张量名', 'cos', 'rel_max', '判定'))
     for r in rows[:args.top]:
-        print('   %-44s %-10.6f %-10.4f %s'
-              % (r['name'][:44], r['cos'], r['rel_max'],
+        print('   %-46s %-10.6f %-10.4f %s'
+              % (r['name'][:46], r['cos'], r['rel_max'],
                  '✗' if r['bad'] else '✓'))
 
     out_scale, out_zp = q_out['quantization']
     print('\n=== 图输出: scale=%.8g zero_point=%d dtype=%s'
           % (out_scale, out_zp, q_out['dtype']))
+    bad_n = sum(1 for r in rows if r['bad'])
+    print('=== 超阈值激活数: %d / %d' % (bad_n, len(rows)))
 
     if args.json:
         os.makedirs(os.path.dirname(args.json) or '.', exist_ok=True)
@@ -281,9 +304,10 @@ def main(argv=None):
             json.dump({
                 'ref': args.ref, 'quant': args.quant, 'image': args.image,
                 'tensors_ref': len(ref_t), 'tensors_quant': len(qnt_t),
-                'matched': matched, 'match_rate': rate,
+                'activations_ref': len(ref_act), 'activations_quant': len(qnt_act),
+                'matched': len(common), 'match_rate': rate,
                 'cos_min': args.cos_min, 'rel_max_threshold': args.rel_max,
-                'first_bad': first_bad, 'rows': rows,
+                'first_bad': first_bad, 'bad_count': bad_n, 'rows': rows,
             }, f, indent=1)
         print('=== json -> %s' % args.json)
 
