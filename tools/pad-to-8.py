@@ -190,22 +190,23 @@ def build_track(mdl, ops, T):
             wt = T[op["inputs"][1]]
             sh = list(wt["shape"])
             out_c = sh[3] if b == DEPTHWISE_CONV_2D else (sh[0] if sh[0] > 1 else sh[3])
+            in_info = tr.info.get(op["inputs"][0])
+            # depthwise 输出通道必须跟随输入通道
+            if b == DEPTHWISE_CONV_2D and in_info and in_info[2]:
+                out_tgt = in_info[2]
+            else:
+                out_tgt = pad_to(out_c)
             for o in outs:
-                tr.info[o] = (len(T[o]["shape"]) - 1, out_c, pad_to(out_c))
-            # 输入张量的通道数由它的**生产者**决定，这里只有两种合法情况会改它：
-            #   · depthwise：C_out ≡ C_in（1:1 绑定）⇒ 必须反向要求输入也补齐；
-            #   · 该张量本身是另一个被补 conv 的输出 ⇒ 由上游正向赋值，无需这里干预。
-            # ★ 不能无条件 pad_to(cnt)：合成模型 op#0 的 RESHAPE 输入是固定尺寸图输入，
-            #   元素守恒不允许它变 ⇒ 会把常量改成 [1,2500,50,50]（实测 6,250,000）。
-            #   普通 conv 的权重 in 轴统一跟随「输入张量实际通道数」（见 in_pad 计算）。
+                tr.info[o] = (len(T[o]["shape"]) - 1, out_c, out_tgt)
             if b == DEPTHWISE_CONV_2D and op["inputs"][0] in tr.info:
                 iti = op["inputs"][0]
-                iax, icnt, _ = tr.info[iti]
+                iax, icnt, existing_tgt = tr.info[iti]
                 if iti in mdl["subgraph"]["inputs"]:
                     tr.barriers.append(
                         (len(tr.info), "op#%d(depthwise) 要求输入补齐，但输入是图输入（契约不可改）" % i))
                 else:
-                    tr.info[iti] = (iax, icnt, pad_to(icnt))
+                    needed = max(existing_tgt, pad_to(icnt))
+                    tr.info[iti] = (iax, icnt, needed)
         elif b == FULLY_CONNECTED and len(op["inputs"]) >= 2:
             # FC 保持原输出维度（例如 335 类别），绝不向外补齐破坏调用方契约
             wt = T[op["inputs"][1]]
@@ -459,8 +460,8 @@ def main():
             continue
         oti = op["outputs"][0]
         tgt = tr.info.get(oti)
-        if tgt and tgt[1] and pad_to(tgt[1]) != tgt[1]:
-            pad_ops[i] = pad_to(tgt[1])
+        if tgt and tgt[1] and tgt[2] != tgt[1]:
+            pad_ops[i] = tgt[2]
         # 权重 in 维：跟随输入张量的**实际**新通道数（new_ch 里没有 ⇒ 不补）
         if op["inputs"][0] in tr.info:
             ax, cnt, itgt = tr.info[op["inputs"][0]]
@@ -517,8 +518,8 @@ def main():
         elif b == DEPTHWISE_CONV_2D:
             # depthwise 权重 [1, kh, kw, out_c(=in_c)]
             _, kh, kw, oc = wshape
-            new_oc = out_pad or oc
-            new_ic = oc            # depthwise 的输入通道数由上游决定
+            new_oc = in_pad_to if in_pad_to else (out_pad or oc)
+            new_ic = new_oc
         else:
             oc, kh, kw, ic = wshape
             new_oc = out_pad or oc
