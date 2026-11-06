@@ -797,6 +797,35 @@ else
 	echo "==> [3h2b/6] 1x1 强制 NO_CACHE：默认关闭（设 TEFLON_NOCACHE_1X1=1 启用）"
 fi
 
+# ── 3h2c. 【修复】pointwise 先于 ReLU6 判定（writer/码流根因）───────────
+# 【为什么】tfl_device.c 的 fill_operation() 里，fused ReLU6 走提前 return
+#   （:125/:157），跳过了函数末尾的 operation->conv.pointwise 赋值（:159）
+#   ⇒ 所有 ReLU6 卷积 pointwise=0 ⇒ v7 选 write_core_interleaved 且码流带 zrl 压缩。
+#   真机单变量实验（2026-11-06，同几何 64x64x32->64、同权重、同库）：
+#     ACT_NONE -> pointwise=1 -> core_6(zrl=0)  -> 9.78ms，与 CPU 逐字节相同
+#     RELU6    -> pointwise=0 -> interleaved    -> 503.98ms，4 次 MMU fault，输出全零
+# 【修法】把 pointwise 的计算提到两处 ReLU6 return 之前（原赋值保留，幂等）。
+# 用法：TEFLON_POINTWISE_RELU6=1 ./build-teflon.sh
+if [ "${TEFLON_POINTWISE_RELU6:-0}" = "1" ]; then
+	echo "==> [3h2c/6] 打【修复】pointwise 先于 ReLU6 判定（writer/码流根因）"
+	PATCHER7W="$SCRIPT_DIR/patch-etnaviv-pointwise-relu6.py"
+	TFDEV="mesa/src/gallium/frontends/teflon/tfl_device.c"
+	if [ ! -f "$PATCHER7W" ]; then
+		echo "ERROR: 设了 TEFLON_POINTWISE_RELU6=1 却缺 $PATCHER7W"
+		exit 1
+	fi
+	if [ ! -f "$TFDEV" ]; then
+		echo "ERROR: 找不到 $TFDEV"
+		exit 1
+	fi
+	python3 "$PATCHER7W" "$TFDEV" || {
+		echo "ERROR: pointwise/ReLU6 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3h2c/6] pointwise 先于 ReLU6：默认关闭（设 TEFLON_POINTWISE_RELU6=1 启用）"
+fi
+
 # ── 3h3. 【修复】pooling-first-pixel padding 门控（报告 56）──────────────
 # 【为什么】v7 上 stride>1 的 depthwise 走 ETNA_NN_POOLING_FIRST_PIXEL
 #   （etnaviv_ml_nn.c:1141），而 operation->padding_same 只在 strided_to_normal()
