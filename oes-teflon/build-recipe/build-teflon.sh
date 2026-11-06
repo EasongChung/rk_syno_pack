@@ -765,6 +765,38 @@ else
 	echo "==> [3h2/6] 幻影通道形状门控：默认关闭（设 TEFLON_PHANTOM_GATE=1 启用）"
 fi
 
+# ── 3h2b. 【修复】1x1 强制 NO_CACHE（image cache tile DMA 越界）────────
+# 【为什么】image cache 的 tile 固定 tile_x x tile_y（A311D 常见 64x12），
+#   DMA 按 in_image_x_stride=in_x 逐行取；in_x < tile_x 时一个 tile 要读
+#   tile_x*tile_y*in_c 字节而一行只有 in_x*in_c 字节 => 越界读/写。
+#   真机实测（2026-11-06）：in_x=12/32 => 每次推理 4 次 hang、0 次 MMU fault、输出全零；
+#   in_x=112（2x10 块）=> MMU fault 到野地址、整机失联。
+#   越界落在 GPU 已映射窗口内时静默写坏别的 BO，落在窗口外才 fault。
+# 【修法】1x1（weight_width==1 && weight_height==1 && !depthwise）的
+#   image_cache_size 置 0 => 走 NO_CACHE，tile DMA 不再发生。
+#   判定用 kernel 尺寸，不用 operation->pointwise（实测该 flag 为 0）。
+# 用法：TEFLON_NOCACHE_1X1=1 ./build-teflon.sh
+if [ "${TEFLON_NOCACHE_1X1:-0}" = "1" ]; then
+	echo "==> [3h2b/6] 打【修复】1x1 强制 NO_CACHE（image cache tile DMA 越界）"
+	PATCHER7N="$SCRIPT_DIR/patch-etnaviv-nocache-1x1.py"
+	MLPN="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn.c"
+	if [ ! -f "$PATCHER7N" ]; then
+		echo "ERROR: 设了 TEFLON_NOCACHE_1X1=1 却缺 $PATCHER7N"
+		exit 1
+	fi
+	if [ ! -f "$MLPN" ]; then
+		echo "ERROR: 找不到 $MLPN"
+		exit 1
+	fi
+	python3 "$PATCHER7N" "$MLPN" || {
+		echo "ERROR: 1x1 NO_CACHE 补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出仍然越界的 .so，挂死会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h2b/6] 1x1 强制 NO_CACHE：默认关闭（设 TEFLON_NOCACHE_1X1=1 启用）"
+fi
+
 # ── 3h3. 【修复】pooling-first-pixel padding 门控（报告 56）──────────────
 # 【为什么】v7 上 stride>1 的 depthwise 走 ETNA_NN_POOLING_FIRST_PIXEL
 #   （etnaviv_ml_nn.c:1141），而 operation->padding_same 只在 strided_to_normal()
