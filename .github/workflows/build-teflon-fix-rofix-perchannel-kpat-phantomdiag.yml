@@ -83,6 +83,10 @@ on:
         description: 'foldearly（报告 55 方案 A：折叠前移+原地+保持 in_c=C；与 layout 补丁互斥）'
         required: false
         default: '0'
+      gate_hdr:
+        description: '1 = A1 实验：头部 TRANSPOSE/PAD @395/397 回退 CPU（N1 布局台账脱钩）'
+        required: false
+        default: '0'
 
 env:
   MESA_TAG: ${{ github.event.inputs.mesa_tag || 'mesa-26.2.5' }}
@@ -114,6 +118,8 @@ env:
   TEFLON_DENY_LOGISTIC: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   # 2026-11-07 M：系数超 SRAM 的卷积回退 CPU（默认关闭）
   TEFLON_COEFSRAM_GATE: ${{ inputs.coefsram_gate || '0' }}
+  # ★ 2026-11-07 A1 实验：头部搬运算子 gate（TRANSPOSE/PAD @395/397 -> CPU）
+  TEFLON_GATE_HDR: ${{ inputs.gate_hdr || '0' }}
   TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。

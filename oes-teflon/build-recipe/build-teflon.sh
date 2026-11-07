@@ -991,6 +991,38 @@ else
 	echo "==> [3j-3] 拒绝 LOGISTIC：默认关闭（设 TEFLON_DENY_LOGISTIC=1 启用）"
 fi
 
+ ── 3j-5. 【A1 实验】头部搬运算子 gate（TRANSPOSE/PAD @395/397 -> CPU）──────
+   N1 定位（op-map/n1-diverge-20261107.md §8）：图级 TRANSPOSE = 零搬动 bypass
+   + 布局重标，c335 头部 TRANSPOSE→PAD→TRANSPOSE 链布局台账与真实字节序脱钩，
+   CONV 按声明布局消费即满量程错位，级联塔 320。
+   本开关让头部三算子回 CPU（输入 dims 含 395/397 的 TRANSPOSE/PAD），
+   CONV 主力留 NPU，输入为 CPU 物化的干净 NHWC。
+   补丁器：build-recipe/patch-teflon-gate-header-moveops.py（带 C 行为自证）
+ 用法：TEFLON_GATE_HDR=1（与其它修复可叠加）
+if [ "${TEFLON_GATE_HDR:-0}" = "1" ]; then
+	echo "==> [3j-5] 打【A1 实验】头部搬运算子 gate"
+	PATCHER_HG="$SCRIPT_DIR/patch-teflon-gate-header-moveops.py"
+	TFLDEV="mesa/src/gallium/frontends/teflon/tfl_device.c"
+	if [ ! -f "$PATCHER_HG" ]; then
+		echo "ERROR: 设了 TEFLON_GATE_HDR=1 却缺 $PATCHER_HG"
+		exit 1
+	fi
+	if [ ! -f "$TFLDEV" ]; then
+		echo "ERROR: 找不到 $TFLDEV"
+		exit 1
+	fi
+	python3 "$PATCHER_HG" --selftest || {
+		echo "ERROR: hdrgate 补丁行为自证失败 —— 不要跳过校验"
+		exit 1
+	}
+	python3 "$PATCHER_HG" "$TFLDEV" || {
+		echo "ERROR: hdrgate 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3j-5] 头部搬运算子 gate：默认关闭（设 TEFLON_GATE_HDR=1 启用）"
+fi
+
 # ── 3j-4. 【修复】系数超 SRAM 的卷积回退 CPU（coefsram gate）──────────────
 # 【为什么需要（2026-11-07 K2/L1 真机取证）】
 #   c335 模型 op#214（1x1, out_c=2048, in_c=976）系数 2,015,744 B >> 片上 SRAM 512 KB
