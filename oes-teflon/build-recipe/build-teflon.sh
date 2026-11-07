@@ -965,6 +965,32 @@ else
 	echo "==> [3j/6] read_outputs 范围修复：默认关闭（设 TEFLON_ROFIX=1 启用）"
 fi
 
+# ── 3j-3. 【实验】拒绝 LOGISTIC（单变量验证分区边界假说）─────────────────
+# 【为什么需要（2026-11-07 WP1 取证）】
+#   v12 INT8 被切成 3 段 delegate：输出张量落在只有 1 个 LOG 算子的第 3 段
+#   （compiled 3 ms / invoked 0 ms），其输入来自 CPU 回退的 STRIDED_SLICE；
+#   实测两张不同图输出逐字节相同 => 疑为「尾部单算子分区 + CPU 到 delegate 边界」。
+# 纯实验开关，默认关闭；不改变数值语义（LOG 由 TFLite CPU 内核计算）。
+if [ "${TEFLON_DENY_LOGISTIC:-0}" = "1" ]; then
+	echo "==> [3j-3] 打【实验】拒绝 LOGISTIC"
+	PATCHER_DL="$SCRIPT_DIR/patch-etnaviv-ml-deny-logistic.py"
+	MLDL="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_DL" ]; then
+		echo "ERROR: 设了 TEFLON_DENY_LOGISTIC=1 却缺 $PATCHER_DL"
+		exit 1
+	fi
+	if [ ! -f "$MLDL" ]; then
+		echo "ERROR: 找不到 $MLDL"
+		exit 1
+	fi
+	python3 "$PATCHER_DL" "$MLDL" || {
+		echo "ERROR: deny-logistic 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3j-3] 拒绝 LOGISTIC：默认关闭（设 TEFLON_DENY_LOGISTIC=1 启用）"
+fi
+
 # ── 3k. 【诊断】alias（批量元数据迁移）取证 ───────────────────────────────
 # 【为什么需要：ROFIX(6acfef1f) 把野指针换成了可观测的 assert】
 #   u_inlines.h:503: pipe_buffer_map_range:

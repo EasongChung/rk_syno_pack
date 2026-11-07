@@ -106,6 +106,8 @@ env:
   # ★ 1x1 强制 NO_CACHE（image cache tile DMA 越界，2026-11-06 实测）
   TEFLON_NOCACHE_1X1: '1'
   TEFLON_POINTWISE_RELU6: '1'
+  # ★ 2026-11-07 WP1-B 单变量实验：拒绝 LOGISTIC，验证「尾部单算子分区 + 边界」假说
+  TEFLON_DENY_LOGISTIC: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。
