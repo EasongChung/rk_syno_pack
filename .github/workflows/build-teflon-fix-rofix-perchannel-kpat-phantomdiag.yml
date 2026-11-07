@@ -75,6 +75,10 @@ on:
         description: 'phantomdiag（取证产物：诊断全开、带 DWARF）| delivery（交付产物：修复默认开、诊断全关、strip）'
         required: false
         default: 'phantomdiag'
+      coefsram_gate:
+        description: '1 = 系数超 SRAM 且 out_c>=1024 的卷积回退 CPU'
+        required: false
+        default: '0'
       foldearly:
         description: 'foldearly（报告 55 方案 A：折叠前移+原地+保持 in_c=C；与 layout 补丁互斥）'
         required: false
@@ -108,6 +112,8 @@ env:
   TEFLON_POINTWISE_RELU6: '1'
   # ★ 2026-11-07 WP1-B 单变量实验：拒绝 LOGISTIC，验证「尾部单算子分区 + 边界」假说
   TEFLON_DENY_LOGISTIC: ${{ inputs.mode == 'delivery' && '1' || '1' }}
+  # 2026-11-07 M：系数超 SRAM 的卷积回退 CPU（默认关闭）
+  TEFLON_COEFSRAM_GATE: ${{ inputs.coefsram_gate || '0' }}
   TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。

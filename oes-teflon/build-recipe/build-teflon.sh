@@ -991,6 +991,33 @@ else
 	echo "==> [3j-3] 拒绝 LOGISTIC：默认关闭（设 TEFLON_DENY_LOGISTIC=1 启用）"
 fi
 
+# ── 3j-4. 【修复】系数超 SRAM 的卷积回退 CPU（coefsram gate）──────────────
+# 【为什么需要（2026-11-07 K2/L1 真机取证）】
+#   c335 模型 op#214（1x1, out_c=2048, in_c=976）系数 2,015,744 B >> 片上 SRAM 512 KB
+#   => PARTIAL_CACHE + out_image_z_size>=1024 档 mask(0x13/0x80000/0x0)
+#   => 该层输出资源全零 => 整图输出塌到固定类（top1 恒 320）
+#   对照组：224 logits 层 coef 同样超 SRAM，但 out_c=1001 走 >=512 档，实测正确。
+#   判据：out_c>=1024 且估算系数>=SRAM => 不接管（回退 CPU）。默认关闭。
+if [ "${TEFLON_COEFSRAM_GATE:-0}" = "1" ]; then
+	echo "==> [3j-4] 打【修复】系数超 SRAM 回退 CPU"
+	PATCHER_CG="$SCRIPT_DIR/patch-etnaviv-ml-coefsram-gate.py"
+	MLCG="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_CG" ]; then
+		echo "ERROR: 设了 TEFLON_COEFSRAM_GATE=1 却缺 $PATCHER_CG"
+		exit 1
+	fi
+	if [ ! -f "$MLCG" ]; then
+		echo "ERROR: 找不到 $MLCG"
+		exit 1
+	fi
+	python3 "$PATCHER_CG" "$MLCG" || {
+		echo "ERROR: coefsram gate 补丁应用失败 —— 不要跳过校验"
+		exit 1
+	}
+else
+	echo "==> [3j-4] 系数超 SRAM 回退 CPU：默认关闭（设 TEFLON_COEFSRAM_GATE=1 启用）"
+fi
+
 # ── 3k. 【诊断】alias（批量元数据迁移）取证 ───────────────────────────────
 # 【为什么需要：ROFIX(6acfef1f) 把野指针换成了可观测的 assert】
 #   u_inlines.h:503: pipe_buffer_map_range:
