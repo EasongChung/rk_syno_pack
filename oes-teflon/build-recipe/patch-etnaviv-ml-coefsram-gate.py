@@ -59,29 +59,19 @@ import tempfile
 MARKER = "och patch: 系数超 SRAM 的卷积回退 CPU"
 COMPILE_MARKER = "och-patch-ml-coefsram-gate"
 
-OLD = """         // Dilation and per-axis quantization not yet implemented
-         if (tensor_quantization_supported(input_tensor) &&
-             tensor_quantization_supported(weight_tensor) &&
-             tensor_quantization_supported(bias_tensor) &&
-             tensor_quantization_supported(output_tensor) &&
-             operation->conv.dilation_width_factor == 1 &&
-             operation->conv.dilation_height_factor == 1) {
-            supported = true;
-         }
-         break;
+OLD = """         struct pipe_tensor *output_tensor = operation->output_tensors[0];
 """
+NEW = """         struct pipe_tensor *output_tensor = operation->output_tensors[0];
 
-NEW = """         /* och patch: 系数超 SRAM 的卷积回退 CPU
+         /* och patch: 系数超 SRAM 的卷积回退 CPU
           *
-          * 2026-11-07 真机取证：c335 模型的 op#214（1x1, out_c=2048, in_c=976）
+          * 2026-11-07 真机取证：c335 模型 op#214（1x1, out_c=2048, in_c=976）
           *   coefficients_size = 2,015,744 B >> 片上 SRAM 512 KB
           *   => PARTIAL_CACHE + out_image_z_size>=1024 档 mask(0x13/0x80000/0x0)
           *   => 该层输出资源全零 => 整图输出塌到固定类
-          * 对照组：224 的 logits 层 coef 同样超 SRAM，但 out_c=1001 走 >=512 档，
-          *   实测正确 => 问题限于 >=1024 这一档。
+          * 对照组：224 logits 层 coef 同样超 SRAM，但 out_c=1001 走 >=512 档，实测正确。
           *
           * 判据：out_c >= 1024 且估算系数超 SRAM => 不接管，回退 CPU。
-          * 估算 = out_c * kh * kw * in_c（未压缩，偏大 => 保守方向）。
           */
          {
             unsigned och_oc = output_tensor->dims[3];
@@ -97,21 +87,11 @@ NEW = """         /* och patch: 系数超 SRAM 的卷积回退 CPU
                return false;
             }
          }
-         // Dilation and per-axis quantization not yet implemented
-         if (tensor_quantization_supported(input_tensor) &&
-             tensor_quantization_supported(weight_tensor) &&
-             tensor_quantization_supported(bias_tensor) &&
-             tensor_quantization_supported(output_tensor) &&
-             operation->conv.dilation_width_factor == 1 &&
-             operation->conv.dilation_height_factor == 1) {
-            supported = true;
-         }
 #if defined(__GNUC__) || defined(__clang__)
          __attribute__((used)) static const char och_coefgate_marker[] =
             "och-patch-ml-coefsram-gate";
          (void)och_coefgate_marker;
 #endif
-         break;
 """
 
 
