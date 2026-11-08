@@ -123,6 +123,9 @@ env:
   # ★ 2026-11-08 F2 转置诚实性：[0,2,3,1] bypass 永不精确（投毒 29 处）→ 退役落 CPU；
   #   [0,3,1,2] bypass 加守卫（act==NCHW 才 bypass）。运行期无开关（结构修复）。
   TEFLON_TFIX: ${{ inputs.tfix || '1' }}
+  # ★ 2026-11-08 F3 add-gate：v7 ADDITION 路径输出全零（v12 逐作业 dump 实测 10/10）→
+  #   ADD/SUBTRACT 不接管回落 CPU（逐元素算子，CPU 精确零风险）。
+  TEFLON_ADDGATE: ${{ inputs.addgate || '1' }}
   TEFLON_RODIAG: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ 权重 int8→uint8 域（+128）：编进产物，但**运行期**再由 TEFLON_WDOMAIN 门控，
   #   便于同产物 A/B（不设 = 与上游逐字节一致 = 全零输出；设 = 应有实数输出）。

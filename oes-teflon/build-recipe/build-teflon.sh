@@ -892,6 +892,38 @@ else
 	echo "==> [3h4/6] F2 转置诚实性：默认关闭（设 TEFLON_TFIX=1 启用）"
 fi
 
+# ── 3h5. 【修复】F3 add-gate：ADD/SUBTRACT 不接管（回落 CPU） ─────────────
+# 【根因】v7 NN 引擎 ADDITION 路径输出比特级全零（2026-11-08 v12 逐作业硬件
+#   dump 实测，报告105）：etna_ml_lower_add_v7 的 2×2×2=8 抽头核仅填
+#   weight_map[0]=255（定点 1.0），残差抽头 calloc 零；bias 校正被 +128 域
+#   污染（实测流尾 0xFF000100 巨负 → 饱和 0）。v12 全部 10 个 ADD 实灭 =
+#   MBV3 残差分支丢失 = v12 输出对不上 CPU 的直接算子缺陷。
+#   该路径从未被已验证模型覆盖（V1 族/r224 无 ADD），疑 upstream 缺陷。
+#   ADD/SUBTRACT 为逐元素小算子，CPU 执行精确零风险 → 不接管回落 CPU。
+# ⚠️ 目标文件 etnaviv_ml.c（与 3h 同一文件）。v12/c335 均无 SUBTRACT。
+#
+# 用法：TEFLON_ADDGATE=1 ./build-teflon.sh（与其它修复可叠加）
+if [ "${TEFLON_ADDGATE:-0}" = "1" ]; then
+	echo "==> [3h5/6] 打【修复】F3 add-gate（ADD/SUBTRACT 回落 CPU）"
+	PATCHER_AG="$SCRIPT_DIR/patch-etnaviv-add-gate.py"
+	MLAG="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_AG" ]; then
+		echo "ERROR: 设了 TEFLON_ADDGATE=1 却缺 $PATCHER_AG"
+		exit 1
+	fi
+	if [ ! -f "$MLAG" ]; then
+		echo "ERROR: 找不到 $MLAG"
+		exit 1
+	fi
+	python3 "$PATCHER_AG" "$MLAG" || {
+		echo "ERROR: F3 add-gate 补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出 ADD 仍走 NPU 的 .so，全零输出照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h5/6] F3 add-gate：默认关闭（设 TEFLON_ADDGATE=1 启用）"
+fi
+
 # ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────
 # 【目的：区分三条静态层面都能自洽的假说，必须用运行时数据】
 #   真机现象（675a1091 / c8e8e658 均复现）：
