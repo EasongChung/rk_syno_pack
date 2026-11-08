@@ -83,6 +83,23 @@ NEW = """   operation->output_count = node->outputs->size;
          return false;
       }
    }
+   /* och patch: A2′ CONCAT gate —— TP detranspose 读 CONCAT 产出缓冲 = 硬挂形态
+    * （2026-11-08 两次实锤：A1′ t332 / 手术模型 t333 首跑即挂；NN 输出缓冲的
+    * detranspose 全程稳定）。手术模型的通道拼接 concat 精确回 CPU，
+    * 分区 1 尾部改为第 6 个子 conv 的输出（NN 输出物化 = 已验证安全模式）。
+    * 其余 15 个 CONCAT（不同 shape）不受影响。och-patch-a2p-concatgate
+    */
+   if (node_registration->builtin_code == kTfLiteBuiltinConcatenation) {
+      struct pipe_tensor *catgate_out = operation->output_tensors[0];
+      if (catgate_out->dims[0] == 1 && catgate_out->dims[1] == 13 &&
+          catgate_out->dims[2] == 13 && catgate_out->dims[3] == 2048) {
+         teflon_debug("[och-catgate] concat out dims[%u,%u,%u,%u] -> CPU
+",
+                      catgate_out->dims[0], catgate_out->dims[1],
+                      catgate_out->dims[2], catgate_out->dims[3]);
+         return false;
+      }
+   }
 
    switch (node_registration->builtin_code) {"""
 
@@ -112,8 +129,9 @@ def selftest() -> int:
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#define kTfLiteBuiltinTranspose 18
-#define kTfLiteBuiltinPad       20
+#define kTfLiteBuiltinTranspose      18
+#define kTfLiteBuiltinPad            20
+#define kTfLiteBuiltinConcatenation   2
 typedef struct { unsigned dims[4]; } pipe_tensor;
 struct node_reg { int builtin_code; };
 static struct node_reg *node_registration;
@@ -133,6 +151,16 @@ static int patched_body(void)
                       node_registration->builtin_code,
                       hdrgate_in->dims[0], hdrgate_in->dims[1],
                       hdrgate_in->dims[2], hdrgate_in->dims[3]);
+         return 0;
+      }
+   }
+   if (node_registration->builtin_code == kTfLiteBuiltinConcatenation) {
+      pipe_tensor *catgate_out = operation_input_tensors;
+      if (catgate_out->dims[0] == 1 && catgate_out->dims[1] == 13 &&
+          catgate_out->dims[2] == 13 && catgate_out->dims[3] == 2048) {
+         teflon_debug("[och-catgate] concat out dims[%u,%u,%u,%u] -> CPU\n",
+                      catgate_out->dims[0], catgate_out->dims[1],
+                      catgate_out->dims[2], catgate_out->dims[3]);
          return 0;
       }
    }
@@ -159,6 +187,10 @@ int main(void)
    if (patched_fill(kTfLiteBuiltinTranspose, 25, 25, 488) != 1) return 7;
    /* CONV 等其它算子不受影响 */
    if (patched_fill(3, 397, 397, 3) != 1) return 8;
+   /* A2'' CONCAT gate：手术 concat（13,13,2048）挡 CPU，其余 concat 放行 */
+   if (patched_fill(kTfLiteBuiltinConcatenation, 13, 13, 2048) != 0) return 9;
+   if (patched_fill(kTfLiteBuiltinConcatenation, 50, 50, 244) != 1) return 10;
+   if (patched_fill(kTfLiteBuiltinConcatenation, 25, 25, 488) != 1) return 11;
    printf("SELFTEST PASS\n");
    return 0;
 }
@@ -183,7 +215,7 @@ int main(void)
         if "SELFTEST PASS" not in rr.stdout:
             print("FAIL: 自证输出缺失")
             return 1
-        print("OK: 行为自证 PASS（8/8 判例）")
+        print("OK: 行为自证 PASS（11/11 判例）")
     return 0
 
 
