@@ -93,8 +93,7 @@ NEW = """   operation->output_count = node->outputs->size;
       struct pipe_tensor *catgate_out = operation->output_tensors[0];
       if (catgate_out->dims[0] == 1 && catgate_out->dims[1] == 13 &&
           catgate_out->dims[2] == 13 && catgate_out->dims[3] == 2048) {
-         teflon_debug("[och-catgate] concat out dims[%u,%u,%u,%u] -> CPU
-",
+         teflon_debug("[och-catgate] concat out dims[%u,%u,%u,%u] -> CPU\n",
                       catgate_out->dims[0], catgate_out->dims[1],
                       catgate_out->dims[2], catgate_out->dims[3]);
          return false;
