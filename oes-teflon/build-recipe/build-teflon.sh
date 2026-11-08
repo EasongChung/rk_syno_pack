@@ -857,6 +857,41 @@ else
 	echo "==> [3h3/6] pooling padding 门控：默认关闭（设 TEFLON_PADDING_GATE=1 启用）"
 fi
 
+# ── 3h4. 【修复】F2 转置诚实性（bypass 有效性守卫 + [0,2,3,1] 退役） ───────
+# 【根因】etnaviv_ml.c 对显式 TRANSPOSE 无条件零搬动 bypass + act=exp=NCHW 硬编码。
+#   slot 代数定谳（2026-11-08）：
+#     - T[0,3,1,2] + 输入 C-outer（conv 输出态）→ bypass 精确（现网 muse 块间 17 处）
+#     - T[0,2,3,1] → bypass 永不精确（consumer 读得 T_in[c,h,w]，逻辑要求
+#       T_in[w,c,h]），29 处直接投毒 = c335 三重修复后仍恒 -128 的最简归因
+#   修复：[0,2,3,1] 移出支持矩阵（落 CPU，row-major 读写与边界天然一致）；
+#         [0,3,1,2] bypass 加守卫（act==NCHW 才 bypass，否则真 TP_TRANSPOSE）。
+#   自证：build-recipe/patch-etnaviv-transpose-honesty.py --selftest
+#   （numpy 有效性表 ALL PASS + C 守卫判例；标记 och-patch-f2-transpose-honesty）
+# ⚠️ 目标文件 etnaviv_ml.c（与 3h 同一文件）。
+# ⚠️ r224 回归护栏：r224 无显式 TRANSPOSE，本补丁不影响其任何路径。
+#
+# 用法：TEFLON_TFIX=1 ./build-teflon.sh（与其它修复可叠加）
+if [ "${TEFLON_TFIX:-0}" = "1" ]; then
+	echo "==> [3h4/6] 打【修复】F2 转置诚实性（bypass 守卫 + [0,2,3,1] 退役）"
+	PATCHER_TF="$SCRIPT_DIR/patch-etnaviv-transpose-honesty.py"
+	MLTF="mesa/src/gallium/drivers/etnaviv/etnaviv_ml.c"
+	if [ ! -f "$PATCHER_TF" ]; then
+		echo "ERROR: 设了 TEFLON_TFIX=1 却缺 $PATCHER_TF"
+		exit 1
+	fi
+	if [ ! -f "$MLTF" ]; then
+		echo "ERROR: 找不到 $MLTF"
+		exit 1
+	fi
+	python3 "$PATCHER_TF" "$MLTF" || {
+		echo "ERROR: F2 转置诚实性补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出**未修复**的 .so，转置投毒路径照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3h4/6] F2 转置诚实性：默认关闭（设 TEFLON_TFIX=1 启用）"
+fi
+
 # ── 3i. 【诊断】read_outputs 越界取证 ─────────────────────────────────────
 # 【目的：区分三条静态层面都能自洽的假说，必须用运行时数据】
 #   真机现象（675a1091 / c8e8e658 均复现）：
