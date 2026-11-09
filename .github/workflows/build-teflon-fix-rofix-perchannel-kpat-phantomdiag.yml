@@ -1125,9 +1125,6 @@ jobs:
                         echo "  ok(skipped): $pat（CLAMP 开关关闭）"; continue
                       fi ;;
                   esac
-                    continue
-                  fi
-                  ;;
               esac
               echo "  ERROR: 构建日志里缺少「$pat」"
               ok=0
