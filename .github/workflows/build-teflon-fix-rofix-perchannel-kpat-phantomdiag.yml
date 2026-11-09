@@ -83,6 +83,10 @@ on:
         description: 'foldearly（报告 55 方案 A：折叠前移+原地+保持 in_c=C；与 layout 补丁互斥）'
         required: false
         default: '0'
+      f4:
+        description: '1 = F4 幻影通道钳位补全（与 PHANTOM_CLAMP 互斥；交付判决实验件）'
+        required: false
+        default: '0'
       gate_hdr:
         description: '1 = A1 实验：头部 TRANSPOSE/PAD @395/397 回退 CPU（N1 布局台账脱钩）'
         required: false
@@ -105,7 +109,9 @@ env:
   TEFLON_KPAT: ${{ inputs.mode == 'delivery' && '0' || '1' }}
   # ★ B-diag：两条幻影补丁 + read_outputs 取证（★ ROFIX 必须为 1；取证叠加在 ROFIX 之上，
   #   见 build-teflon.sh 3j-2 与报告 38：ROFIX=0 的取证产物会在真机上整机硬挂）
-  TEFLON_PHANTOM_CLAMP: ${{ inputs.mode == 'delivery' && '0' || '1' }}
+  # ★ F4（2026-11-09）：f4=1 时强制 PHANTOM_CLAMP=0（同站点互斥）
+  TEFLON_F4: ${{ inputs.f4 || '0' }}
+  TEFLON_PHANTOM_CLAMP: ${{ inputs.f4 == '1' && '0' || (inputs.mode == 'delivery' && '0' || '1') }}
   TEFLON_PHANTOM_GATE: ${{ inputs.mode == 'delivery' && '1' || '1' }}
   # ★ 报告 56：stride>1 的 depthwise 在 v7 上走 POOLING_FIRST_PIXEL，
   #   该路径不消费 padding_top/left ⇒ pad_top=1 的层会整体偏 1 像素。
@@ -904,11 +910,34 @@ jobs:
           print('CREATEDIAG-DOCS: PASS')
           PY
 
+      # ★ F4 补丁器 mock 自测（零 mesa 源码：直接测补丁器的结构门）
+      - name: Preflight - F4 patcher mock self-test
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import os, shutil, subprocess, sys, tempfile
+          P = 'oes-teflon/build-recipe/patch-etnaviv-f4-phantom-fix.py'
+          OC = 'oes-teflon/build-recipe/patch-etnaviv-outchannel-clamp.py'
+          F = 'oes-teflon/third_party/mesa-src-26.2.5/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c'
+          if os.path.isfile(F):
+              d = tempfile.mkdtemp(); v7 = os.path.join(d, 'v7.c'); shutil.copyfile(F, v7)
+              for p in (OC, P):
+                  r = subprocess.run([sys.executable, p, v7], capture_output=True, text=True)
+                  assert r.returncode == 0, p + ': ' + r.stderr
+              s = open(v7, encoding='utf-8').read()
+              assert 'och-patch-v7-f4-phantom-fix' in s
+              assert s.count('out_channel = och_f4_clamp_out_channel(out_channel, output_channels);') == 3
+              r = subprocess.run([sys.executable, P, v7], capture_output=True, text=True)
+              assert r.returncode != 0, 'F4 重复应用竟然通过'
+              print('F4-MOCK: PASS (OCFIX前置 + 三站点 + 重复应用拒绝)')
+          else:
+              print('F4-MOCK: SKIP (仓库无内嵌 mesa 源码；构建期补丁器自身的结构门为准)')
+          PY
       - name: Build libteflon.so (FIX_V7 + OCFIX + FSGUARD + ROFIX + PERCHANNEL, UNSTRIPPED)
         run: |
           set -euxo pipefail
           chmod +x oes-teflon/build-recipe/build-teflon.sh
-          echo "TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0} TEFLON_PADDING_GATE=${TEFLON_PADDING_GATE:-0} TEFLON_RODIAG=${TEFLON_RODIAG:-0}"
+          echo "TEFLON_F4=${TEFLON_F4:-0} TEFLON_FIX_V7=${TEFLON_FIX_V7} TEFLON_OCFIX=${TEFLON_OCFIX} TEFLON_FSGUARD=${TEFLON_FSGUARD} TEFLON_ROFIX=${TEFLON_ROFIX} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG} TEFLON_DIAG=${TEFLON_DIAG} TEFLON_WCDIAG=${TEFLON_WCDIAG} TEFLON_DEBUG_INFO=${TEFLON_DEBUG_INFO} TEFLON_NO_STRIP=${TEFLON_NO_STRIP} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0} TEFLON_PADDING_GATE=${TEFLON_PADDING_GATE:-0} TEFLON_RODIAG=${TEFLON_RODIAG:-0}"
           ./oes-teflon/build-recipe/build-teflon.sh "$RUNNER_TEMP/teflon-build" 2>&1 \
             | tee "$RUNNER_TEMP/build-fix.log"
 
@@ -1072,7 +1101,9 @@ jobs:
                      '[3g2/6] 打【修复】幻影通道 out_channel 钳位' \
                      '[phantom-clamp] 已加幻影通道钳位' \
                      '[3h2/6] 打【修复】幻影通道形状门控' \
-                     '[och-pgate] 已加幻影通道形状门控'; do
+                     '[och-pgate] 已加幻影通道形状门控' \
+                     '[3g3/6] 打【修复·F4】幻影通道钳位补全' \
+                     '[f4-phantom-fix] 已加 F4 幻影通道钳位'; do
 
             if grep -qF "$pat" "$L"; then
               echo "  OK: $pat"
@@ -1080,9 +1111,20 @@ jobs:
               # ★ 有些断言只对**取证变体**成立（CLAMP 等）⇒ 开关关着时跳过，不算失败。
               #   （交付模式 PHANTOM_CLAMP=0 ⇒ 构建日志里当然没有钳位补丁的消息）
               case "$pat" in
-                '[3g2/6] 打【修复】幻影通道 out_channel 钳位'|'[phantom-clamp] 已加幻影通道钳位')
-                  if [ "${TEFLON_PHANTOM_CLAMP:-0}" != "1" ]; then
-                    echo "  ok(skipped): $pat（CLAMP 开关关闭）"
+                '[3g2/6] 打【修复】幻影通道 out_channel 钳位'|'[phantom-clamp] 已加幻影通道钳位'|\
+                '[3g3/6] 打【修复·F4】幻影通道钳位补全'|'[f4-phantom-fix] 已加 F4 幻影通道钳位')
+                  # ★ F4 与 CLAMP 各自用各自的开关判定，互不影响；
+                  #   内层 case 无匹配时退出码 0 会误跳过 ⇒ 必须显式分派。
+                  case "$pat" in
+                    *F4*|*f4-phantom*)
+                      if [ "${TEFLON_F4:-0}" != "1" ]; then
+                        echo "  ok(skipped): $pat（F4 开关关闭）"; continue
+                      fi ;;
+                    *)
+                      if [ "${TEFLON_PHANTOM_CLAMP:-0}" != "1" ]; then
+                        echo "  ok(skipped): $pat（CLAMP 开关关闭）"; continue
+                      fi ;;
+                  esac
                     continue
                   fi
                   ;;
@@ -1264,6 +1306,27 @@ jobs:
             exit 1
           fi
           echo "STRING-CHECK: och-patch-v7-outchannel-clamp PRESENT (clamp really in .so)"
+          # ★★ F4 双向 strings 门（oca 两轮复核要求）
+          if [ "${TEFLON_F4:-0}" = "1" ]; then
+            if ! strings -a "$SO" | grep -qF 'och-patch-v7-f4-phantom-fix'; then
+              echo "ERROR: TEFLON_F4=1 但产物里没有 F4 标记"; exit 1
+            fi
+            echo "STRING-CHECK: och-patch-v7-f4-phantom-fix PRESENT (F4 really in .so)"
+          else
+            if strings -a "$SO" | grep -qF 'och-patch-v7-f4-phantom-fix'; then
+              echo "ERROR: TEFLON_F4=0 但产物里有 F4 标记"; exit 1
+            fi
+            echo "STRING-CHECK: och-patch-v7-f4-phantom-fix absent (F4 off)"
+          fi
+          # ★ 交付模式四个运行期开关字面量必须在
+          if [ "$TEFLON_MODE" = "delivery" ]; then
+            for pat in 'TEFLON_WDOMAIN' 'TEFLON_ODETRANS' 'TEFLON_PCDOMAIN' 'TEFLON_PHANTOM_GATE'; do
+              if ! strings -a "$SO" | grep -qF "$pat"; then
+                echo "ERROR: 交付产物缺少运行期开关字面量 $pat"; exit 1
+              fi
+              echo "STRING-CHECK: $pat present (runtime switch compiled in)"
+            done
+          fi
           # ★★ FSGUARD 的二进制级证据：`ML_DBG` 的**格式串是真字面量**。
           #   定义（etnaviv_ml.h:143）：
           #     #define ML_DBG(fmt, ...) do { if (DBG_ENABLED(ETNA_DBG_ML_MSGS))
@@ -1343,7 +1406,8 @@ jobs:
           done
           if [ "$TEFLON_MODE" = "delivery" ]; then
             # ★ 交付版的额外门：三个修复的标记**必须在**，诊断/实验标记**必须不在**
-            for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]' 'och-patch-ml-resource-width'; do
+            for pat in '[och-wdom]' '[och-odetrans]' '[och-pcdomain]' 'och-patch-ml-resource-width' \
+                       ${TEFLON_F4:+och-patch-v7-f4-phantom-fix}; do
               if ! strings -a "$SO" | grep -qF "$pat"; then
                 echo "ERROR: 产物里缺少 $pat —— 该修复没进二进制，交付产物会带缺陷"
                 exit 1
@@ -1474,6 +1538,16 @@ jobs:
           OUT="$RUNNER_TEMP/teflon-build/out"
           mkdir -p artifact
           cp "$OUT/libteflon.so" artifact/
+          # ★ as-built 源件（oca 第5点：这次 build 到底是什么源码）
+          SRC="$RUNNER_TEMP/teflon-build/mesa/src/gallium"
+          mkdir -p artifact/as-built
+          for f in drivers/etnaviv/etnaviv_ml.c drivers/etnaviv/etnaviv_ml_nn.c \
+                   drivers/etnaviv/etnaviv_ml_nn_v7.c frontends/teflon/tfl_device.c; do
+            if [ -f "$SRC/$f" ]; then cp "$SRC/$f" artifact/as-built/; else
+              echo "ERROR: as-built 源件缺失: $f"; exit 1; fi
+          done
+          cp oes-teflon/build-recipe/build-teflon.sh artifact/as-built/
+          cp .github/workflows/build-teflon-fix-rofix-perchannel-kpat-phantomdiag.yml artifact/as-built/
           # ★ 第 23 步的断言原文（**日志侧**证据；产物侧证据是 .so 里的标记）
           if [ -f "$RUNNER_TEMP/teflon-build/step23-assertions.log" ]; then
             cp "$RUNNER_TEMP/teflon-build/step23-assertions.log" artifact/
@@ -1566,6 +1640,11 @@ jobs:
             echo "TEFLON_FIX_V7=${TEFLON_FIX_V7:-0} TEFLON_OCFIX=${TEFLON_OCFIX:-0} TEFLON_FSGUARD=${TEFLON_FSGUARD:-0} TEFLON_ROFIX=${TEFLON_ROFIX:-0} TEFLON_ALIASDIAG=${TEFLON_ALIASDIAG:-0} TEFLON_CREATEDIAG=${TEFLON_CREATEDIAG:-0}"
             echo "TEFLON_DIAG=${TEFLON_DIAG:-0} TEFLON_WCDIAG=${TEFLON_WCDIAG:-0}"
             echo "teflon_debug_info=${TEFLON_DEBUG_INFO:-0} teflon_no_strip=${TEFLON_NO_STRIP:-0}"
+            echo "TEFLON_F4=${TEFLON_F4:-0} TEFLON_PHANTOM_CLAMP=${TEFLON_PHANTOM_CLAMP:-0} TEFLON_PHANTOM_GATE=${TEFLON_PHANTOM_GATE:-0}"
+            echo "as_built_git_commit=${GITHUB_SHA}"
+            echo "patcher_f4_sha256=$(sha256sum oes-teflon/build-recipe/patch-etnaviv-f4-phantom-fix.py | cut -d' ' -f1)"
+            echo "patcher_pgate_sha256=$(sha256sum oes-teflon/build-recipe/patch-etnaviv-phantom-gate.py | cut -d' ' -f1)"
+            echo "patcher_ocfix_sha256=$(sha256sum oes-teflon/build-recipe/patch-etnaviv-outchannel-clamp.py | cut -d' ' -f1)"
             echo "warning=NOT validated: must pass acceptance level 4 (byte-identical vs x86 baseline)"
             echo "expected=takeover op count drops by exactly 2 (ops #58/#153 now run on CPU); this is BY DESIGN,"
             echo "         not a regression. If the drop is NOT 2, read it as 'guard did not take effect'"

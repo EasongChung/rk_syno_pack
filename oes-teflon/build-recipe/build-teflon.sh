@@ -643,6 +643,46 @@ else
 	echo "==> [3g2/6] 幻影通道 out_channel 钳位：默认关闭（设 TEFLON_PHANTOM_CLAMP=1 启用）"
 fi
 
+# ── 3g3. 【修复·F4】幻影通道钳位补全（转正候选，交接包 HANDOFF-20261109 §4） ──
+# 【目的】c335 解锁线：修掉 kpat/%8 缺陷本体，拿回 out_c=122/244 族卷积的 NPU 接管。
+#   与 PHANTOM_CLAMP 同语义（钳到 C-1）、同站点（write_core_6 两处 + sequential 一处），
+#   另加：F4 专属编译期标记 + ML_DBG 遥测（och-f4: phantom，ml_msgs 可见）+ fail-closed 前置。
+# ⚠️ 硬门 1：必须 TEFLON_OCFIX=1（interleaved 由 OCFIX 管；补丁器也会二次校验）。
+# ⚠️ 硬门 2：与 TEFLON_PHANTOM_CLAMP=1 互斥（同站点，防双重钳位）。
+# ⚠️ 数值安全未决：store/add 语义判决（合成 C=122 单 conv 逐元素比对）通过前，
+#    本开关产物只可取证，不得交付。默认关闭 ⇒ 不设时产物与原来完全一致。
+#
+# 用法：TEFLON_OCFIX=1 TEFLON_F4=1 ./build-teflon.sh
+if [ "${TEFLON_F4:-0}" = "1" ]; then
+	if [ "${TEFLON_OCFIX:-0}" != "1" ]; then
+		echo "ERROR: TEFLON_F4=1 必须同时 TEFLON_OCFIX=1（interleaved 钳位前置）"
+		exit 1
+	fi
+	if [ "${TEFLON_PHANTOM_CLAMP:-0}" = "1" ]; then
+		echo "ERROR: TEFLON_F4 与 TEFLON_PHANTOM_CLAMP 互斥（同站点钳位，只能启用其一）"
+		exit 1
+	fi
+	echo "==> [3g3/6] 打【修复·F4】幻影通道钳位补全（write_core_6 + write_core_sequential）"
+	PATCHERF4="$SCRIPT_DIR/patch-etnaviv-f4-phantom-fix.py"
+	ML7F4="mesa/src/gallium/drivers/etnaviv/etnaviv_ml_nn_v7.c"
+	if [ ! -f "$PATCHERF4" ]; then
+		echo "ERROR: 设了 TEFLON_F4=1 却缺 $PATCHERF4"
+		exit 1
+	fi
+	if [ ! -f "$ML7F4" ]; then
+		echo "ERROR: 找不到 $ML7F4"
+		exit 1
+	fi
+	python3 "$PATCHERF4" "$ML7F4" || {
+		echo "ERROR: F4 幻影通道钳位补丁应用失败 —— 不要跳过校验"
+		echo "       （会静默产出未修复的 .so，越界/挂死会照旧）。"
+		exit 1
+	}
+else
+	echo "==> [3g3/6] F4 幻影通道钳位补全：默认关闭（设 TEFLON_F4=1 启用，需 OCFIX=1）"
+fi
+
+
 # ── 3e. 【修复】v7 calculate_bias_correction 漏 depthwise 特判
 # 上游 Mesa 缺陷（已静态证明，见 verify/reports/05 与 06）：
 #   etnaviv_ml_nn_v7.c 的 calculate_bias_correction() 用 operation->input_channels

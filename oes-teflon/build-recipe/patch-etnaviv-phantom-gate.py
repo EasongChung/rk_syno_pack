@@ -41,7 +41,7 @@ C=122/196/220/240/248/252/260/280 不挂。
 ## 已知局限（写清楚，避免被当成"已根治"）
 
   1. 这是**兜底**，不是根治：被门控的形状只是"不挂"，没有 NPU 加速。
-     要拿回加速 ⇒ 模型侧 pad-to-8（见 tools/pad-to-8.py）或长期移植 v8 分配（P5）。
+     要拿回加速 ⇒ F4 钳位修复（patch-etnaviv-f4-phantom-fix.py）或模型侧 pad-to-8。
   2. 判据只用了 `m > 0`（必要条件），**没有用**更紧的
      `rem==1 ∨ FP≥3 ∨ Aff≥3`（那需要 screen 算 sb/d/rem）。
   3. 只有**卷积**被门控；其它算子类型不受影响（但它们不产生幻影通道）。
@@ -52,9 +52,22 @@ C=122/196/220/240/248/252/260/280 不挂。
 
 由 `build-teflon.sh` 的 `TEFLON_PHANTOM_GATE=1` 启用，默认关。
 产物判据：`strings libteflon.so | grep och-patch-v7-phantom-gate`
+
+## 运行期开关（2026-11-09 F4 线增补，oca 两轮复核采纳）
+
+编译进产物后，门的行为再由运行期环境变量 `TEFLON_PHANTOM_GATE` 门控：
+
+  · unset 或 =1 ⇒ 门开（与本补丁历史行为逐字节一致，交付默认）；
+  · =0          ⇒ 关门（F4 取证/判决实验用：让 out_c%8!=0 的形状进 NPU）。
+
+关门时打 ML_DBG 通告（不静默）；门开拒绝形状时仍打 ML_DBG。
+判决实验协议（第一批）：TEFLON_PHANTOM_GATE=0 + ETNA_MESA_DEBUG=ml_msgs。
+⚠️ 关门运行只可取证，数值判决通过前不得交付。
+旧版补丁（无运行期开关）已应用的树：本补丁器自动原地升级（不拒绝）。
 """
 
 import argparse
+import re
 import sys
 
 MARKER = "och patch: 幻影通道形状门控"
@@ -91,13 +104,20 @@ NEW = ('      case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {\n'
        '          * 这里把 m>0 的形状整体挡在 NPU 之外 ⇒ 该机制不可能再触发。\n'
        '          * 代价只是这些形状回落 CPU（少加速），换来零挂死风险。\n'
        '          *\n'
-       '          * ⚠️ 这是**兜底**不是根治：要拿回加速 ⇒ 模型侧 pad-to-8 或长期移植 v8 分配。\n'
+       '          * ⚠️ 这是**兜底**不是根治：要拿回加速 ⇒ F4 钳位修复或模型侧 pad-to-8。\n'
        '          * ⚠️ 判据用固定的 8（A311D 的 nn_core_count，NNDUMP 实测确认）：换芯片若\n'
        '          *    cores_used 不同，本判据只会**过度门控**（少加速），不会漏放行 ⇒ 仍安全。\n'
        '          */\n'
        '         {\n'
+       '            /* och patch: 幻影门运行期开关（F4 线，2026-11-09）\n'
+       '             * unset/1 = 门开（默认，与历史行为一致）；0 = 关门（取证/判决用）。\n'
+       '             * 关门通告走 ML_DBG 不静默；拒绝形状 likewise。 */\n'
+       '            const char *och_pgate_env = getenv("TEFLON_PHANTOM_GATE");\n'
+       '            int och_pgate_on = !(och_pgate_env && och_pgate_env[0] == \'0\' && och_pgate_env[1] == \'\\0\');\n'
        '            unsigned och_out_c = operation->output_tensors[0]->dims[3];\n'
-       '            if (och_out_c % 8 != 0) {\n'
+       '            if (!och_pgate_on) {\n'
+       '               ML_DBG("och-pgate: 幻影门运行期关闭 (TEFLON_PHANTOM_GATE=0, out_c=%u)\\n", och_out_c);\n'
+       '            } else if (och_out_c % 8 != 0) {\n'
        '               ML_DBG("幻影通道形状 (out_c=%u %% 8 != 0)，回退 CPU\\n", och_out_c);\n'
        '               /* return false 而不是 break：break 依赖「此刻 supported 仍是 false」\n'
        '                * 这个隐含前提；将来若有人把 supported = true 提到守卫之前，\n'
@@ -115,6 +135,33 @@ NEW = ('      case PIPE_ML_OPERATION_TYPE_CONVOLUTION: {\n'
        '#endif\n')
 # ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
 
+# 旧版守卫块头部（无运行期开关）——升级路径的定位锚点
+LEGACY_HEAD = ('         {\n'
+               '            unsigned och_out_c = operation->output_tensors[0]->dims[3];\n'
+               '            if (och_out_c % 8 != 0) {\n')
+UPGRADED_HEAD = ('         {\n'
+                 '            /* och patch: 幻影门运行期开关（F4 线，2026-11-09）\n'
+                 '             * unset/1 = 门开（默认，与历史行为一致）；0 = 关门（取证/判决用）。\n'
+                 '             * 关门通告走 ML_DBG 不静默；拒绝形状 likewise。 */\n'
+                 '            const char *och_pgate_env = getenv("TEFLON_PHANTOM_GATE");\n'
+                 '            int och_pgate_on = !(och_pgate_env && och_pgate_env[0] == \'0\' && och_pgate_env[1] == \'\\0\');\n'
+                 '            unsigned och_out_c = operation->output_tensors[0]->dims[3];\n'
+                 '            if (!och_pgate_on) {\n'
+                 '               ML_DBG("och-pgate: 幻影门运行期关闭 (TEFLON_PHANTOM_GATE=0, out_c=%u)\\n", och_out_c);\n'
+                 '            } else if (och_out_c % 8 != 0) {\n')
+
+
+def ensure_stdlib(src):
+    """getenv 需要 <stdlib.h>：幂等补全（KPAT 补丁器先例）。"""
+    if "#include <stdlib.h>" in src:
+        return src
+    m_inc = re.search(r'^#include .*$', src, re.M)
+    if not m_inc:
+        sys.stderr.write("ERROR: 源文件里找不到 #include 行，无法补 <stdlib.h>（getenv 无声明）\n")
+        return None
+    return (src[:m_inc.end()] + "\n#include <stdlib.h> /* och-pgate: getenv 需要 */"
+            + src[m_inc.end():])
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -125,8 +172,28 @@ def main() -> int:
         src = f.read()
 
     if MARKER in src:
-        sys.stderr.write("ERROR: " + args.path + " 已包含本补丁，拒绝重复应用。\n")
-        return 1
+        if 'getenv("TEFLON_PHANTOM_GATE")' in src:
+            sys.stderr.write("ERROR: " + args.path + " 已包含本补丁（含运行期开关），拒绝重复应用。\n")
+            return 1
+        # 旧版（无运行期开关）升级路径：守卫块头部原地替换；其余部分（拒绝日志/
+        # return false/编译期标记）逐字保留。CI 从 pristine mesa 构建走不到这里。
+        if src.count(LEGACY_HEAD) != 1:
+            sys.stderr.write("ERROR: 旧版守卫块定位失败（出现 %d 次，期望 1）—— 人工核对，不要跳过\n"
+                             % src.count(LEGACY_HEAD))
+            return 1
+        src = src.replace(LEGACY_HEAD, UPGRADED_HEAD, 1)
+        src = ensure_stdlib(src)
+        if src is None:
+            return 1
+        for token in ('getenv("TEFLON_PHANTOM_GATE")', "och-pgate: 幻影门运行期关闭",
+                      "och_out_c % 8 != 0", "return false;", COMPILE_MARKER):
+            if token not in src:
+                sys.stderr.write("ERROR: 升级后自检失败，缺少: " + token + "\n")
+                return 1
+        with open(args.path, "w", encoding="utf-8") as f:
+            f.write(src)
+        print("  [och-pgate] 旧版已升级：运行期开关 TEFLON_PHANTOM_GATE（unset/1=门开，0=关）")
+        return 0
 
     n = src.count(OLD)
     if n != 1:
@@ -152,12 +219,16 @@ def main() -> int:
             sys.stderr.write(
                 "ERROR: 在 " + TARGET_FN + " 函数体内 `" + token + "` 出现 " + str(got)
                 + " 处，至少应有 " + str(want) + " 处。\n"
-                "       Mesa 结构已变 —— 守卫逻辑依赖这些点，请人工核对后重新生成补丁。\n")
+                "       Mesa 结构已变 —— 守卫逻辑依赖这些点，请人工核对并重新生成补丁。\n")
             return 1
 
     src = src.replace(OLD, NEW, 1)
+    src = ensure_stdlib(src)
+    if src is None:
+        return 1
 
-    for token in (MARKER, COMPILE_MARKER, "och_out_c % 8 != 0", "return false;"):
+    for token in (MARKER, COMPILE_MARKER, "och_out_c % 8 != 0", "return false;",
+                  'getenv("TEFLON_PHANTOM_GATE")', "och-pgate: 幻影门运行期关闭"):
         if token not in src:
             sys.stderr.write("ERROR: 打完补丁后自检失败，缺少: " + token + "\n")
             return 1
@@ -175,6 +246,9 @@ def main() -> int:
         return 1
     if "och_out_c % 8 != 0" not in guard:
         sys.stderr.write("ERROR: 守卫块内没有判据 —— 补丁形态不对\n")
+        return 1
+    if 'getenv("TEFLON_PHANTOM_GATE")' not in guard:
+        sys.stderr.write("ERROR: 守卫块内没有运行期开关 —— 补丁形态不对\n")
         return 1
     # ⚠️ 本补丁的 NEW **以 OLD 为前缀**（只追加不替换）⇒ 「锚点不再出现」这个检查
     #    在数学上永远不成立（OCFIX 补丁已实测踩到过这个坑：正例被全部误拒）。
@@ -195,8 +269,9 @@ def main() -> int:
         f.write(src)
 
     print("  [och-pgate] 已加幻影通道形状门控：out_c %% 8 != 0 的卷积不接管（回落 CPU）")
+    print("  [och-pgate] 运行期开关：TEFLON_PHANTOM_GATE unset/1=门开（默认），0=关（取证/判决用）")
     print("  [och-pgate] 预期效果：不挂 + 接管数下降；**兜底不是根治**")
-    print("  [och-pgate] 要拿回加速 ⇒ 模型侧 pad-to-8（tools/pad-to-8.py）或长期 P5")
+    print("  [och-pgate] 要拿回加速 ⇒ F4 钳位修复（patch-etnaviv-f4-phantom-fix.py）或模型侧 pad-to-8")
     return 0
 
 
