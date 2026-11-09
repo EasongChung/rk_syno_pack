@@ -101,7 +101,7 @@ static inline unsigned
 och_f4_clamp_out_channel(unsigned out_channel, unsigned output_channels)
 {
    if (output_channels > 0 && out_channel >= output_channels) {
-      ML_DBG("och-f4: phantom out_channel %u -> %u (output_channels=%u)\n",
+      ML_DBG("och-f4: phantom out_channel %u -> %u (output_channels=%u)\\n",
              out_channel, output_channels - 1, output_channels);
       return output_channels - 1;
    }

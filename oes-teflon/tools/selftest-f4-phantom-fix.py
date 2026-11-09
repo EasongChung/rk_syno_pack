@@ -165,11 +165,16 @@ def helper_compile_check(patched_text):
     if start < 0 or end < 0:
         fail("正控制 4 失败：helper 块边界定位失败")
     block = patched_text[start:end + len("#endif")]
-    # ML_DBG 在真实源码由头文件提供；语法检查给一个空定义
-    code = "#define ML_DBG(...) do {} while (0)\n" + block + "\n"
+    # ★ 不能把 ML_DBG 定义成空宏（do {} while(0) 会把格式串当宏参数丢掉，
+    #   编译器看不到跨行字符串 —— CI run 42547644410 就是被这个假绿放过的：
+    #   helper 里 ML_DBG 的 "\n" 被写成真换行 ⇒ missing terminating " character）。
+    #   这里模拟真实 ML_DBG：格式串作为 _debug_printf 的第一个实参参与编译。
+    code = ("extern void _debug_printf(const char *, ...);\n"
+            "#define ML_DBG(fmt, ...) _debug_printf(fmt, ##__VA_ARGS__)\n"
+            + block + "\n")
 
     def compiles(src):
-        p = subprocess.run([cc, "-x", "c", "-std=c11", "-fsyntax-only", "-"],
+        p = subprocess.run([cc, "-x", "c", "-std=c11", "-Werror=format", "-fsyntax-only", "-"],
                            input=src, text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return p.returncode == 0, p.stderr
