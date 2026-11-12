@@ -186,12 +186,29 @@ jobs:
             [ "$got" = "$want" ] || { echo "ERROR: $node opp-microvolt target $got, expected $want"; exit 1; }
             echo "  $node opp-microvolt target = $got uV"
           done
-          if dtc -I dtb -O dts "$DTB" 2>/dev/null | grep -q 'opp-microvolt-L'; then
+          # Scope the check to the CPU OPP table.  The NPU table still carries
+          # opp-microvolt-L* on purpose: the NPU is powered from vdd_fixed (a
+          # fixed 950 mV regulator), so it has no voltage scaling to bypass and
+          # those properties are inert.  A whole-DTB grep would flag them.
+          dtc -I dtb -O dts "$DTB" 2>/dev/null > /tmp/ds124-decompiled.dts
+          awk '
+            /cpu0-opp-table[ \t]*\{/ { inside = 1 }
+            inside {
+              print
+              depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+              if (depth == 0) exit
+            }
+          ' /tmp/ds124-decompiled.dts > /tmp/ds124-cpu-opp.dts
+          [ -s /tmp/ds124-cpu-opp.dts ] || {
+            echo "ERROR: could not extract cpu0-opp-table from the decompiled DTB"
+            exit 1
+          }
+          if grep -q 'opp-microvolt-L' /tmp/ds124-cpu-opp.dts; then
             echo "ERROR: cpu0-opp-table still carries opp-microvolt-L* (board voltage would be bypassed)"
-            dtc -I dtb -O dts "$DTB" 2>/dev/null | grep -n 'opp-microvolt-L' | head
+            grep -n 'opp-microvolt-L' /tmp/ds124-cpu-opp.dts | head
             exit 1
           fi
-          echo "  no opp-microvolt-L* in cpu0-opp-table"
+          echo "  no opp-microvolt-L* in cpu0-opp-table (NPU table exempt: fixed rail)"
 
           echo "== 1800 MHz must NOT be offered (bad bin: hangs the box at 56 C)"
           if fdtget -l "$DTB" /cpu0-opp-table | grep -q '^opp-1800000000$'; then
