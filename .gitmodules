@@ -3,4 +3,26 @@
 	url = https://github.com/prt1999/SynoXtract.git
 [submodule "linux-5.10.x"]
 	path = linux-5.10.x
-	url = https://github.com/931122/rk_syno_kernel.git
+	# 2026-11-12: switched from the upstream repo 931122/rk_syno_kernel to our
+	# own fork EasongChung/rk_syno_kernel.  The upstream repo is read-only for
+	# us (push is rejected with 403), and the fork carries the identical
+	# history - its default branch rk-dsm-port-7.3-86009 was at the same
+	# baseline c6d327b94 before this change.
+	#
+	# The fork now also carries the board thermal policy for the OEC/DS124:
+	#   7aa3d1f4  rk3566: retune the OEC/DS124 thermal ladder for a fanless box
+	#             60/68/75 C ladder, NPU coupled to the same trips, the 1800 MHz
+	#             bad bin removed from the CPU OPP table, and the board level
+	#             opp-microvolt made effective by dropping the inherited
+	#             opp-microvolt-L* properties.
+	#
+	# Consequences to keep in mind:
+	#   - the build now depends on this fork existing; if it is deleted or
+	#     renamed, every CI run fails to fetch the submodule
+	#   - the fork does not follow the upstream automatically; sync it by hand
+	#
+	# To go back to the upstream repo: restore the url below to
+	#   https://github.com/931122/rk_syno_kernel.git
+	# and point the submodule back at the upstream commit, e.g.
+	#   git update-index --cacheinfo 160000,c6d327b94e694c8d380618d0831c30d92f20a5f4,linux-5.10.x
+	url = https://github.com/EasongChung/rk_syno_kernel.git
