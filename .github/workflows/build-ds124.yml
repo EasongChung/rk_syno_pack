@@ -239,7 +239,7 @@ jobs:
           for sym in CONFIG_THERMAL CONFIG_CPU_THERMAL CONFIG_THERMAL_OF \
                       CONFIG_ROCKCHIP_THERMAL CONFIG_THERMAL_GOV_STEP_WISE \
                       CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE CONFIG_CPU_FREQ \
-                      CONFIG_CPU_FREQ_DT CONFIG_DEVFREQ_THERMAL; do
+                      CONFIG_CPUFREQ_DT CONFIG_DEVFREQ_THERMAL; do
             grep -qE "^${sym}=y" build/out/kernel-7.3/.config || \
               { echo "ERROR: ${sym} missing from the built kernel config"; exit 1; }
             echo "  ${sym}=y"
