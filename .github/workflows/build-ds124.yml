@@ -120,7 +120,7 @@ jobs:
             output/dsm/boot-root/boot/extlinux/extlinux.conf
           grep -q 'cma=256M' output/dsm/boot-root/boot/extlinux/extlinux.conf || { echo "ERROR: cma=256M missing from bootargs (VPU DMA-heap path needs it)"; exit 1; }
 
-      - name: Verify thermal policy (60/68/75 C ladder + NPU coupling)
+      - name: Verify thermal policy (60/68/75 C CPU ladder, NPU not involved)
         run: |
           set -euo pipefail
           DTB=$(ls output/dsm/boot-root/boot/*.dtb)
@@ -133,9 +133,9 @@ jobs:
             [ "$got" = "$want" ] || { echo "ERROR: $node temperature $got, expected $want"; exit 1; }
           done
 
-          echo "== Cooling maps must bind CPU and NPU to all three trips"
+          echo "== Cooling maps must bind the CPU to all three trips"
           M=/thermal-zones/soc-thermal/cooling-maps
-          for map in map0 map1 map2 map3 map4 map5 map6; do
+          for map in map0 map1 map2 map3; do
             trip=$(fdtget -t x "$DTB" "$M/$map" trip)
             dev=$(fdtget -t x "$DTB" "$M/$map" cooling-device)
             [ -n "$trip" ] && [ -n "$dev" ] || { echo "ERROR: $map missing trip/cooling-device"; exit 1; }
@@ -156,17 +156,20 @@ jobs:
               { echo "ERROR: $map min state $got_min, expected ffffffff (THERMAL_NO_LIMIT)"; exit 1; }
             echo "  $map max_state=$got_max min_state=$got_min (unlimited low end)"
           done
-          # NPU must be a legal cooling-map target
-          fdtget -t i "$DTB" /npu@fde40000 '#cooling-cells' | grep -qx 2 || \
-            { echo "ERROR: npu@fde40000 missing #cooling-cells=2 (cannot be a map target)"; exit 1; }
-          for pair in map4:1 map5:3 map6:5; do
-            map="${pair%%:*}"; want="${pair##*:}"
-            vals=$(fdtget -t x "$DTB" "$M/$map" cooling-device | tr ' ' '\n')
-            got_max=$(echo "$vals" | sed -n 2p); got_min=$(echo "$vals" | sed -n 3p)
-            [ "$got_max" = "$want" ] || { echo "ERROR: $map NPU max state $got_max, expected $want"; exit 1; }
-            [ "$got_min" = "ffffffff" ] || \
-              { echo "ERROR: $map NPU min state $got_min, expected ffffffff (THERMAL_NO_LIMIT)"; exit 1; }
-          done
+          # The NPU must NOT be a cooling-map target: its frequency is static
+          # (rknpu_ondemand does not sample load) and already sits at 600 MHz on
+          # a fixed 950 mV rail, so a thermal step on it changes nothing.
+          # High-temperature protection for the NPU is a userspace task gate in
+          # the RK3566_NPU_Server package (68 C pause / 65 C resume).
+          if fdtget -l "$DTB" "$M" 2>/dev/null | grep -qx 'map4'; then
+            echo "ERROR: cooling-maps/map4 is back - the NPU must not be bound to a trip"
+            exit 1
+          fi
+          if fdtget -t i "$DTB" /npu@fde40000 '#cooling-cells' >/dev/null 2>&1; then
+            echo "ERROR: npu@fde40000 carries #cooling-cells again"
+            exit 1
+          fi
+          echo "  NPU is not a cooling device (userspace task gate handles it)"
 
           echo "== CPU OPP voltage matrix (per-bin overrides must not bypass the board value)"
           # rockchip_set_opp_prop_name() picks "opp-microvolt-L<n>" by the chip's
