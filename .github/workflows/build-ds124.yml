@@ -120,13 +120,13 @@ jobs:
             output/dsm/boot-root/boot/extlinux/extlinux.conf
           grep -q 'cma=256M' output/dsm/boot-root/boot/extlinux/extlinux.conf || { echo "ERROR: cma=256M missing from bootargs (VPU DMA-heap path needs it)"; exit 1; }
 
-      - name: Verify thermal policy (60/68/75 C CPU ladder, NPU not involved)
+      - name: Verify thermal policy (50/54/75 C CPU ladder, NPU not involved)
         run: |
           set -euo pipefail
           DTB=$(ls output/dsm/boot-root/boot/*.dtb)
-          echo "== Thermal ladder: 60 C start / 68 C mid / 75 C hard floor"
+          echo "== Thermal ladder: 50 C start / 54 C mid / 75 C hard floor"
           T=/thermal-zones/soc-thermal/trips
-          for pair in trip-point-0:60000 trip-point-2:68000 trip-point-1:75000 soc-crit:115000; do
+          for pair in trip-point-0:50000 trip-point-2:54000 trip-point-1:75000 soc-crit:115000; do
             node="${pair%%:*}"; want="${pair##*:}"
             got=$(fdtget -t i "$DTB" "$T/$node" temperature)
             echo "  $node = $got"
@@ -141,7 +141,7 @@ jobs:
             [ -n "$trip" ] && [ -n "$dev" ] || { echo "ERROR: $map missing trip/cooling-device"; exit 1; }
             echo "  $map trip=$trip cooling-device=$dev"
           done
-          # CPU ceilings: 60 C -> max state 1 (1416 MHz), 68 C -> max state 3
+          # CPU ceilings: 50 C -> max state 1 (1416 MHz), 54 C -> max state 3
           # (816 MHz), 75 C -> max state 5 (408 MHz).  The second argument must
           # stay THERMAL_NO_LIMIT (0xffffffff) so the governor may drop all the
           # way to the lowest OPP instead of being fenced in at one frequency.
