@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Verify the OEC CPU-bin/eMMC compatibility branch (stdlib only).
 
-The model tests do not replace a kernel build or a boot test.  CI additionally
+The model tests do not replace a kernel build or a boot test. CI additionally
 checks the compiled DTB, actual .config and System.map from this kernel build.
 No input firmware, host setting or credential is modified by this tool.
 """
 import argparse
-import copy
 import re
 import struct
 import sys
@@ -68,8 +67,7 @@ def validate_records(records):
     require(set(records) == set(EXPECTED), "candidate OPP set must contain six regular + three special nodes")
     for name, (hz, mask, uv) in records.items():
         require((hz, mask, uv) == EXPECTED[name], "unexpected OPP/mask/voltage: " + name)
-    # The getter currently resolves SoC version 0/1/2. Also cover other bits in
-    # the table and all defined speed bits, rather than hardcoding only one box.
+    # Also cover other mask bits and all defined speed bits, not just one box.
     for version in range(8):
         for speed in range(16):
             freqs = selected_opps(records, version, speed)
@@ -111,6 +109,38 @@ def source_cells(text, key, optional=False):
     return tuple(int(x, 0) for x in match.group(1).split())
 
 
+def expand_quoted_includes(path, active=()):
+    """Follow local quoted includes in order; this is not a general cpp."""
+    path = path.resolve()
+    require(path not in active, "cyclic DTS include")
+    text = clean_source(path.read_text())
+    pattern = r'^\s*#include\s+"([^"\n]+)"[^\n]*$'
+    return re.sub(pattern,
+                  lambda match: expand_quoted_includes(path.parent / match.group(1), active + (path,)),
+                  text, flags=re.M)
+
+
+def check_emmc_overlays(overlays):
+    """Apply relevant declarations/deletions in final include order."""
+    high_speed = set()
+    cap = None
+    statement = re.compile(
+        r'/delete-property/\s+(mmc-hs(?:200|400)[\w-]*)\s*;'
+        r'|\b(mmc-hs(?:200|400)[\w-]*)\s*;'
+        r'|\bmax-frequency\s*=\s*<\s*(0x[0-9a-fA-F]+|[0-9]+)\s*>\s*;')
+    for overlay in overlays:
+        for match in statement.finditer(overlay):
+            removed, enabled, frequency = match.groups()
+            if removed:
+                high_speed.discard(removed)
+            elif enabled:
+                high_speed.add(enabled)
+            else:
+                cap = int(frequency, 0)
+    require(cap == 52000000, "final eMMC clock cap is not 52 MHz")
+    require(not high_speed, "later board overlay re-enables eMMC: " + ", ".join(sorted(high_speed)))
+
+
 def audit_source(kernel):
     directory = kernel / "arch/arm64/boot/dts/rockchip"
     soc = clean_source((directory / "rk3568.dtsi").read_text())
@@ -149,6 +179,8 @@ def audit_source(kernel):
     require(source_cells(emmc, "max-frequency") == (52000000,), "missing eMMC cap")
     for prop in ("mmc-hs200-1_8v", "mmc-hs200-1_2v", "mmc-hs400-1_8v", "mmc-hs400-1_2v", "mmc-hs400-enhanced-strobe"):
         require("/delete-property/ " + prop + ";" in emmc, "high-speed property not removed")
+    final_source = expand_quoted_includes(directory / "rk3566-oec-box-wxy4-dsm.dts")
+    check_emmc_overlays(blocks(final_source, r"&sdhci"))
     helper = (kernel / "drivers/thermal/cpufreq_cooling.c").read_text()
     binding = (kernel / "drivers/thermal/thermal_of.c").read_text()
     header = (kernel / "include/linux/cpu_cooling.h").read_text()
@@ -253,7 +285,8 @@ def audit_dtb(path):
     emmc = tree["/sdhci@fe310000"]
     require(cells(emmc, "max-frequency", 1) == (52000000,), "eMMC cap missing")
     require(cells(emmc, "bus-width", 1) == (8,), "eMMC bus width changed")
-    require(not any(k.startswith("mmc-hs200") or k.startswith("mmc-hs400") for k in emmc), "eMMC high-speed declaration remains")
+    remaining = sorted(k for k in emmc if k.startswith("mmc-hs200") or k.startswith("mmc-hs400"))
+    require(not remaining, "eMMC high-speed declaration remains: " + ", ".join(remaining))
     print("OK: compiled DTB: nine candidate OPPs, 50/55/75/115 C, NPU out, eMMC 52 MHz")
     for version, label in [(0, "normal"), (1, "M"), (2, "J")]:
         freqs = selected_opps(records, version, 1)
@@ -278,6 +311,23 @@ class ModelTests(unittest.TestCase):
         pieces = blocks(text, r"\bopp-1104")
         self.assertEqual(len(pieces), 2)
         self.assertIn("/delete-property/ opp-microvolt-L1;", "\n".join(pieces))
+
+    def test_late_hs400_overlay_is_rejected(self):
+        with self.assertRaises(ValueError):
+            check_emmc_overlays(["max-frequency = <52000000>; /delete-property/ mmc-hs400-1_8v;",
+                                "mmc-hs400-1_8v; mmc-hs400-enhanced-strobe;"])
+
+    def test_late_hs200_overlay_is_rejected(self):
+        with self.assertRaises(ValueError):
+            check_emmc_overlays(["max-frequency = <52000000>;", "mmc-hs200-1_8v;"])
+
+    def test_late_clock_override_is_rejected(self):
+        with self.assertRaises(ValueError):
+            check_emmc_overlays(["max-frequency = <52000000>;", "max-frequency = <200000000>;"])
+
+    def test_final_deletion_removes_high_speed(self):
+        check_emmc_overlays(["mmc-hs400-1_8v; mmc-hs400-enhanced-strobe;",
+                             "max-frequency = <52000000>; /delete-property/ mmc-hs400-1_8v; /delete-property/ mmc-hs400-enhanced-strobe;"])
 
     def test_all_hardware_masks(self):
         validate_records(EXPECTED)
