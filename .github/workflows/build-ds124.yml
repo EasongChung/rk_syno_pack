@@ -1,4 +1,4 @@
-name: Build DS124 DSM Boot Image
+name: Build DS124 DSM Boot Image (OEC compatibility)
 
 on:
   workflow_dispatch:
@@ -36,6 +36,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Compatibility branch guard
+        run: |
+          test "$GITHUB_REF_NAME" = "compat/oec-bin-emmc52" || {
+            echo "ERROR: this experimental workflow must run on compat/oec-bin-emmc52"
+            exit 1
+          }
+
       - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
@@ -141,26 +148,18 @@ jobs:
             [ -n "$trip" ] && [ -n "$dev" ] || { echo "ERROR: $map missing trip/cooling-device"; exit 1; }
             echo "  $map trip=$trip cooling-device=$dev"
           done
-          # CPU ceilings: 50 C -> max state 1 (1416 MHz), 55 C -> max state 3
-          # (816 MHz), 75 C -> max state 5 (408 MHz).  The second argument must
-          # stay THERMAL_NO_LIMIT (0xffffffff) so the governor may drop all the
-          # way to the lowest OPP instead of being fenced in at one frequency.
-          # (state numbers assume the 1800 MHz OPP is deleted - see below)
-          for pair in map3:1 map2:3 map0:5; do
-            map="${pair%%:*}"; want="${pair##*:}"
-            vals=$(fdtget -t x "$DTB" "$M/$map" cooling-device | tr ' ' '\n')
-            # values are: phandle max_state min_state
-            got_max=$(echo "$vals" | sed -n 2p); got_min=$(echo "$vals" | sed -n 3p)
-            [ "$got_max" = "$want" ] || { echo "ERROR: $map max state $got_max, expected $want"; exit 1; }
-            [ "$got_min" = "ffffffff" ] || \
-              { echo "ERROR: $map min state $got_min, expected ffffffff (THERMAL_NO_LIMIT)"; exit 1; }
-            echo "  $map max_state=$got_max min_state=$got_min (unlimited low end)"
-          done
+          # State indices depend on the hardware-filtered table.  Validate
+          # frequency caps, all bin selections and the linked binding helper.
+          # Normal/M: state 1/3/5; J: state 0/1/1, lowest OPP 1008 MHz.
+          python3 scripts/verify-oec-compat.py --selftest \
+            --source linux-5.10.x --dtb "$DTB" \
+            --config build/out/kernel-7.3/.config \
+            --system-map build/out/kernel-7.3/System.map
           # The NPU must NOT be a cooling-map target: its frequency is static
           # (rknpu_ondemand does not sample load) and already sits at 600 MHz on
           # a fixed 950 mV rail, so a thermal step on it changes nothing.
           # High-temperature protection for the NPU is a userspace task gate in
-          # the RK3566_NPU_Server package (68 C pause / 65 C resume).
+          # the RK3566_NPU_Server package (55 C pause / 53 C resume).
           if fdtget -l "$DTB" "$M" 2>/dev/null | grep -qx 'map4'; then
             echo "ERROR: cooling-maps/map4 is back - the NPU must not be bound to a trip"
             exit 1
@@ -221,20 +220,9 @@ jobs:
           fi
           echo "  opp-1800000000 absent"
 
-          echo "== CPU OPP set must stay at 6 entries (cooling state numbering depends on it)"
-          # The cpufreq cooling state index runs from the TOP of the ascending
-          # frequency table, so state N maps to freq_table[max_state-N].  The
-          # thermal map limits above (1..2 / 3 / 5) are only correct while the
-          # table has exactly 6 entries.  Adding or removing an OPP shifts every
-          # state number and silently changes which frequency each tier means.
-          opp_count=$(fdtget -l "$DTB" /cpu0-opp-table | grep -c '^opp-')
-          echo "  cpu0-opp-table has $opp_count OPPs"
-          [ "$opp_count" = "6" ] || {
-            echo "ERROR: cpu0-opp-table has $opp_count OPPs, expected 6."
-            echo "       Cooling state numbers in the thermal maps would shift -"
-            echo "       renumber them together with this table."
-            exit 1
-          }
+          # The validator above requires nine candidate DTB nodes, but only
+          # six (normal/M) or two (J) remain after runtime hardware filtering.
+          # A single fixed OPP-count/state-number assertion is incorrect here.
 
           echo "== Thermal driver must be compiled in"
           # Assert against build/out/kernel-7.3/.config, the file make actually
@@ -242,7 +230,8 @@ jobs:
           for sym in CONFIG_THERMAL CONFIG_CPU_THERMAL CONFIG_THERMAL_OF \
                       CONFIG_ROCKCHIP_THERMAL CONFIG_THERMAL_GOV_STEP_WISE \
                       CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE CONFIG_CPU_FREQ \
-                      CONFIG_CPUFREQ_DT CONFIG_DEVFREQ_THERMAL; do
+                      CONFIG_CPUFREQ_DT CONFIG_CPU_FREQ_THERMAL \
+                      CONFIG_ARM_ROCKCHIP_CPUFREQ CONFIG_PM_OPP CONFIG_DEVFREQ_THERMAL; do
             grep -qE "^${sym}=y" build/out/kernel-7.3/.config || \
               { echo "ERROR: ${sym} missing from the built kernel config"; exit 1; }
             echo "  ${sym}=y"
@@ -277,7 +266,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ds124-boot-images
+          name: ds124-boot-images-oec-bin-emmc52
           path: |
             output/dsm/
             build/rd.bin
