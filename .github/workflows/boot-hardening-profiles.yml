@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           found=$(find build/frozen-artifact -name 'rk3566-dsm-raw_20261118.img.gz' -type f | head -1)
-          test -n "$found" || { echo "ERROR: frozen baseline raw not found"; exit 1 }
+          test -n "$found" || { echo "ERROR: frozen baseline raw not found"; exit 1; }
           echo "path=$found" >> "$GITHUB_OUTPUT"
 
       - name: Parser and contract regression tests
