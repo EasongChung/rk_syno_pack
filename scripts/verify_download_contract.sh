@@ -35,8 +35,9 @@ h1raw=/tmp/h1.raw
 [ "$(stat -c %s /tmp/h1.raw)" = "$((128*1024*1024))" ] || need "H1 raw size != 128MiB"
 
 sgdisk -v /tmp/h1.raw | sed -n '1,40p'
-sgdisk -i 1 /tmp/h1.raw | grep -q 'legacy BIOS bootable' || need "p1 bootable flag not set"
-sgdisk -i 2 /tmp/h1.raw | grep -q 'legacy BIOS bootable' && need "p2 must not be bootable"
+# Attribute bit 2 = Legacy BIOS Bootable; p1 must be 0x4, p2 must be 0.
+sgdisk -i 1 /tmp/h1.raw | grep -q 'Attribute flags: 0000000000000004' || need "p1 bootable flag not set"
+sgdisk -i 2 /tmp/h1.raw | grep -q 'Attribute flags: 0000000000000000' || need "p2 must not be bootable"
 echo "p1 flags: $(sgdisk -i 1 /tmp/h1.raw | grep 'Attribute flags')"
 
 dd if=/tmp/h1.raw of=/tmp/boot.img bs=1M skip=16 count=32 status=none
