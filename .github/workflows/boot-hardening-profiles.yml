@@ -6,6 +6,15 @@ name: Build OEC Boot Hardening Profiles
 # offsets are unproven.
 
 on:
+  # GitHub only allows workflow_dispatch from the default branch, so this
+  # experimental workflow also runs on pushes to its own branch.
+  push:
+    branches:
+      - compat/oec-boot-hardening
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/boot-hardening-profiles.yml'
   workflow_dispatch:
     inputs:
       profile:
@@ -64,7 +73,7 @@ jobs:
 
       - name: Build and verify frozen-payload profiles
         env:
-          PROFILE: ${{ inputs.profile }}
+          PROFILE: ${{ inputs.profile || 'all' }}
           BASELINE: ${{ steps.baseline.outputs.path }}
         run: |
           python3 -B scripts/make_oec_boot_profiles.py \
