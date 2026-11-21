@@ -1,0 +1,89 @@
+name: Build OEC Boot Hardening Profiles
+
+# Experimental branch only. Never run on main; formal images keep using
+# build-ds124.yml. H0 = byte-identical reference, H1 = FAT16+bootable+marker.
+# H2 (explicit ENV) is intentionally NOT generated: vendor ENV backend and
+# offsets are unproven.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'H0 reference / H1 FAT16+bootable / all'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - H0
+          - H1
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-profiles:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Experimental branch guard
+        run: |
+          test "$GITHUB_REF_NAME" = "compat/oec-boot-hardening" || {
+            echo "ERROR: experimental boot profiles must not run on main"
+            exit 1
+          }
+
+      - name: Checkout profile code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Fetch frozen original artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ds124-boot-images
+          path: build/frozen-artifact
+          run-id: 44310500902
+          github-token: ${{ github.token }}
+
+      - name: Install offline image tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dosfstools mtools gdisk gzip
+
+      - name: Locate frozen baseline raw
+        id: baseline
+        run: |
+          set -euo pipefail
+          found=$(find build/frozen-artifact -name 'rk3566-dsm-raw_20261118.img.gz' -type f | head -1)
+          test -n "$found" || { echo "ERROR: frozen baseline raw not found"; exit 1 }
+          echo "path=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Parser and contract regression tests
+        run: python3 -B tests/test_oec_boot_contract.py
+
+      - name: Build and verify frozen-payload profiles
+        env:
+          PROFILE: ${{ inputs.profile }}
+          BASELINE: ${{ steps.baseline.outputs.path }}
+        run: |
+          python3 -B scripts/make_oec_boot_profiles.py \
+            --baseline-raw "$BASELINE" \
+            --out output/boot-hardening --profile "$PROFILE"
+          for folder in output/boot-hardening/H0 output/boot-hardening/H1; do
+            if test -f "$folder/SHA256SUMS"; then
+              (cd "$folder" && sha256sum -c SHA256SUMS)
+            fi
+          done
+
+      - name: Upload only test packages and validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: oec-boot-hardening-profiles
+          path: |
+            output/boot-hardening/H*/rk3566-dsm-raw_*.img.gz
+            output/boot-hardening/H*/README.md
+            output/boot-hardening/H*/SHA256SUMS
+            output/boot-hardening/H*/VALIDATION.json
+            output/boot-hardening/RESULTS.json
+          if-no-files-found: error

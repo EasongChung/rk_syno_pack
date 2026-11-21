@@ -323,3 +323,35 @@ output/                  最终启动及烧录镜像
 - 切换 `SOC` 后应重新执行 `kernel` 和 `pat`，不要复用上一平台的 initrd。
 - `updateimg` 只使用已有产物，不会自动重新编译内核或重新修补 PAT。
 - RK3566 WXY/OECT 使用 vendor bootloader，正常流程不需要 `uboot` target。
+
+## 引导兼容试验（仅实验分支）
+
+以下工具只在 `compat/oec-boot-hardening` 分支使用，用于排查少数设备刷入
+raw 后持续白灯的问题。**不改变正式构建流程，不修改内核/initrd/DTB。**
+
+| 脚本 | 作用 |
+| --- | --- |
+| `scripts/oec_boot_contract.py` | 只读解析 GPT / FAT16 / FAT32 / extlinux / initrd / ARM64 Image，校验 H0/H1 启动合同 |
+| `scripts/make_oec_boot_profiles.py` | 生成 H0（字节级对照）与 H1（标准 FAT16 + p1 bootable + 非身份标记） |
+| `scripts/audit_oec_boot_env.py` | 审计 vendor ENV 的 CRC 与启动控制变量，记录 H2 阻碍 |
+| `scripts/probe_oec_boot_contract.py` | 启动后只读探针，只输出元数据，绝不输出 SN/MAC |
+| `tests/test_oec_boot_contract.py` | 28 项解析、安全与负例测试 |
+
+```bash
+# 本地回归测试（无需 FAT 工具链）
+python3 -B tests/test_oec_boot_contract.py
+
+# 检查 H1 所需可靠工具（dosfstools/mtools/gdisk；BusyBox 不适用）
+python3 -B scripts/make_oec_boot_profiles.py --check-tools
+
+# 生成 H0 对照包（输出落在 output/ 下）
+python3 -B scripts/make_oec_boot_profiles.py \
+  --baseline-raw /path/to/rk3566-dsm-raw_20261118.img.gz \
+  --out output/local-H0 --profile H0
+```
+
+H1 只能由 CI 用真实 dosfstools/mtools/gdisk 生成（`.github/workflows/boot-hardening-profiles.yml`，
+仅允许在本分支手动触发）。H2（显式 ENV）证据不足，暂不生成。
+
+结论与边界见
+`HANDOFF-cpufreq-DS124-20261012/evidence/boot-hardening/REPORT-20261121-boot-hardening.md`。
