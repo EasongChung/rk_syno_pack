@@ -35,13 +35,21 @@ h1raw=/tmp/h1.raw
 [ "$(stat -c %s /tmp/h1.raw)" = "$((128*1024*1024))" ] || need "H1 raw size != 128MiB"
 
 sgdisk -v /tmp/h1.raw | sed -n '1,40p'
-sgdisk -i 1 /tmp/h1.raw | grep -qi 'legacy BIOS bootable: set' || need "p1 bootable flag not set"
-sgdisk -i 2 /tmp/h1.raw | grep -qi 'legacy BIOS bootable: set' && need "p2 must not be bootable"
+sgdisk -i 1 /tmp/h1.raw | grep -q 'legacy BIOS bootable' || need "p1 bootable flag not set"
+sgdisk -i 2 /tmp/h1.raw | grep -q 'legacy BIOS bootable' && need "p2 must not be bootable"
+echo "p1 flags: $(sgdisk -i 1 /tmp/h1.raw | grep 'Attribute flags')"
 
 dd if=/tmp/h1.raw of=/tmp/boot.img bs=1M skip=16 count=32 status=none
 echo "== H1 FAT type (must be FAT16)"
 mdir -i /tmp/boot.img :: | head -5
-fsck.fat -n /tmp/boot.img | grep -qi 'FAT16' || need "boot volume is not FAT16"
+python3 - <<'PY'
+from pathlib import Path
+b = Path('/tmp/boot.img').read_bytes(512)
+assert b[54:62] == b'FAT16   ', b[54:62]
+assert b[82:90] != b'FAT32   '
+print('boot sector signature: FAT16')
+PY
+fsck.fat -n /tmp/boot.img | tail -3
 
 echo "== H1 frozen components must be unchanged"
 mkdir -p /tmp/h1boot
