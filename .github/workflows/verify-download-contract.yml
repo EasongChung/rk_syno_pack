@@ -21,6 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo 'triggered by user'
+      - name: Checkout verification script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/verify_download_contract.sh
+
       - name: Download profile artifact
         uses: actions/download-artifact@v4
         with:
