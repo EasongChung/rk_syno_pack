@@ -311,6 +311,10 @@ patch_synoinfo_disk_count() {
     need_file "${synoinfo}"
     set_synoinfo_kv "${synoinfo}" maxdisks "${max_disks}"
     set_synoinfo_kv "${synoinfo}" max_sys_raid_disks "${max_disks}"
+    # /lib/udev/script/sdcard.sh reads this key: when "yes" it exits before
+    # registering the boot eMMC as an SD-card external device, which stops
+    # DSM from auto-mounting (and sharing) the boot partition.
+    set_synoinfo_kv "${synoinfo}" support_emmc_boot "yes"
   done
 }
 
