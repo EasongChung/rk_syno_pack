@@ -25,8 +25,13 @@ echo "$H0_RAW  /tmp/h0.raw" | sha256sum -c -
 echo "== H1 structure"
 h1raw=$(find "$ROOT/H1" -name '*.img' ! -name '*.img.gz')
 h1gz=$(find "$ROOT/H1" -name '*.img.gz')
+echo "== H1 files"
+ls -l "$ROOT/H1"
+echo "h1 raw recorded sha:  42f8613e2a39fb5850319c34110d596891d25f51ec19e7274beeb1b870275cc9"
+sha256sum "$h1raw" "$h1gz"
 gzip -dc "$h1gz" > /tmp/h1.raw
-cmp /tmp/h1.raw "$h1raw" || need "H1 raw != decompressed gz"
+sha256sum /tmp/h1.raw
+cmp /tmp/h1.raw "$h1raw" || need "H1 raw != decompressed gz (see hashes above)"
 [ "$(stat -c %s /tmp/h1.raw)" = "$((128*1024*1024))" ] || need "H1 raw size != 128MiB"
 
 sgdisk -v /tmp/h1.raw | sed -n '1,40p'
