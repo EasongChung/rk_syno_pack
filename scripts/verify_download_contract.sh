@@ -45,7 +45,8 @@ echo "== H1 FAT type (must be FAT16)"
 mdir -i /tmp/boot.img :: | head -5
 python3 - <<'PY'
 from pathlib import Path
-b = Path('/tmp/boot.img').read_bytes(512)
+with Path('/tmp/boot.img').open('rb') as f:
+    b = f.read(512)
 assert b[54:62] == b'FAT16   ', b[54:62]
 assert b[82:90] != b'FAT32   '
 print('boot sector signature: FAT16')
