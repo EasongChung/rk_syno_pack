@@ -9,11 +9,13 @@ IMAGE=8023e24832bfe4eec2a4e7cf35cb3ffa8c497350e3fb126b70b9e4a083929025
 UINITRD=173cfcfdc6e95482240f4bc6dd460c4c0fd9db1a8bba27375dc54a354ca4114c
 DTB=2f3232a17733e28ba4d231bd26fb4139d8d348ac42f570e197363fe8aab7cb70
 DTB_NAME=rk3566-oec-box-wxy4-dsm.dtb
-ROOT=verify/artifact/output/boot-hardening
+# Locate the H0/H1 folders wherever download-artifact placed them.
+H0_DIR=$(find verify/artifact -type d -name H0 | head -1)
+ROOT=$(dirname "$H0_DIR")
 
 need() { echo "FAIL: $*"; exit 1; }
 
-[ -d "$ROOT/H0" ] && [ -d "$ROOT/H1" ] || need "H0/H1 folders missing"
+[ -d "$ROOT/H0" ] && [ -d "$ROOT/H1" ] || need "H0/H1 folders missing (ROOT=$ROOT)"
 
 echo "== H0 must be byte-identical to the official package"
 (h0=$(find "$ROOT/H0" -name '*.img.gz'); echo "$H0_GZ  $h0" | sha256sum -c -)
