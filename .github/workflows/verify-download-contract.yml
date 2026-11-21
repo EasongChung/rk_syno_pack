@@ -1,0 +1,39 @@
+name: Verify Boot Hardening Artifact
+
+# Read-only audit run. Downloads the profile artifact from the build run and
+# re-verifies SHA256SUMS plus contract checks on the raw files.
+
+on:
+  push:
+    branches:
+      - compat/oec-boot-hardening
+    paths:
+      - '.github/workflows/verify-download-contract.yml'
+      - 'scripts/verify_download_contract.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'triggered by user'
+      - name: Download profile artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: oec-boot-hardening-profiles
+          path: verify/artifact
+          run-id: 44867651794
+          github-token: ${{ github.token }}
+      - name: Re-verify SHA256SUMS
+        run: |
+          set -euo pipefail
+          find verify/artifact -name SHA256SUMS -print -execdir sha256sum -c {} \;
+      - name: Independent contract re-check
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq dosfstools mtools gdisk
+          bash scripts/verify_download_contract.sh
