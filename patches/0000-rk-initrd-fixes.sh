@@ -122,6 +122,11 @@ sync_synoinfo_disk_count()
 		[ -d "$RootMnt/$dir" ] || continue
 		set_synoinfo_kv "$RootMnt/$dir/synoinfo.conf" maxdisks "$max_disks"
 		set_synoinfo_kv "$RootMnt/$dir/synoinfo.conf" max_sys_raid_disks "$max_disks"
+		# Stop DSM's /lib/udev/script/sdcard.sh from registering the boot
+		# eMMC as an SD-card external device and auto-mounting its FAT boot
+		# partition as a share. Re-applied every boot so DSM updates that
+		# regenerate synoinfo.conf cannot bring the automount back.
+		set_synoinfo_kv "$RootMnt/$dir/synoinfo.conf" support_emmc_boot yes
 	done
 }
 
